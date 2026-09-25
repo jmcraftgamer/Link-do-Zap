@@ -1,0 +1,15 @@
+node_modules/
+dist/
+out/
+sessions/
+*.log
+.DS_Store
+Thumbs.db
+# Electron data (dev)
+link-no-whatsapp/
+# Env
+.env
+.env.local
+# OS
+*.swp
+*.swo

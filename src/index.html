@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://api.qrserver.com; connect-src 'self' https://api.openai.com https://api.groq.com https://api.openrouter.ai https://generativelanguage.googleapis.com https://api.deepseek.com https://api.mistral.ai;">
+
+  <title>Link no WhatsApp</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Bar -->
+    <div class="top-bar">
+      <!-- Identity -->
+      <div class="app-identity">
+        <svg class="whatsapp-icon" viewBox="0 0 32 32" width="31" height="31">
+          <path fill="#111111" d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
+        </svg>
+        <span class="app-name">Link no WhatsApp</span>
+      </div>
+
+      <!-- Search Bar -->
+      <div class="search-bar">
+        <svg class="search-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#111111" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="text" placeholder="Buscar Zaps, nmeros..." id="searchInput">
+      </div>
+
+      <!-- Top Right Icons -->
+      <div class="top-right-icons">
+        <button class="icon-btn" title="Notificaes">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#111111" stroke-width="2">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+          </svg>
+        </button>
+        <button class="icon-btn" title="Configuraes">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#111111" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+        <button class="icon-btn profile-btn" title="Perfil">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#111111" stroke-width="2">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Window Controls -->
+      <div class="window-controls">
+        <button class="win-btn" id="minimizeBtn" title="Minimizar">
+          <svg viewBox="0 0 12 12" width="12" height="12">
+            <line x1="2" y1="6" x2="10" y2="6" stroke="#111111" stroke-width="1.5"/>
+          </svg>
+        </button>
+        <button class="win-btn" id="maximizeBtn" title="Maximizar">
+          <svg viewBox="0 0 12 12" width="12" height="12">
+            <rect x="2" y="2" width="8" height="8" fill="none" stroke="#111111" stroke-width="1.5"/>
+          </svg>
+        </button>
+        <button class="win-btn win-btn-close" id="closeBtn" title="Fechar">
+          <svg viewBox="0 0 12 12" width="12" height="12">
+            <line x1="2" y1="2" x2="10" y2="10" stroke="#111111" stroke-width="1.5"/>
+            <line x1="10" y1="2" x2="2" y2="10" stroke="#111111" stroke-width="1.5"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="main-layout">
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <nav class="sidebar-menu">
+          <a href="#" class="menu-item" data-page="dashboard">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+              <polyline points="9 22 9 12 15 12 15 22"/>
+            </svg>
+            <span>Dashboard</span>
+          </a>
+          <a href="#" class="menu-item active" data-page="adicionar-whatsapp">
+            <svg class="menu-icon whatsapp-menu-icon" viewBox="0 0 32 32" width="20" height="20">
+              <path fill="currentColor" d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
+            </svg>
+            <span>Adicionar WhatsApp</span>
+          </a>
+          <a href="#" class="menu-item" data-page="meus-zaps">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+            </svg>
+            <span>Meus Zaps</span>
+          </a>
+          <a href="#" class="menu-item" data-page="contatos">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+            </svg>
+            <span>Contatos</span>
+          </a>
+          <a href="#" class="menu-item" data-page="conversas">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+            <span>Conversas</span>
+          </a>
+          <a href="#" class="menu-item" data-page="treinamento">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+              <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+            </svg>
+            <span>Treinamento</span>
+          </a>
+          <a href="#" class="menu-item" data-page="provedores">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+              <line x1="6" y1="6" x2="6.01" y2="6"/>
+              <line x1="6" y1="18" x2="6.01" y2="18"/>
+            </svg>
+            <span>Provedores</span>
+          </a>
+          <a href="#" class="menu-item" data-page="relatorios">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="20" x2="18" y2="10"/>
+              <line x1="12" y1="20" x2="12" y2="4"/>
+              <line x1="6" y1="20" x2="6" y2="14"/>
+            </svg>
+            <span>Relatorios</span>
+          </a>
+          <a href="#" class="menu-item" data-page="configuracoes">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            <span>Configuraes</span>
+          </a>
+          <a href="#" class="menu-item" data-page="ajuda">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+            <span>Ajuda</span>
+          </a>
+        </nav>
+      </div>
+
+      <!-- Main Content -->
+      <div class="main-content">
+        <!-- Page: Dashboard -->
+        <div class="page" id="page-dashboard">
+          <h1 class="page-title">Dashboard</h1>
+          <p class="page-subtitle">Viso geral do seu sistema</p>
+          <div class="dashboard-stats">
+            <div class="stat-card">
+              <div class="stat-number">5</div>
+              <div class="stat-label">Zaps Ativos</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-number">1.234</div>
+              <div class="stat-label">Contatos</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-number">8.901</div>
+              <div class="stat-label">Mensagens Hoje</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-number">99.9%</div>
+              <div class="stat-label">Uptime</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Page: Adicionar WhatsApp -->
+        <div class="page active" id="page-adicionar-whatsapp">
+          <!-- List View -->
+          <div id="zapsListView">
+            <div class="page-header-row">
+              <div>
+                <h1 class="page-title">Meus Zaps</h1>
+                <p class="page-subtitle">Gerencie todos os seus Zaps do WhatsApp</p>
+              </div>
+              <div class="page-actions" style="margin:0">
+                <button class="btn btn-outline" id="addZapBtn">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"/>
+                    <line x1="5" y1="12" x2="19" y2="12"/>
+                  </svg>
+                  Adicionar Zap
+                </button>
+                <button class="btn btn-primary" id="listZapsBtn">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="8" y1="6" x2="21" y2="6"/>
+                    <line x1="8" y1="12" x2="21" y2="12"/>
+                    <line x1="8" y1="18" x2="21" y2="18"/>
+                    <line x1="3" y1="6" x2="3.01" y2="6"/>
+                    <line x1="3" y1="12" x2="3.01" y2="12"/>
+                    <line x1="3" y1="18" x2="3.01" y2="18"/>
+                  </svg>
+                  Lista de Zaps
+                </button>
+              </div>
+            </div>
+            <div class="zaps-list" id="zapsList">
+              <!-- Zap Cards will be injected here -->
+            </div>
+          </div>
+
+          <!-- Panel View (in-place, replaces list) -->
+          <div id="zapPanelView" style="display:none">
+            <div class="panel-top-bar">
+              <button class="btn-back-list" id="backToList">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="19" y1="12" x2="5" y2="12"/>
+                  <polyline points="12 19 5 12 12 5"/>
+                </svg>
+                Voltar
+              </button>
+            </div>
+
+            <div class="panel-header-card">
+              <div class="panel-header-left">
+                <div class="panel-header-icon">
+                  <svg viewBox="0 0 32 32" fill="#111" width="32" height="32">
+                    <path d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
+                  </svg>
+                </div>
+                <div>
+                  <div class="panel-header-name-row">
+                    <span class="panel-header-name" id="zapPanelName">Nome do Zap</span>
+                    <div class="zap-card-status" id="zapPanelStatus"><span class="dot"></span> Desconectado</div>
+                    <label class="panel-enabled-toggle">
+                      <input type="checkbox" id="panelEnabled" checked>
+                      <span class="toggle-slider"></span>
+                      <span class="panel-enabled-label" id="panelEnabledLabel">Ativo</span>
+                    </label>
+                    <label class="panel-auto-reply">
+                      <input type="checkbox" id="panelAutoReply" checked>
+                      <span>Ativar auto-resposta</span>
+                    </label>
+                  </div>
+                  <div class="panel-header-phone-row">
+                    <span class="panel-header-phone" id="zapPanelPhone">+55 11 99999-9999</span>
+                    <button class="panel-copy-btn" id="copyZapPhone">
+                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                      </svg>
+                      Copiar
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="panel-header-right">
+                <button class="panel-log-btn" id="zapPanelLog" title="Ver Log">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13"/>
+                    <line x1="16" y1="17" x2="8" y2="17"/>
+                  </svg>
+                </button>
+                <button class="zap-panel-connect-btn" id="zapPanelConnect">Conectar</button>
+              </div>
+            </div>
+
+            <!-- Save & Restart -->
+            <div class="panel-save-bar">
+              <button class="btn-save-restart" id="panelSaveRestart">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                </svg>
+                Salvar alteraes e reiniciar Zap
+              </button>
+              <button class="btn-toggle-zap" id="panelToggleZap">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+                  <line x1="12" y1="2" x2="12" y2="12"/>
+                </svg>
+                <span id="panelToggleZapText">Desativar Zap</span>
+              </button>
+            </div>
+
+            <!-- Personality -->
+            <div class="panel-section">
+              <div class="panel-section-title">Personalidade</div>
+              <div class="model-config-box">
+                <div class="model-config-row">
+                  <div>
+                    <div class="model-config-label">Personalidade da IA</div>
+                    <div class="model-config-hint">Define o estilo de resposta do Zap</div>
+                  </div>
+                  <select class="model-config-select" id="panelPersonality">
+                    <option value="padrao">Padro (Jovem 17 anos)</option>
+                    <option value="vendedor">Vendedor</option>
+                    <option value="atendente">Atendente</option>
+                    <option value="especialista">Especialista</option>
+                  </select>
+                </div>
+                <div class="model-config-row" id="panelAreaRow" style="display:none">
+                  <div>
+                    <div class="model-config-label">rea de Atuao</div>
+                    <div class="model-config-hint">Ex: Psicologia, Dentista, Advogado</div>
+                  </div>
+                  <input type="text" class="panel-area-input" id="panelArea" placeholder="Sua rea de atuao...">
+                </div>
+              </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="panel-section">
+              <div class="panel-section-title">Estatsticas</div>
+              <div class="charts-row">
+                <div class="chart-box">
+                  <div class="chart-box-header">
+                    <div class="chart-box-title">Tokens Gastos</div>
+                    <div class="chart-box-value" id="tokensValue">0</div>
+                  </div>
+                  <canvas class="chart-canvas" id="tokensChart"></canvas>
+                  <div class="chart-tooltip" id="tokensTooltip"></div>
+                </div>
+                <div class="chart-box">
+                  <div class="chart-box-header">
+                    <div class="chart-box-title">Uso do Zap</div>
+                    <div class="chart-box-value" id="usageValue">0</div>
+                  </div>
+                  <canvas class="chart-canvas" id="usageChart"></canvas>
+                  <div class="chart-tooltip" id="usageTooltip"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Providers -->
+            <div class="panel-section">
+              <div class="panel-section-title">Provedores de IA</div>
+              <div id="panelProvidersList"></div>
+
+              <div class="model-config-box">
+                <div class="model-config-row">
+                  <div>
+                    <div class="model-config-label">Modelo de Resposta</div>
+                    <div class="model-config-hint">Escolha o modelo ou use o automtico</div>
+                  </div>
+                  <select class="model-config-select" id="panelModelSelect">
+                    <option value="auto">Automtico (Melhor para Pior)</option>
+                  </select>
+                </div>
+                <div class="model-config-row">
+                  <div>
+                    <div class="model-config-label">Trocar modelo automaticamente</div>
+                    <div class="model-config-hint">Se um modelo falhar, usa o proximo disponivel</div>
+                  </div>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="panelAutoSwitch" checked>
+                    <span class="toggle-slider"></span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Contacts -->
+            <div class="panel-section">
+              <div class="panel-section-title">Contatos Autorizados</div>
+              <div id="panelContactsList">
+                <p style="font-size:12px;color:#999;">Conecte o Zap para ver os contatos.</p>
+              </div>
+            </div>
+
+            <!-- Delete -->
+            <div class="panel-delete-section">
+              <button class="btn-delete-zap" id="panelDeleteZap">Excluir Zap</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Page: Meus Zaps -->
+        <div class="page" id="page-meus-zaps">
+          <h1 class="page-title">Meus Zaps</h1>
+          <p class="page-subtitle">Visualize e gerencie seus Zaps conectados</p>
+        </div>
+
+        <!-- Page: Contatos -->
+        <div class="page" id="page-contatos">
+          <h1 class="page-title">Contatos</h1>
+          <p class="page-subtitle">Gerencie os contatos dos seus nmeros</p>
+        </div>
+
+        <!-- Page: Conversas -->
+        <div class="page" id="page-conversas">
+          <h1 class="page-title">Conversas</h1>
+          <p class="page-subtitle">Acompanhe as conversas dos seus Zaps em tempo real</p>
+
+          <div class="conversations-container">
+            <!-- Conversations List -->
+            <div class="conversations-list-panel">
+              <div class="conversations-list-header">
+                <select id="zapSelector" class="zap-selector">
+                  <option value="">Selecione um Zap</option>
+                </select>
+              </div>
+              <div class="conversations-list" id="conversationsList">
+                <div class="conversations-empty">
+                  <p>Selecione um Zap para ver as conversas</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Chat Panel -->
+            <div class="chat-panel">
+              <div class="chat-header" id="chatHeader">
+                <div class="chat-contact-info">
+                  <div class="chat-contact-avatar" id="chatAvatar">
+                    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#666" stroke-width="2">
+                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                      <circle cx="12" cy="7" r="4"/>
+                    </svg>
+                  </div>
+                  <div class="chat-contact-details">
+                    <div class="chat-contact-name" id="chatContactName">Selecione uma conversa</div>
+                    <div class="chat-contact-status" id="chatContactStatus"></div>
+                  </div>
+                </div>
+                <div class="chat-header-actions">
+                  <button class="btn btn-sm btn-outline" id="toggleAutoReply" title="Ligar/Desligar resposta automática">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <polygon points="5 3 19 12 5 21 5 3"/>
+                    </svg>
+                    Auto: ON
+                  </button>
+                </div>
+              </div>
+
+              <div class="chat-messages" id="chatMessages">
+                <div class="chat-empty">
+                  <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#ccc" stroke-width="1.5">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                  </svg>
+                  <p>Selecione uma conversa para visualizar</p>
+                </div>
+              </div>
+
+              <div class="chat-input-area" id="chatInputArea" style="display:none">
+                <textarea id="chatInput" class="chat-input" placeholder="Digite sua mensagem..." rows="1"></textarea>
+                <button class="btn btn-primary btn-send-chat" id="sendChatBtn">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="22" y1="2" x2="11" y2="13"/>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Page: Treinamento -->
+        <div class="page" id="page-treinamento">
+          <!-- View: Lista de Zaps -->
+          <div id="trainingZapsView">
+            <h1 class="page-title">Treinamento</h1>
+            <p class="page-subtitle">Selecione um Zap para treinar a IA com informações do negócio</p>
+            <div class="training-zaps-list" id="trainingZapsList"></div>
+          </div>
+
+          <!-- View: Editor de Treinamentos -->
+          <div id="trainingEditorView" style="display:none">
+            <div class="panel-top-bar">
+              <button class="btn-back-list" id="backToTrainingZaps">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="19" y1="12" x2="5" y2="12"/>
+                  <polyline points="12 19 5 12 12 5"/>
+                </svg>
+                Voltar
+              </button>
+            </div>
+
+            <div class="training-editor-header">
+              <div>
+                <h1 class="page-title" id="trainingEditorTitle">Treinamentos</h1>
+                <p class="page-subtitle">Informações, preços, cardápios e imagens que a IA usa para responder</p>
+              </div>
+              <button class="btn btn-primary" id="addTrainingBtn">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                Adicionar Treinamento
+              </button>
+            </div>
+
+            <div class="trainings-list" id="trainingsList"></div>
+          </div>
+        </div>
+
+        <!-- Page: Provedores -->
+        <div class="page" id="page-provedores">
+          <h1 class="page-title">Provedores de IA</h1>
+          <p class="page-subtitle">Gerencie seus provedores de inteligncia artificial</p>
+          <div class="page-actions">
+            <button class="btn btn-primary disabled-btn" id="addProviderBtn" disabled title="Em breve">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              Adicionar Provedor
+              <span class="coming-soon-badge">Em Breve</span>
+            </button>
+          </div>
+          <div class="providers-list" id="providersList">
+            <!-- Providers will be injected here -->
+          </div>
+        </div>
+
+        <!-- Page: Relatorios -->
+        <div class="page" id="page-relatorios">
+          <h1 class="page-title">Relatorios</h1>
+          <p class="page-subtitle">Visualize estatsticas e relatorios</p>
+        </div>
+
+        <!-- Page: Configuracoes -->
+        <div class="page" id="page-configuracoes">
+          <h1 class="page-title">Configuraes</h1>
+          <p class="page-subtitle">Configure as preferncias do sistema</p>
+        </div>
+
+        <!-- Page: Ajuda -->
+        <div class="page" id="page-ajuda">
+          <h1 class="page-title">Ajuda</h1>
+          <p class="page-subtitle">Precisa de ajuda? Estamos aqui para voc</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Zap Modal -->
+  <div class="modal-overlay" id="addZapModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>Adicionar novo Zap</h2>
+        <button class="modal-close" id="closeModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="zapName">Nome do Zap</label>
+          <input type="text" id="zapName" placeholder="Ex: Atendimento Loja XYZ">
+        </div>
+        <div class="form-group">
+          <label for="zapNumber">Nmero do WhatsApp</label>
+          <input type="tel" id="zapNumber" placeholder="+55 11 99999-9999">
+        </div>
+        <div class="form-group">
+          <label for="zapPersonality">Personalidade</label>
+          <p class="form-hint">Escolha como a IA deve agir e responder</p>
+          <select id="zapPersonality">
+            <option value="padrao" selected>Padro - Jovem de 17 anos, descontraido</option>
+            <option value="vendedor">Vendedor - Tecnicas do FBI, experiente e divertido</option>
+            <option value="atendente">Atendente - Loja, educado e prestativo</option>
+            <option value="especialista">Especialista - Profissional em uma rea</option>
+          </select>
+        </div>
+        <div class="form-group" id="zapAreaGroup" style="display:none">
+          <label for="zapArea">rea de Atuao</label>
+          <p class="form-hint">Ex: Psicologia, Dentista, Direito, Contabilidade, etc.</p>
+          <input type="text" id="zapArea" placeholder="Ex: Psicologia">
+        </div>
+        <div class="form-group">
+          <label>Provedores de IA</label>
+          <p class="form-hint">Selecione um ou mais provedores</p>
+          <div class="checkbox-group" id="zapProvidersList">
+            <!-- Providers checkboxes will be injected here -->
+          </div>
+        </div>
+        <div class="form-group" id="zapModelGroup" style="display:none">
+          <label>Modelo</label>
+          <p class="form-hint">Escola um modelo especfico ou use a automtica (melhor para pior)</p>
+          <select id="zapModel">
+            <option value="auto">Automtico (Melhor para Pior)</option>
+          </select>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-outline" id="cancelAdd">Cancelar</button>
+          <button class="btn btn-primary" id="confirmAdd">Adicionar Zap</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Provider Config Modal -->
+  <div class="modal-overlay" id="providerModal">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h2 id="providerModalTitle">Adicionar Provedor</h2>
+        <button class="modal-close" id="closeProviderModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="providerFormStep">
+          <div class="form-group">
+            <label for="providerName">Nome do Provedor</label>
+            <input type="text" id="providerName" placeholder="Ex: Meu OpenAI">
+          </div>
+          <div class="form-group">
+            <label for="apiKey">Chave API</label>
+            <input type="password" id="apiKey" placeholder="Cole sua chave API aqui">
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-outline" id="cancelProviderConfig">Cancelar</button>
+            <button class="btn btn-primary" id="saveProviderConfig">Salvar e Buscar Modelos</button>
+          </div>
+        </div>
+        <div id="providerModelsStep" style="display:none">
+          <div class="loading-models" id="loadingModels">
+            <p>Buscando modelos disponveis...</p>
+          </div>
+          <div id="modelsResult" style="display:none">
+            <div class="form-group">
+              <label>Modelos Encontrados</label>
+              <p class="form-hint">Desmarque os modelos que no deseja usar</p>
+              <div class="models-list" id="modelsList"></div>
+            </div>
+            <div class="form-actions">
+              <button class="btn btn-outline" id="cancelProviderConfig2">Cancelar</button>
+              <button class="btn btn-primary" id="confirmSaveProvider">Confirmar e Salvar</button>
+            </div>
+          </div>
+          <div id="modelsError" style="display:none">
+            <p class="error-text">Erro ao buscar modelos. Verifique sua chave API.</p>
+            <div class="form-actions">
+              <button class="btn btn-outline" id="retryProviderConfig">Tentar Novamente</button>
+              <button class="btn btn-outline" id="cancelProviderConfig3">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Provider Config Page Modal -->
+  <div class="modal-overlay" id="providerConfigModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <h2 id="providerConfigTitle">Configurar Provedor</h2>
+        <button class="modal-close" id="closeProviderConfigModal">&times;</button>
+      </div>
+      <div class="modal-body provider-config-body">
+        <!-- Provider Name Section -->
+        <div class="config-section">
+          <label class="config-label">Nome do Provedor</label>
+          <input type="text" id="editProviderName" class="config-input">
+        </div>
+
+        <!-- APIs Section -->
+        <div class="config-section">
+          <div class="config-section-header">
+            <label class="config-label">APIs Configuradas</label>
+            <button class="btn btn-sm btn-outline" id="addApiKeyBtn">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              Adicionar API
+            </button>
+          </div>
+          <p class="config-hint">Adicione vrias chaves API para distribuir o uso entre mltiplos nmeros</p>
+          <div class="api-keys-list" id="apiKeysList">
+            <!-- API keys will be injected here -->
+          </div>
+        </div>
+
+        <!-- Models Section -->
+        <div class="config-section">
+          <label class="config-label">Modelos Disponveis</label>
+          <p class="config-hint">Clique em "Testar" para conversar com o modelo e verificar se est funcionando</p>
+          <div class="config-models-list" id="configModelsList">
+            <!-- Models will be injected here -->
+          </div>
+        </div>
+
+        <!-- Save/Cancel Actions -->
+        <div class="config-actions">
+          <button class="btn btn-outline" id="cancelProviderConfigBtn">Cancelar</button>
+          <button class="btn btn-primary" id="saveProviderConfigBtn">Salvar Alteraes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Test Chat Modal -->
+  <div class="modal-overlay" id="testChatModal">
+    <div class="modal modal-md">
+      <div class="modal-header">
+        <h2 id="testChatTitle">Testar Modelo</h2>
+        <button class="modal-close" id="closeTestChatModal">&times;</button>
+      </div>
+      <div class="modal-body test-chat-body">
+        <div class="test-chat-history" id="testChatHistory">
+          <div class="test-chat-empty">Envie uma mensagem para testar o modelo...</div>
+        </div>
+        <div class="test-chat-input-area">
+          <textarea id="testChatInput" class="test-chat-input" placeholder="Digite sua mensagem..." rows="2"></textarea>
+          <button class="btn btn-primary btn-send" id="sendTestMessage">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WhatsApp Connection Modal -->
+  <div class="modal-overlay" id="connectModal">
+    <div class="modal modal-connect">
+      <div class="modal-header">
+        <h2 id="connectModalTitle">Conectar WhatsApp</h2>
+        <button class="modal-close" id="closeConnectModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Connection Tabs -->
+        <div class="connect-tabs">
+          <button class="connect-tab active" data-method="qrcode">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="7" height="7"/>
+              <rect x="14" y="3" width="7" height="7"/>
+              <rect x="3" y="14" width="7" height="7"/>
+              <rect x="14" y="14" width="3" height="3"/>
+            </svg>
+            QR Code
+          </button>
+          <button class="connect-tab" data-method="pairing">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="5" y="2" width="14" height="20" rx="2" ry="2"/>
+              <line x1="12" y1="18" x2="12.01" y2="18"/>
+            </svg>
+            Cdigo
+          </button>
+        </div>
+
+        <!-- QR Code Tab -->
+        <div class="connect-tab-content active" id="tabQrcode">
+          <div class="connect-zap-name" id="connectZapNameQr"></div>
+          <div class="connect-qr-container">
+            <div class="connect-qr-loading" id="qrLoading">
+              <div class="spinner"></div>
+              <p>Gerando QR Code...</p>
+            </div>
+            <div class="connect-qr-image" id="qrImage" style="display:none"></div>
+          </div>
+          <div class="connect-status" id="qrStatus">Aguardando QR Code...</div>
+          <div class="connect-instructions">
+            <p><strong>Como vincular (mesmo nmero do celular):</strong></p>
+            <ol>
+              <li>Abra o WhatsApp <strong>no celular com esse nmero</strong></li>
+              <li>Toque nos <strong>3 pontinhos</strong> (canto superior direito)</li>
+              <li>Toque em <strong>Dispositivos vinculados</strong></li>
+              <li>Toque em <strong>Vincular dispositivo</strong></li>
+              <li><strong>Escaneie o QR Code</strong> que aparece acima</li>
+            </ol>
+            <p style="margin-top:12px;font-weight:500">Pronto! O app ficar vinculado ao seu WhatsApp e a IA responder automaticamente.</p>
+          </div>
+        </div>
+
+        <!-- Pairing Code Tab -->
+        <div class="connect-tab-content" id="tabPairing">
+          <div class="connect-zap-name" id="connectZapNamePair"></div>
+          <div class="connect-pairing-form" id="pairingForm">
+            <div class="form-group">
+              <label for="pairingPhone">Nmero do celular do cliente</label>
+              <input type="tel" id="pairingPhone" placeholder="Ex: 5511999999999">
+              <p class="form-hint">Apenas nmeros, sem espacos ou traos. Este  o nmero que o cliente usa no WhatsApp dele.</p>
+            </div>
+            <button class="btn btn-primary btn-block" id="generatePairingCode">
+              Gerar Cdigo de Pareamento
+            </button>
+          </div>
+          <div class="connect-pairing-code" id="pairingCodeDisplay" style="display:none">
+            <p class="pairing-code-label">Envie este cdigo para o cliente:</p>
+            <div class="pairing-code-value" id="pairingCodeValue"></div>
+            <button class="btn btn-outline btn-sm" id="copyPairingCode">Copiar Cdigo</button>
+            <p class="form-hint" style="margin-top:12px">O cliente deve abrir WhatsApp > Dispositivos vinculados > Vincular dispositivo > Vincular com nmero de telefone > Digitar este cdigo</p>
+          </div>
+          <div class="connect-status" id="pairingStatus"></div>
+          <div class="connect-instructions">
+            <p><strong>Como funciona (para venda remota):</strong></p>
+            <ol>
+              <li>Digite o nmero do WhatsApp do cliente</li>
+              <li>Clique em "Gerar Cdigo"</li>
+              <li>Envie o cdigo de 8 dgitos para o cliente</li>
+              <li>O cliente abre WhatsApp <strong>no celular dele</strong></li>
+              <li>Vai em <strong>Dispositivos vinculados > Vincular dispositivo > Vincular com nmero de telefone</strong></li>
+              <li>Digita o cdigo que voc enviou</li>
+            </ol>
+            <p style="margin-top:12px;font-weight:500">Pronto! A IA vai responder automaticamente no WhatsApp do cliente.</p>
+          </div>
+        </div>
+
+        <!-- Connecting Status -->
+        <div class="connect-progress" id="connectProgress" style="display:none">
+          <div class="spinner"></div>
+          <p id="connectProgressText">Conectando...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log Modal -->
+  <div class="modal-overlay" id="logModal">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h2 id="logModalTitle">Log</h2>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-outline btn-sm" id="copyLogBtn">Copiar Log</button>
+          <button class="modal-close" id="closeLogModal">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="log-container" id="logContainer">
+          <p class="log-empty">Nenhuma atividade ainda. Envie uma mensagem para o nmero do Zap e veja o log aqui.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Zap Contacts Modal -->
+  <div class="modal-overlay" id="zapContactsModal">
+    <div class="modal modal-md">
+      <div class="modal-header">
+        <h2 id="zapContactsModalTitle">Contatos do Zap</h2>
+        <button class="modal-close" id="closeZapContactsModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="config-hint" style="margin-bottom: 16px;">Selecione quais contatos a IA est autorizada a responder.</p>
+        <div class="zap-contacts-list" id="zapContactsList">
+          <div class="spinner" style="margin: 20px auto;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Training Modal (Add/Edit) -->
+  <div class="modal-overlay" id="trainingModal">
+    <div class="modal modal-md">
+      <div class="modal-header">
+        <h2 id="trainingModalTitle">Adicionar Treinamento</h2>
+        <button class="modal-close" id="closeTrainingModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="trainingTitle">Título (opcional)</label>
+          <input type="text" id="trainingTitle" placeholder="Ex: Cardápio, Preços, Sobre a loja...">
+        </div>
+        <div class="form-group">
+          <label for="trainingContent">Conteúdo do treinamento</label>
+          <p class="form-hint">Informações que a IA deve saber: produtos, preços, regras, horários, nome do negócio, como se comportar, etc.</p>
+          <textarea id="trainingContent" rows="8" placeholder="Ex: Somos a Chique Chique Bahia, loja de roupas..."></textarea>
+          <div class="form-hint" id="trainingCharCount">0 caracteres</div>
+        </div>
+        <div class="form-group">
+          <label>Imagens (opcional)</label>
+          <p class="form-hint">Cardápios, catálogos, fotos. Quando o cliente pedir, a IA envia a imagem. Máx 5MB por imagem, até 10 imagens.</p>
+          <input type="file" id="trainingImageInput" accept="image/*" multiple>
+          <div id="trainingImagesList" class="training-images-list"></div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-outline" id="cancelTraining">Cancelar</button>
+          <button class="btn btn-primary" id="saveTraining">Salvar Treinamento</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/providers.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
