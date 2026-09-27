@@ -29,17 +29,29 @@
           <circle cx="11" cy="11" r="8"/>
           <line x1="21" y1="21" x2="16.65" y2="16.65"/>
         </svg>
-        <input type="text" placeholder="Buscar Zaps, nmeros..." id="searchInput">
+        <input type="text" placeholder="Buscar Zaps, nmeros..." id="searchInput" autocomplete="off">
+        <button class="search-clear" id="searchClear" title="Limpar busca" style="display:none">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+
+        <div class="search-dropdown" id="searchDropdown" style="display:none">
+          <div class="search-dd-block" id="searchRecentBlock">
+            <div class="search-dd-label">Pesquisas recentes</div>
+            <div id="searchRecentList"></div>
+          </div>
+          <div class="search-dd-block" id="searchSuggestBlock">
+            <div class="search-dd-label">Sugestes</div>
+            <div id="searchSuggestList"></div>
+          </div>
+          <div class="search-dd-empty" id="searchDdEmpty" style="display:none">Nenhuma sugesto</div>
+        </div>
       </div>
 
       <!-- Top Right Icons -->
       <div class="top-right-icons">
-        <button class="icon-btn" title="Notificaes">
-          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#111111" stroke-width="2">
-            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
-            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-          </svg>
-        </button>
         <button class="icon-btn" title="Configuraes">
           <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#111111" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
@@ -90,13 +102,7 @@
             <svg class="menu-icon whatsapp-menu-icon" viewBox="0 0 32 32" width="20" height="20">
               <path fill="currentColor" d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
             </svg>
-            <span>Adicionar WhatsApp</span>
-          </a>
-          <a href="#" class="menu-item" data-page="meus-zaps">
-            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-            </svg>
-            <span>Meus Zaps</span>
+            <span>Gerenciar Zaps</span>
           </a>
           <a href="#" class="menu-item" data-page="contatos">
             <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
@@ -235,7 +241,7 @@
                     <path d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
                   </svg>
                 </div>
-                <div>
+                <div class="panel-header-main">
                   <div class="panel-header-name-row">
                     <span class="panel-header-name" id="zapPanelName">Nome do Zap</span>
                     <div class="zap-card-status" id="zapPanelStatus"><span class="dot"></span> Desconectado</div>
@@ -243,10 +249,6 @@
                       <input type="checkbox" id="panelEnabled" checked>
                       <span class="toggle-slider"></span>
                       <span class="panel-enabled-label" id="panelEnabledLabel">Ativo</span>
-                    </label>
-                    <label class="panel-auto-reply">
-                      <input type="checkbox" id="panelAutoReply" checked>
-                      <span>Ativar auto-resposta</span>
                     </label>
                   </div>
                   <div class="panel-header-phone-row">
@@ -258,6 +260,13 @@
                       </svg>
                       Copiar
                     </button>
+                    <label class="panel-auto-reply">
+                      <input type="checkbox" id="panelAutoReply" checked>
+                      <span>Ativar auto-resposta</span>
+                    </label>
+                  </div>
+                  <div class="panel-header-personality-row">
+                    <span class="panel-personality-badge" id="zapPanelPersonality">Padro</span>
                   </div>
                 </div>
               </div>
@@ -295,49 +304,31 @@
             <!-- Personality -->
             <div class="panel-section">
               <div class="panel-section-title">Personalidade</div>
-              <div class="model-config-box">
-                <div class="model-config-row">
-                  <div>
-                    <div class="model-config-label">Personalidade da IA</div>
-                    <div class="model-config-hint">Define o estilo de resposta do Zap</div>
-                  </div>
-                  <select class="model-config-select" id="panelPersonality">
-                    <option value="padrao">Padro (Jovem 17 anos)</option>
-                    <option value="vendedor">Vendedor</option>
-                    <option value="atendente">Atendente</option>
-                    <option value="especialista">Especialista</option>
-                  </select>
+              <select class="model-config-select panel-select-full" id="panelPersonality">
+                <option value="padrao">Padro (Jovem 17 anos)</option>
+                <option value="vendedor">Vendedor</option>
+                <option value="atendente">Atendente</option>
+                <option value="especialista">Especialista</option>
+              </select>
+              <div class="model-config-row panel-area-row" id="panelAreaRow" style="display:none">
+                <div>
+                  <div class="model-config-label">rea de Atuao</div>
+                  <div class="model-config-hint">Ex: Psicologia, Dentista, Advogado</div>
                 </div>
-                <div class="model-config-row" id="panelAreaRow" style="display:none">
-                  <div>
-                    <div class="model-config-label">rea de Atuao</div>
-                    <div class="model-config-hint">Ex: Psicologia, Dentista, Advogado</div>
-                  </div>
-                  <input type="text" class="panel-area-input" id="panelArea" placeholder="Sua rea de atuao...">
-                </div>
+                <input type="text" class="panel-area-input" id="panelArea" placeholder="Sua rea de atuao...">
               </div>
             </div>
 
             <!-- Charts -->
             <div class="panel-section">
               <div class="panel-section-title">Estatsticas</div>
-              <div class="charts-row">
-                <div class="chart-box">
-                  <div class="chart-box-header">
-                    <div class="chart-box-title">Tokens Gastos</div>
-                    <div class="chart-box-value" id="tokensValue">0</div>
-                  </div>
-                  <canvas class="chart-canvas" id="tokensChart"></canvas>
-                  <div class="chart-tooltip" id="tokensTooltip"></div>
+              <div class="chart-box">
+                <div class="chart-box-header">
+                  <div class="chart-box-title">Atividade da IA - ultimas 12 horas</div>
+                  <div class="chart-box-value" id="usageValue">0</div>
                 </div>
-                <div class="chart-box">
-                  <div class="chart-box-header">
-                    <div class="chart-box-title">Uso do Zap</div>
-                    <div class="chart-box-value" id="usageValue">0</div>
-                  </div>
-                  <canvas class="chart-canvas" id="usageChart"></canvas>
-                  <div class="chart-tooltip" id="usageTooltip"></div>
-                </div>
+                <canvas class="chart-canvas" id="usageChart"></canvas>
+                <div class="chart-tooltip" id="usageTooltip"></div>
               </div>
             </div>
 
@@ -345,27 +336,28 @@
             <div class="panel-section">
               <div class="panel-section-title">Provedores de IA</div>
               <div id="panelProvidersList"></div>
+            </div>
 
-              <div class="model-config-box">
-                <div class="model-config-row">
-                  <div>
-                    <div class="model-config-label">Modelo de Resposta</div>
-                    <div class="model-config-hint">Escolha o modelo ou use o automtico</div>
-                  </div>
-                  <select class="model-config-select" id="panelModelSelect">
-                    <option value="auto">Automtico (Melhor para Pior)</option>
-                  </select>
+            <!-- Response Models -->
+            <div class="panel-section">
+              <div class="panel-section-title">Modelos de Resposta</div>
+              <div class="panel-models-header">
+                <span class="panel-models-hint">Modelos de todos os provedores selecionados</span>
+                <label class="panel-select-all" title="Marcar todos os modelos">
+                  <input type="checkbox" id="panelSelectAllModels" checked>
+                  <span>Usar todos</span>
+                </label>
+              </div>
+              <div class="panel-models-list" id="panelModelsList"></div>
+              <div class="panel-models-footer">
+                <div>
+                  <div class="model-config-label">Trocar modelo automaticamente</div>
+                  <div class="model-config-hint">Se um modelo falhar, usa o proximo disponivel</div>
                 </div>
-                <div class="model-config-row">
-                  <div>
-                    <div class="model-config-label">Trocar modelo automaticamente</div>
-                    <div class="model-config-hint">Se um modelo falhar, usa o proximo disponivel</div>
-                  </div>
-                  <label class="toggle-switch">
-                    <input type="checkbox" id="panelAutoSwitch" checked>
-                    <span class="toggle-slider"></span>
-                  </label>
-                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="panelAutoSwitch" checked>
+                  <span class="toggle-slider"></span>
+                </label>
               </div>
             </div>
 
@@ -394,6 +386,7 @@
         <div class="page" id="page-contatos">
           <h1 class="page-title">Contatos</h1>
           <p class="page-subtitle">Gerencie os contatos dos seus nmeros</p>
+          <div class="contacts-zaps-list" id="contactsZapsList"></div>
         </div>
 
         <!-- Page: Conversas -->
@@ -499,25 +492,120 @@
             </div>
 
             <div class="trainings-list" id="trainingsList"></div>
+
+            <!-- Biblioteca de imagens (todos os Zaps) -->
+            <div class="image-library" id="imageLibrary">
+              <div class="image-library-header">
+                <h3 class="image-library-title">Biblioteca de imagens</h3>
+                <span class="image-library-count" id="imageLibraryCount"></span>
+              </div>
+              <div class="image-library-grid" id="imageLibraryGrid"></div>
+            </div>
           </div>
         </div>
 
         <!-- Page: Provedores -->
         <div class="page" id="page-provedores">
-          <h1 class="page-title">Provedores de IA</h1>
-          <p class="page-subtitle">Gerencie seus provedores de inteligncia artificial</p>
-          <div class="page-actions">
-            <button class="btn btn-primary disabled-btn" id="addProviderBtn" disabled title="Em breve">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-              Adicionar Provedor
-              <span class="coming-soon-badge">Em Breve</span>
-            </button>
+          <!-- List View -->
+          <div id="providersListView">
+            <div class="page-header-row">
+              <div>
+                <h1 class="page-title">Provedores de IA</h1>
+                <p class="page-subtitle">Gerencie seus provedores de inteligncia artificial</p>
+              </div>
+              <div class="page-actions" style="margin:0">
+                <button class="btn btn-primary disabled-btn" id="addProviderBtn" disabled title="Em breve">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"/>
+                    <line x1="5" y1="12" x2="19" y2="12"/>
+                  </svg>
+                  Adicionar Provedor
+                  <span class="coming-soon-badge">Em Breve</span>
+                </button>
+              </div>
+            </div>
+            <div class="providers-list" id="providersList">
+              <!-- Providers will be injected here -->
+            </div>
           </div>
-          <div class="providers-list" id="providersList">
-            <!-- Providers will be injected here -->
+
+          <!-- Detail View: configurao inline do provedor -->
+          <div id="providerDetailView" style="display:none">
+            <div class="prov-top-bar">
+              <button class="btn-back-list" id="provBackBtn">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="19" y1="12" x2="5" y2="12"/>
+                  <polyline points="12 19 5 12 12 5"/>
+                </svg>
+                Voltar aos provedores
+              </button>
+            </div>
+
+            <div class="prov-detail-header">
+              <div class="prov-detail-name-row">
+                <h2 class="prov-detail-name" id="provDetailName">Provedor</h2>
+                <button class="prov-icon-btn" id="provRenameBtn" title="Editar nome">
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+                  </svg>
+                </button>
+                <div class="prov-name-editor" id="provNameEditor" style="display:none">
+                  <input type="text" id="provNameInput" class="prov-name-input" placeholder="Nome do provedor">
+                  <button class="prov-icon-btn ok" id="provNameConfirm" title="Confirmar">
+                    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                  </button>
+                  <button class="prov-icon-btn" id="provNameCancel" title="Cancelar">
+                    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <line x1="18" y1="6" x2="6" y2="18"/>
+                      <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              <button class="prov-save-btn" id="provSaveBtn" style="display:none">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                Salvar alteraes
+              </button>
+            </div>
+
+            <!-- Chaves API -->
+            <section class="prov-section">
+              <div class="prov-section-header">
+                <h3 class="prov-section-title">Chaves API</h3>
+                <button class="prov-section-action" id="provAddKeyBtn">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"/>
+                    <line x1="5" y1="12" x2="19" y2="12"/>
+                  </svg>
+                  Adicionar API
+                </button>
+              </div>
+              <div class="prov-keys-list" id="provKeysList"></div>
+              <div class="prov-key-form" id="provKeyForm" style="display:none">
+                <input type="text" id="provKeyNameInput" class="prov-key-form-input" placeholder="Nome da chave" maxlength="40">
+                <input type="password" id="provKeyValueInput" class="prov-key-form-input grow" placeholder="Chave API">
+                <button class="btn btn-primary btn-sm" id="provKeyConfirmBtn">Adicionar</button>
+                <button class="prov-icon-btn" id="provKeyCancelBtn" title="Cancelar">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18"/>
+                    <line x1="6" y1="6" x2="18" y2="18"/>
+                  </svg>
+                </button>
+              </div>
+            </section>
+
+            <!-- Modelos -->
+            <section class="prov-section">
+              <div class="prov-section-header">
+                <h3 class="prov-section-title">Modelos</h3>
+                <span class="prov-section-count" id="provModelsCount"></span>
+              </div>
+              <div class="prov-models-list" id="provModelsList"></div>
+            </section>
           </div>
         </div>
 
@@ -644,56 +732,6 @@
     </div>
   </div>
 
-  <!-- Provider Config Page Modal -->
-  <div class="modal-overlay" id="providerConfigModal">
-    <div class="modal modal-xl">
-      <div class="modal-header">
-        <h2 id="providerConfigTitle">Configurar Provedor</h2>
-        <button class="modal-close" id="closeProviderConfigModal">&times;</button>
-      </div>
-      <div class="modal-body provider-config-body">
-        <!-- Provider Name Section -->
-        <div class="config-section">
-          <label class="config-label">Nome do Provedor</label>
-          <input type="text" id="editProviderName" class="config-input">
-        </div>
-
-        <!-- APIs Section -->
-        <div class="config-section">
-          <div class="config-section-header">
-            <label class="config-label">APIs Configuradas</label>
-            <button class="btn btn-sm btn-outline" id="addApiKeyBtn">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-              Adicionar API
-            </button>
-          </div>
-          <p class="config-hint">Adicione vrias chaves API para distribuir o uso entre mltiplos nmeros</p>
-          <div class="api-keys-list" id="apiKeysList">
-            <!-- API keys will be injected here -->
-          </div>
-        </div>
-
-        <!-- Models Section -->
-        <div class="config-section">
-          <label class="config-label">Modelos Disponveis</label>
-          <p class="config-hint">Clique em "Testar" para conversar com o modelo e verificar se est funcionando</p>
-          <div class="config-models-list" id="configModelsList">
-            <!-- Models will be injected here -->
-          </div>
-        </div>
-
-        <!-- Save/Cancel Actions -->
-        <div class="config-actions">
-          <button class="btn btn-outline" id="cancelProviderConfigBtn">Cancelar</button>
-          <button class="btn btn-primary" id="saveProviderConfigBtn">Salvar Alteraes</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <!-- Test Chat Modal -->
   <div class="modal-overlay" id="testChatModal">
     <div class="modal modal-md">
@@ -757,17 +795,6 @@
             <div class="connect-qr-image" id="qrImage" style="display:none"></div>
           </div>
           <div class="connect-status" id="qrStatus">Aguardando QR Code...</div>
-          <div class="connect-instructions">
-            <p><strong>Como vincular (mesmo nmero do celular):</strong></p>
-            <ol>
-              <li>Abra o WhatsApp <strong>no celular com esse nmero</strong></li>
-              <li>Toque nos <strong>3 pontinhos</strong> (canto superior direito)</li>
-              <li>Toque em <strong>Dispositivos vinculados</strong></li>
-              <li>Toque em <strong>Vincular dispositivo</strong></li>
-              <li><strong>Escaneie o QR Code</strong> que aparece acima</li>
-            </ol>
-            <p style="margin-top:12px;font-weight:500">Pronto! O app ficar vinculado ao seu WhatsApp e a IA responder automaticamente.</p>
-          </div>
         </div>
 
         <!-- Pairing Code Tab -->
@@ -790,18 +817,6 @@
             <p class="form-hint" style="margin-top:12px">O cliente deve abrir WhatsApp > Dispositivos vinculados > Vincular dispositivo > Vincular com nmero de telefone > Digitar este cdigo</p>
           </div>
           <div class="connect-status" id="pairingStatus"></div>
-          <div class="connect-instructions">
-            <p><strong>Como funciona (para venda remota):</strong></p>
-            <ol>
-              <li>Digite o nmero do WhatsApp do cliente</li>
-              <li>Clique em "Gerar Cdigo"</li>
-              <li>Envie o cdigo de 8 dgitos para o cliente</li>
-              <li>O cliente abre WhatsApp <strong>no celular dele</strong></li>
-              <li>Vai em <strong>Dispositivos vinculados > Vincular dispositivo > Vincular com nmero de telefone</strong></li>
-              <li>Digita o cdigo que voc enviou</li>
-            </ol>
-            <p style="margin-top:12px;font-weight:500">Pronto! A IA vai responder automaticamente no WhatsApp do cliente.</p>
-          </div>
         </div>
 
         <!-- Connecting Status -->
@@ -815,7 +830,7 @@
 
   <!-- Log Modal -->
   <div class="modal-overlay" id="logModal">
-    <div class="modal modal-lg">
+    <div class="modal modal-lg modal-log">
       <div class="modal-header">
         <h2 id="logModalTitle">Log</h2>
         <div style="display:flex;gap:8px;align-items:center">
@@ -867,14 +882,38 @@
         </div>
         <div class="form-group">
           <label>Imagens (opcional)</label>
-          <p class="form-hint">Cardápios, catálogos, fotos. Quando o cliente pedir, a IA envia a imagem. Máx 5MB por imagem, até 10 imagens.</p>
+          <p class="form-hint">Cardápios, catálogos, fotos. Dê um nome e diga sobre o que é cada imagem - assim a IA sabe qual mandar. Máx 5MB por imagem, até 10 imagens.</p>
           <input type="file" id="trainingImageInput" accept="image/*" multiple>
           <div id="trainingImagesList" class="training-images-list"></div>
+        </div>
+        <div class="form-group">
+          <label>Links (opcional)</label>
+          <p class="form-hint">Cardápio digital, catálogo online, site. Quando o cliente pedir, a IA manda o link. Até 10 links.</p>
+          <div class="link-add-row">
+            <input type="text" id="trainingLinkUrl" placeholder="https://exemplo.com/cardapio">
+            <input type="text" id="trainingLinkDesc" placeholder="Nome/sobre o link (ex: Cardápio digital)">
+            <button type="button" class="btn btn-outline btn-sm" id="addTrainingLink">Adicionar</button>
+          </div>
+          <div id="trainingLinksList" class="training-images-list"></div>
         </div>
         <div class="form-actions">
           <button class="btn btn-outline" id="cancelTraining">Cancelar</button>
           <button class="btn btn-primary" id="saveTraining">Salvar Treinamento</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Image Viewer -->
+  <div class="modal-overlay" id="imageViewerModal">
+    <div class="modal image-viewer">
+      <div class="modal-header">
+        <h2 id="imageViewerTitle">Imagem</h2>
+        <button class="modal-close" id="closeImageViewer">&times;</button>
+      </div>
+      <div class="modal-body image-viewer-body">
+        <img id="imageViewerImg" src="" alt="">
+        <p class="image-viewer-caption" id="imageViewerCaption"></p>
       </div>
     </div>
   </div>

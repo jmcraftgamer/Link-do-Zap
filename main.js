@@ -1,13 +1,21 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const WhatsAppManager = require('./src/js/whatsapp-manager');
 const AIResponder = require('./src/js/ai-responder');
+const { resolveReplyMedia } = require('./src/js/media-resolver');
 
 let mainWindow;
 let whatsappManager;
 let aiResponder;
 let rendererDragging = false;
+
+// Um evaluate do wwebjs numa pagina morta (teardown de LOGOUT) rejeita sem
+// catcher e no Node derrubaria o processo inteiro - aqui so registra o erro
+process.on('unhandledRejection', (reason) => {
+  const msg = reason && reason.message ? reason.message : String(reason);
+  console.error('[UNHANDLED] Promessa rejeitada sem tratamento:', msg);
+});
 
 // ------------------------------------------------------------
 // Helpers - paths
@@ -74,15 +82,6 @@ function resolveProviderKey(provider) {
   return provider;
 }
 
-function parseImageMarkers(text) {
-  const re = /\[SEND_IMAGE:([^\]]+)\]/g;
-  const ids = [];
-  let m;
-  while ((m = re.exec(text)) !== null) ids.push(m[1]);
-  const clean = text.replace(re, '').trim();
-  return { ids, clean };
-}
-
 async function sendErrorToWhatsApp(zapId, chatId, msg) {
   try {
     const clientData = whatsappManager && whatsappManager.clients.get(String(zapId));
@@ -99,17 +98,40 @@ async function sendErrorToWhatsApp(zapId, chatId, msg) {
   }
 }
 
-async function sendTypingIndicator(zapId, chatId) {
+async function sendTypingIndicator(zapId, chatId, silent = false) {
   try {
     const clientData = whatsappManager && whatsappManager.clients.get(String(zapId));
-    if (!clientData) return;
-    const chat = clientData.chats ? clientData.chats.get(chatId) : null;
-    if (chat && chat.sendStateTyping) {
-      await chat.sendStateTyping();
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('whatsapp-typing', { zapId: String(zapId), chatId, isTyping: true });
+    if (!clientData || !clientData.client || !clientData.client.pupPage) {
+      if (!silent) sendLog(zapId, 'warning', 'Indicador digitando: cliente ou pagina pupPage indisponivel');
+      return;
+    }
+    const page = clientData.client.pupPage;
+    const success = await page.evaluate(async (id) => {
+      try {
+        let wid = window.require('WAWebWidFactory').createWid(id);
+        if (wid.isLid && wid.isLid()) {
+          try {
+            const pn = window.require('WAWebApiContact').getPhoneNumber(wid);
+            if (pn) wid = pn;
+          } catch (_) {}
+        }
+        const ChatState = window.require('WAWebChatStateBridge');
+        await ChatState.sendChatStateComposing(wid);
+        return true;
+      } catch (err) {
+        return { error: err.message };
       }
-      sendLog(zapId, 'info', 'Indicador digitando enviado no WhatsApp');
+    }, chatId);
+
+    if (success === true) {
+      if (!silent) {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('whatsapp-typing', { zapId: String(zapId), chatId, isTyping: true });
+        }
+        sendLog(zapId, 'info', 'Indicador digitando enviado no WhatsApp');
+      }
+    } else {
+      sendLog(zapId, 'warning', `Falha ao enviar digitando via page.evaluate: ${success && success.error ? success.error : 'desconhecido'}`);
     }
   } catch (e) {
     sendLog(zapId, 'warning', `Nao foi possivel enviar digitando: ${e.message}`);
@@ -119,8 +141,22 @@ async function sendTypingIndicator(zapId, chatId) {
 async function clearTypingIndicator(zapId, chatId) {
   try {
     const clientData = whatsappManager && whatsappManager.clients.get(String(zapId));
-    const chat = clientData && clientData.chats ? clientData.chats.get(chatId) : null;
-    if (chat && chat.clearState) await chat.clearState();
+    if (!clientData || !clientData.client || !clientData.client.pupPage) return;
+    const page = clientData.client.pupPage;
+    await page.evaluate(async (id) => {
+      try {
+        let wid = window.require('WAWebWidFactory').createWid(id);
+        if (wid.isLid && wid.isLid()) {
+          try {
+            const pn = window.require('WAWebApiContact').getPhoneNumber(wid);
+            if (pn) wid = pn;
+          } catch (_) {}
+        }
+        const ChatState = window.require('WAWebChatStateBridge');
+        await ChatState.sendChatStatePaused(wid);
+      } catch (_) {}
+    }, chatId).catch(() => {});
+
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('whatsapp-typing', { zapId: String(zapId), chatId, isTyping: false });
     }
@@ -134,7 +170,8 @@ async function transcribeAudio(audio, providersData, zapId, apiKeySelections) {
   // audio: { data: base64, mimetype, size }
   // Try aiResponder.transcribeAudio if exists, else fallback to asking to repeat
   if (aiResponder && typeof aiResponder.transcribeAudio === 'function') {
-    return await aiResponder.transcribeAudio(audio, providersData, zapId, apiKeySelections);
+    const log = (type, msg) => sendLog(zapId, type, msg);
+    return await aiResponder.transcribeAudio(audio, providersData, zapId, apiKeySelections, log);
   }
   // Fallback: try OpenAI whisper via any provider that has key
   const anyProvider = (providersData || []).find(p => p.apiKey || (Array.isArray(p.apiKeys) && p.apiKeys[0]));
@@ -143,25 +180,58 @@ async function transcribeAudio(audio, providersData, zapId, apiKeySelections) {
 }
 
 // ------------------------------------------------------------
+// Fila por conversa: mensagens do MESMO chat sao processadas na ordem em
+// que chegaram. Sem isso, com o tempo aleatorio de resposta (15/25/35s),
+// a IA poderia responder a segunda mensagem antes da primeira.
+// ------------------------------------------------------------
+const chatQueues = new Map();
+
+async function handleIncomingMessage(messageData) {
+  const cid = (messageData.chat && messageData.chat.id) || messageData.from || messageData.to || '';
+  const key = `${messageData.zapId}|${cid}`;
+  const prev = chatQueues.get(key) || Promise.resolve();
+  const run = prev
+    .catch(() => {})
+    .then(() => processMessage(messageData))
+    .catch(e => console.error('handleIncomingMessage erro:', e));
+  chatQueues.set(key, run);
+  run.then(() => { if (chatQueues.get(key) === run) chatQueues.delete(key); });
+  return run;
+}
+
+// ------------------------------------------------------------
 // Core: handle incoming WhatsApp message -> IA -> reply
 // ------------------------------------------------------------
-async function handleIncomingMessage(messageData) {
+async function processMessage(messageData) {
   const { zapId, body, from, to, fromMe, chat, contact, audio } = messageData;
   const contactName = contact?.name || from;
   const chatId = chat?.id || from;
+  const audioFailed = !!messageData.audioFailed;
 
-  if (fromMe) {
-    const fromNumber = (from || '').split('@')[0];
-    const toNumber = (to || '').split('@')[0];
-    if (fromNumber !== toNumber) return;
-    sendLog(zapId, 'ai', `IA iniciando (teste para si mesmo): "${body}"`);
-  } else {
-    sendLog(zapId, 'ai', `IA iniciando para ${contactName}: "${body}"`);
+  // ================= GRUPOS: CORTE NO TOPO =================
+  // Nenhuma mensagem de grupo/canal/transmissao pode chegar na IA.
+  // Nem log de "IA iniciando", nem transcricao de audio, nada.
+  const jidRef = String(chatId || from || to || '');
+  const isGroupMsg = !!messageData.isGroup ||
+    !!(chat && chat.isGroup) ||
+    jidRef.includes('@g.us') ||
+    jidRef.includes('@newsletter') ||
+    jidRef.includes('@broadcast');
+  if (isGroupMsg) {
+    console.log(`[GRUPO] mensagem de grupo nao processada (zap ${zapId}) - IA bloqueada`);
+    return;
   }
 
-  if (chat && chat.isGroup) {
-    sendLog(zapId, 'info', `Ignorando mensagem de grupo (${contactName})`);
-    return;
+  if (fromMe) {
+    // So mensagens do AUTOCHAT (enviadas para o proprio numero) chegam aqui.
+    // As respostas da IA sao bloqueadas no whatsapp-manager (anti-loop).
+    if (!messageData.selfChat) {
+      sendLog(zapId, 'info', 'Ignorada: mensagem enviada por mim para outro contato.');
+      return;
+    }
+    sendLog(zapId, 'ai', `Autochat: IA iniciando para o proprio numero (${(to || from || '').split('@')[0]}): "${body}"`);
+  } else {
+    sendLog(zapId, 'ai', `IA iniciando para ${contactName}: "${body}"`);
   }
 
   const zapsData = loadZapsData();
@@ -200,6 +270,18 @@ async function handleIncomingMessage(messageData) {
   sendLog(zapId, 'info', `Config: modelo=${zap.model || 'auto'}, personalidade=${zap.personality || 'padrao'}, treinos=${enabledTrainings.length}`);
 
   let finalBody = body;
+
+  // Audio detectado mas download falhou (mesmo apos retries): em vez de
+  // ignorar em silencio, responde pedindo para mandar como texto
+  // (se tinha legenda, segue com a legenda mesmo)
+  const bodyIsAudioPlaceholder = !body || body.trim() === '' || body === '[AUDIO]';
+  if (audioFailed && (!audio || !audio.data) && bodyIsAudioPlaceholder) {
+    sendLog(zapId, 'warning', `Audio de ${contactName} nao pôde ser baixado. Pedindo para enviar como texto.`);
+    await sendErrorToWhatsApp(zapId, chatId, 'Nao consegui baixar seu audio, pode mandar como texto?');
+    sendLog(zapId, 'outgoing', 'Mensagem de audio nao baixado respondida.');
+    return;
+  }
+
   if (audio && (body === '[AUDIO]' || !body || body.trim() === '')) {
     sendLog(zapId, 'info', `Audio recebido de ${contactName}. Transcrevendo...`);
     try {
@@ -261,11 +343,18 @@ async function handleIncomingMessage(messageData) {
   }
   sendLog(zapId, 'info', `${modelsToTry.length} modelo(s) disponivel(is) para tentar`);
 
-  // Typing indicator + 5s delay
+  // ---- 1) SORTEIO DO TEMPO ANTES DE COMECAR A RESPONDER (15s, 25s ou 35s) ----
+  // Simula uma pessoa lendo a mensagem / pensando na resposta. Nesse periodo
+  // NADA aparece para o contato (sem "digitando").
+  const delayOptions = [15000, 25000, 35000];
+  const preDelay = delayOptions[Math.floor(Math.random() * delayOptions.length)];
+  sendLog(zapId, 'info', `Sorteio de tempo de resposta: ${(preDelay / 1000)}s antes de comecar a digitar...`);
+  await new Promise(resolve => setTimeout(resolve, preDelay));
+
+  // ---- 2) INDICADOR "DIGITANDO" LIGA AQUI ----
+  const typingStart = Date.now();
   await sendTypingIndicator(zapId, chatId);
-  sendLog(zapId, 'info', 'Digitando por 5 segundos...');
-  await new Promise(resolve => setTimeout(resolve, 5000));
-  await clearTypingIndicator(zapId, chatId);
+  sendLog(zapId, 'info', 'Indicador "digitando" ativado - IA gerando a resposta...');
 
   let response = null;
   let lastError = null;
@@ -298,10 +387,15 @@ async function handleIncomingMessage(messageData) {
       } else {
         r = await aiResponder.generateResponse(msgForAI, zapConfig, providersData);
       }
-      if (r && r.trim().length > 0) {
+      const isJunk = !!(aiResponder && typeof aiResponder.isJunkResponse === 'function' && aiResponder.isJunkResponse(r));
+      if (r && r.trim().length > 0 && !isJunk) {
         response = r;
         sendLog(zapId, 'success', `Resposta obtida com ${entry.provider.name} / ${entry.model.id}`);
         break;
+      } else if (r && r.trim().length > 0) {
+        // Artefato interno da IA (ex: "Check Constreainsts:*** Max") - NUNCA vai ao cliente
+        sendLog(zapId, 'warning', `${entry.provider.name} / ${entry.model.id} retornou texto invalido - descartado: "${r.trim().substring(0, 80)}"`);
+        lastError = 'Resposta invalida do modelo (texto de sistema)';
       } else {
         sendLog(zapId, 'warning', `${entry.provider.name} / ${entry.model.id} retornou vazio`);
         lastError = 'Resposta vazia';
@@ -314,13 +408,46 @@ async function handleIncomingMessage(messageData) {
 
   if (!response) {
     sendLog(zapId, 'error', `Todos os modelos falharam. Ultimo erro: ${lastError}`);
+    await clearTypingIndicator(zapId, chatId);
     await sendErrorToWhatsApp(zapId, chatId, 'Desculpe, tive um problema tecnico. Pode repetir sua mensagem?');
     return;
   }
 
-  // Parse image markers and send
-  const { ids: imageIds, clean: cleanText } = parseImageMarkers(response);
-  const textToSend = cleanText;
+  // Resolve imagem/link da resposta: marcadores da IA + fallback por intencao
+  const media = resolveReplyMedia(response, finalBody, enabledTrainings, (type, msg) => sendLog(zapId, type, msg));
+  const resolvedImages = media.images;
+  const resolvedLinks = media.links;
+  const textToSend = media.text;
+
+  // ---- 3) TEMPO REALISTA DE DIGITACAO ----
+  // Pessoa comum: em media 2s para digitar 5 caracteres => 0,4s por caractere
+  // (2,5 caracteres por segundo). O indicador so desliga e a mensagem so sai
+  // quando esse tempo passar (minimo 5s de "digitando" visivel).
+  const CARACTERES_POR_SEGUNDO = 5 / 2;
+  const chars = String(textToSend || '').length;
+  const humanTypingMs = Math.round((chars / CARACTERES_POR_SEGUNDO) * 1000);
+  const minTypingMs = 5000;
+  const targetTypingMs = Math.max(minTypingMs, humanTypingMs);
+  const typingElapsed = Date.now() - typingStart;
+  const remainingMs = targetTypingMs - typingElapsed;
+
+  sendLog(zapId, 'info',
+    `Digitacao realista: ${chars} caracteres = ~${(humanTypingMs / 1000).toFixed(1)}s de pessoa digitando; ` +
+    `indicador ligado ha ${(typingElapsed / 1000).toFixed(1)}s (alvo ${(targetTypingMs / 1000).toFixed(1)}s).`);
+
+  if (remainingMs > 0) {
+    sendLog(zapId, 'info', `Faltam ${(remainingMs / 1000).toFixed(1)}s com "digitando..." antes de enviar...`);
+    const deadline = Date.now() + remainingMs;
+    while (Date.now() < deadline) {
+      const left = deadline - Date.now();
+      await new Promise(resolve => setTimeout(resolve, Math.min(20000, left)));
+      // O WhatsApp expira o estado "digitando" em ~25s - renova ate o fim
+      if (Date.now() < deadline) await sendTypingIndicator(zapId, chatId, true);
+    }
+  }
+
+  // ---- 4) DESLIGA O INDICADOR E ENVIA ----
+  await clearTypingIndicator(zapId, chatId);
 
   if (textToSend) {
     const preview = textToSend.substring(0, 80);
@@ -334,50 +461,43 @@ async function handleIncomingMessage(messageData) {
     }
   }
 
-  // Send training images if requested via [SEND_IMAGE:id]
-  if (imageIds.length > 0) {
-    for (const imgId of imageIds) {
-      let found = null;
-      for (const t of enabledTrainings) {
-        const img = (t.images || []).find(im => String(im.id) === String(imgId));
-        if (img) { found = img; break; }
-      }
-      if (!found) {
-        sendLog(zapId, 'warning', `Imagem de treinamento ${imgId} nao encontrada`);
-        continue;
-      }
-      const rel = found.file || null;
-      if (!rel) {
-        // Try inline data fallback
-        if (found.data) {
-          try {
-            await whatsappManager.sendMedia(String(zapId), chatId, { data: found.data, mimeType: found.mimeType || 'image/jpeg', name: found.filename || `${imgId}.jpg` });
-            sendLog(zapId, 'success', `Imagem enviada: ${found.filename || imgId}`);
-            continue;
-          } catch (e) {
-            sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
-            continue;
-          }
+  // Send training images resolved from [SEND_IMAGE:id] (or intent fallback)
+  for (const found of resolvedImages) {
+    const imgId = found.id;
+    const label = found.name || found.filename || imgId;
+    const rel = found.file || null;
+    if (!rel) {
+      if (found.data) {
+        try {
+          await whatsappManager.sendMedia(String(zapId), chatId, { data: found.data, mimeType: found.mimeType || 'image/jpeg', name: found.filename || `${imgId}.jpg` });
+          sendLog(zapId, 'success', `Imagem enviada: ${label}`);
+        } catch (e) {
+          sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
         }
-        sendLog(zapId, 'warning', `Arquivo da imagem ${imgId} nao encontrado no disco`);
         continue;
       }
-      const abs = resolveDataPath(rel);
-      if (!abs || !fs.existsSync(abs)) {
-        sendLog(zapId, 'warning', `Arquivo da imagem ${imgId} nao encontrado no disco`);
-        continue;
-      }
-      try {
-        const b64 = fs.readFileSync(abs).toString('base64');
-        await whatsappManager.sendMedia(String(zapId), chatId, { data: b64, mimeType: found.mimeType || 'image/jpeg', name: found.filename || path.basename(abs) });
-        sendLog(zapId, 'success', `Imagem enviada: ${found.filename || imgId}`);
-      } catch (e) {
-        sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
-      }
+      sendLog(zapId, 'warning', `Arquivo da imagem ${imgId} nao encontrado no disco`);
+      continue;
+    }
+    const abs = resolveDataPath(rel);
+    if (!abs || !fs.existsSync(abs)) {
+      sendLog(zapId, 'warning', `Arquivo da imagem ${imgId} nao encontrado no disco`);
+      continue;
+    }
+    try {
+      const b64 = fs.readFileSync(abs).toString('base64');
+      await whatsappManager.sendMedia(String(zapId), chatId, { data: b64, mimeType: found.mimeType || 'image/jpeg', name: found.filename || path.basename(abs) });
+      sendLog(zapId, 'success', `Imagem enviada: ${label}`);
+    } catch (e) {
+      sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
     }
   }
 
-  if (!textToSend && imageIds.length === 0) {
+  if (resolvedLinks.length > 0) {
+    sendLog(zapId, 'success', `Link(s) enviado(s): ${resolvedLinks.map(l => l.name || l.description || l.url).join(', ')}`);
+  }
+
+  if (!textToSend && resolvedImages.length === 0 && resolvedLinks.length === 0) {
     sendLog(zapId, 'warning', 'Resposta vazia apos remocao de marcadores de imagem');
   }
 }
@@ -443,6 +563,14 @@ ipcMain.on('window-maximize', () => {
 });
 ipcMain.on('window-close', () => { if (mainWindow) mainWindow.close(); });
 ipcMain.on('window-focus', () => { if (mainWindow) mainWindow.focus(); });
+ipcMain.on('app-alert', (e, message) => {
+  dialog.showMessageBoxSync(mainWindow, { type: 'info', message: String(message || ''), buttons: ['OK'], defaultId: 0, noLink: true, title: app.getName() });
+  e.returnValue = true;
+});
+ipcMain.on('app-confirm', (e, message) => {
+  const r = dialog.showMessageBoxSync(mainWindow, { type: 'warning', message: String(message || ''), buttons: ['Sim', 'Não'], defaultId: 1, cancelId: 1, noLink: true, title: app.getName() });
+  e.returnValue = r === 0;
+});
 ipcMain.on('window-start-drag', () => { rendererDragging = true; });
 ipcMain.on('window-stop-drag', () => { rendererDragging = false; });
 ipcMain.on('window-drag-move', (e, dx, dy) => {

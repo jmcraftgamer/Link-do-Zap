@@ -2,6 +2,12 @@
 // Link no WhatsApp - App Logic
 // ============================================
 
+// Defensive patch for native dialog focus bug
+if (window.electronAPI && window.electronAPI.nativeAlert) {
+  window.alert = (m) => window.electronAPI.nativeAlert(String(m));
+  window.confirm = (m) => window.electronAPI.nativeConfirm(String(m));
+}
+
 function safeParseLS(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -23,6 +29,7 @@ let currentTrainingZapId = null;
 let editingTrainingId = null;
 let modalPendingImages = [];
 let modalDeletedFiles = [];
+let modalPendingLinks = [];
 
 // ============================================
 // Token & Usage Tracking
@@ -160,6 +167,13 @@ const menuItems = document.querySelectorAll('.menu-item');
 const pages = document.querySelectorAll('.page');
 const zapsList = document.getElementById('zapsList');
 const searchInput = document.getElementById('searchInput');
+const searchClearBtn = document.getElementById('searchClear');
+const searchDropdown = document.getElementById('searchDropdown');
+let globalSearchQuery = '';
+let searchDdItems = [];
+let searchDdIndex = -1;
+let lastRenderedConversations = null;
+let lastRenderedConversationsZapId = null;
 const addZapBtn = document.getElementById('addZapBtn');
 const listZapsBtn = document.getElementById('listZapsBtn');
 const addZapModal = document.getElementById('addZapModal');
@@ -325,14 +339,21 @@ function init() {
 // Render Zaps
 // ============================================
 function renderZaps(zaps) {
+  const list = globalSearchQuery
+    ? zaps.filter(zap => zapMatchesSearch(zap, globalSearchQuery))
+    : zaps;
+
   zapsList.innerHTML = '';
 
-  if (zaps.length === 0) {
-    zapsList.innerHTML = '<p style="color: #999; font-size: 14px; text-align: center; padding: 40px 0;">Nenhum Zap adicionado ainda.</p>';
+  if (list.length === 0) {
+    const msg = globalSearchQuery
+      ? 'Nenhum Zap encontrado para a busca.'
+      : 'Nenhum Zap adicionado ainda.';
+    zapsList.innerHTML = `<p style="color: #999; font-size: 14px; text-align: center; padding: 40px 0;">${msg}</p>`;
     return;
   }
 
-  zaps.forEach(zap => {
+  list.forEach(zap => {
     const card = createZapCard(zap);
     zapsList.appendChild(card);
   });
@@ -346,12 +367,6 @@ function createZapCard(zap) {
   card.className = 'zap-card';
   card.dataset.id = zap.id;
 
-  const personalityLabels = {
-    padrao: 'Padro', vendedor: 'Vendedor',
-    atendente: 'Atendente', especialista: 'Especialista'
-  };
-  const personalityLabel = personalityLabels[zap.personality] || 'Padro';
-
   card.innerHTML = `
     <div class="zap-card-icon">
       <svg viewBox="0 0 32 32" fill="#111">
@@ -361,7 +376,6 @@ function createZapCard(zap) {
     <div class="zap-card-info">
       <div class="zap-card-name-row">
         <span class="zap-card-name">${zap.name}</span>
-        <span class="zap-card-personality">${personalityLabel}</span>
       </div>
       <div class="zap-card-phone">${zap.phone}</div>
     </div>
@@ -443,6 +457,13 @@ function toggleAutoReply(id, enabled) {
 // Event Listeners
 // ============================================
 function setupEventListeners() {
+  // Redraw activity chart on resize (panel open)
+  window.addEventListener('resize', () => {
+    if (currentPanelZapId == null) return;
+    const zap = zapsData.find(z => String(z.id) === String(currentPanelZapId));
+    if (zap) renderPanelCharts(zap);
+  });
+
   // Custom window drag - sends DELTA (fixed bug where absolute screenX was sent)
   const topBar = document.querySelector('.top-bar');
   if (topBar && window.electronAPI) {
@@ -455,7 +476,7 @@ function setupEventListeners() {
       window.electronAPI.startDrag();
     });
     document.addEventListener('mousemove', (e) => {
-      if (!rendererDragging) return;
+      if (!rendererDragging || !(e.buttons & 1)) { rendererDragging = false; return; }
       const dx = e.screenX - lastX;
       const dy = e.screenY - lastY;
       lastX = e.screenX; lastY = e.screenY;
@@ -481,9 +502,49 @@ function setupEventListeners() {
     });
   });
 
-  searchInput.addEventListener('input', (e) => {
-    const query = e.target.value.toLowerCase();
-    filterZaps(query);
+  searchInput.addEventListener('input', () => {
+    updateSearchClearBtn();
+    const value = searchInput.value.trim();
+    if (!value) {
+      hideSearchDropdown();
+      if (globalSearchQuery) clearGlobalSearch(false);
+      return;
+    }
+    showSearchDropdown();
+    renderSearchDropdown(value);
+  });
+
+  searchInput.addEventListener('focus', () => {
+    updateSearchClearBtn();
+    showSearchDropdown();
+    renderSearchDropdown(searchInput.value.trim());
+  });
+
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const picked = (searchDdIndex >= 0 && searchDdItems[searchDdIndex])
+        ? searchDdItems[searchDdIndex]
+        : searchInput.value;
+      applyGlobalSearch(picked);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      moveSearchHighlight(1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveSearchHighlight(-1);
+    } else if (e.key === 'Escape') {
+      if (searchInput.value || globalSearchQuery) clearGlobalSearch(true);
+      hideSearchDropdown();
+    }
+  });
+
+  if (searchClearBtn) searchClearBtn.addEventListener('click', () => clearGlobalSearch(true));
+
+  document.addEventListener('click', (e) => {
+    if (!searchDropdown) return;
+    if (e.target && typeof e.target.closest === 'function' && e.target.closest('.search-bar')) return;
+    hideSearchDropdown();
   });
 
   addZapBtn.addEventListener('click', openModal);
@@ -588,35 +649,262 @@ function navigateTo(page) {
     targetPage.classList.add('active');
   }
 
+  // Cada pagina tem sua propria busca: trocar de pagina limpa o filtro
+  resetSearchForPage(page);
+
   if (page === 'treinamento') {
     closeTrainingEditor();
-    renderTrainingZapsList();
   }
+
   // Close zap panel when leaving "adicionar-whatsapp" page
   if (page !== 'adicionar-whatsapp' && currentPanelZapId != null) {
     closeZapPanel();
   }
+
+  // Volta para a lista de provedores ao sair da pagina (mantem edies pendentes)
+  if (page !== 'provedores' && currentEditingProvider != null && !provDirty) {
+    closeProviderConfig();
+  }
+
+  // (Re)monta a lista da pagina ativa ja sem filtro de busca
+  refreshPageList();
 }
 
 // ============================================
-// Filter Zaps
+// Busca universal (topo)
 // ============================================
-function filterZaps(query) {
-  if (!query) {
-    renderZaps(zapsData);
+const SEARCH_PLACEHOLDERS = {
+  'dashboard': 'Buscar no dashboard...',
+  'adicionar-whatsapp': 'Buscar Zaps, nmeros...',
+  'contatos': 'Buscar contatos, nmeros...',
+  'conversas': 'Buscar conversas...',
+  'treinamento': 'Buscar Zaps e treinamentos...',
+  'provedores': 'Buscar provedores...',
+  'relatorios': 'Buscar relatrios...',
+  'configuracoes': 'Buscar configuraes...',
+  'ajuda': 'Buscar na ajuda...'
+};
+
+function getActivePageId() {
+  const active = document.querySelector('.menu-item.active');
+  return active ? active.dataset.page : null;
+}
+
+function searchMatches(value, query) {
+  return String(value == null ? '' : value).toLowerCase().includes(query);
+}
+
+function zapMatchesSearch(zap, query) {
+  if (searchMatches(zap.name, query)) return true;
+  if (searchMatches(zap.phone, query)) return true;
+  if (searchMatches(zap.status, query)) return true;
+  if (searchMatches(zap.personality, query)) return true;
+  return (zap.providers || []).some(id => {
+    const p = providersData.find(pp => pp.id === id);
+    return searchMatches(p ? p.name : id, query);
+  });
+}
+
+function getSearchItemsForPage() {
+  const page = getActivePageId();
+  const items = [];
+  const push = (v) => {
+    const s = (v == null ? '' : String(v)).trim();
+    if (s) items.push(s);
+  };
+
+  if (page === 'adicionar-whatsapp') {
+    zapsData.forEach(z => { push(z.name); push(z.phone); });
+  } else if (page === 'contatos') {
+    zapsData.forEach(z => { push(z.name); push(z.phone); });
+    document.querySelectorAll('#contactsZapsList .contact-row-name, #contactsZapsList .contact-row-number')
+      .forEach(el => push(el.textContent));
+  } else if (page === 'treinamento') {
+    zapsData.forEach(z => { push(z.name); push(z.phone); });
+    Object.keys(trainingsData || {}).forEach(key => {
+      (trainingsData[key] || []).forEach(t => push(t.title));
+    });
+  } else if (page === 'provedores') {
+    providersData.forEach(p => push(p.name));
+  } else if (page === 'conversas') {
+    zapsData.forEach(z => push(z.name));
+    document.querySelectorAll('#conversationsList .conversation-name').forEach(el => push(el.textContent));
+  }
+
+  return items;
+}
+
+function buildSearchSuggestions(value) {
+  const query = value.toLowerCase();
+  const unique = [];
+  const seen = new Set();
+
+  getSearchItemsForPage().forEach(item => {
+    const key = item.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(item);
+  });
+
+  const startsWith = unique.filter(s => s.toLowerCase().startsWith(query)).slice(0, 3);
+  const contains = unique.filter(s => !s.toLowerCase().startsWith(query) && s.toLowerCase().includes(query)).slice(0, 2);
+
+  return startsWith.concat(contains);
+}
+
+function getRecentSearches() {
+  const list = safeParseLS('linknozap_recent_searches', []);
+  return Array.isArray(list) ? list : [];
+}
+
+function pushRecentSearch(value) {
+  if (!value) return;
+  const lower = value.toLowerCase();
+  const list = getRecentSearches().filter(x => String(x).toLowerCase() !== lower);
+  list.unshift(value);
+  localStorage.setItem('linknozap_recent_searches', JSON.stringify(list.slice(0, 8)));
+}
+
+function updateSearchClearBtn() {
+  if (searchClearBtn) searchClearBtn.style.display = searchInput && searchInput.value ? 'flex' : 'none';
+}
+
+function showSearchDropdown() {
+  if (searchDropdown) searchDropdown.style.display = 'block';
+}
+
+function hideSearchDropdown() {
+  if (searchDropdown) searchDropdown.style.display = 'none';
+  searchDdItems = [];
+  searchDdIndex = -1;
+}
+
+function renderSearchDropdown(value) {
+  if (!searchDropdown) return;
+
+  const recentBlock = document.getElementById('searchRecentBlock');
+  const recentList = document.getElementById('searchRecentList');
+  const suggestBlock = document.getElementById('searchSuggestBlock');
+  const suggestList = document.getElementById('searchSuggestList');
+  const empty = document.getElementById('searchDdEmpty');
+
+  const query = (value || '').toLowerCase();
+  const recents = getRecentSearches()
+    .filter(r => !query || String(r).toLowerCase().includes(query))
+    .slice(0, 5);
+  const suggestions = query ? buildSearchSuggestions(query) : [];
+
+  if (recents.length) {
+    recentBlock.style.display = '';
+    recentList.innerHTML = recents.map(r => `
+      <div class="search-dd-item" data-value="${escapeHtml(r)}">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/>
+          <polyline points="12 7 12 12 15 14"/>
+        </svg>
+        <span>${escapeHtml(r)}</span>
+      </div>
+    `).join('');
+  } else {
+    recentBlock.style.display = 'none';
+  }
+
+  if (suggestions.length) {
+    suggestBlock.style.display = '';
+    suggestList.innerHTML = suggestions.map(s => `
+      <div class="search-dd-item" data-value="${escapeHtml(s)}">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <span>${escapeHtml(s)}</span>
+      </div>
+    `).join('');
+  } else {
+    suggestBlock.style.display = 'none';
+  }
+
+  searchDdItems = Array.from(searchDropdown.querySelectorAll('.search-dd-item')).map(el => el.dataset.value);
+  searchDdIndex = -1;
+  if (empty) empty.style.display = searchDdItems.length ? 'none' : '';
+
+  if (!searchDdItems.length) {
+    hideSearchDropdown();
     return;
   }
 
-  const filtered = zapsData.filter(zap => {
-    return (
-      (zap.phone || '').toLowerCase().includes(query) ||
-      (zap.name || '').toLowerCase().includes(query) ||
-      (zap.providers || []).some(p => (p||'').toLowerCase().includes(query)) ||
-      (zap.status || '').toLowerCase().includes(query)
-    );
+  searchDropdown.querySelectorAll('.search-dd-item').forEach(el => {
+    el.addEventListener('click', () => applyGlobalSearch(el.dataset.value));
   });
+}
 
-  renderZaps(filtered);
+function moveSearchHighlight(delta) {
+  if (!searchDdItems.length) return;
+  searchDdIndex = (searchDdIndex + delta + searchDdItems.length) % searchDdItems.length;
+  const nodes = searchDropdown.querySelectorAll('.search-dd-item');
+  nodes.forEach((el, i) => el.classList.toggle('active', i === searchDdIndex));
+  const active = nodes[searchDdIndex];
+  if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+}
+
+function preparePageForSearch() {
+  const page = getActivePageId();
+  if (page === 'adicionar-whatsapp' && currentPanelZapId != null) closeZapPanel();
+  if (page === 'provedores' && currentEditingProvider != null && !provDirty) closeProviderConfig();
+  if (page === 'treinamento' && currentTrainingZapId != null) closeTrainingEditor();
+}
+
+function refreshPageList() {
+  const page = getActivePageId();
+  if (page === 'adicionar-whatsapp') {
+    renderZaps(zapsData);
+  } else if (page === 'contatos') {
+    renderContactsPage();
+  } else if (page === 'treinamento') {
+    renderTrainingZapsList();
+    renderTrainingsList();
+  } else if (page === 'provedores') {
+    renderProvidersList();
+  } else if (page === 'conversas') {
+    if (lastRenderedConversations != null) {
+      renderConversations(lastRenderedConversations, lastRenderedConversationsZapId);
+    }
+  }
+}
+
+function applyGlobalSearch(value) {
+  const raw = (value || '').trim();
+  const query = raw.toLowerCase();
+  if (!query) {
+    clearGlobalSearch(true);
+    return;
+  }
+
+  globalSearchQuery = query;
+  searchInput.value = raw;
+  updateSearchClearBtn();
+  hideSearchDropdown();
+  pushRecentSearch(raw);
+  preparePageForSearch();
+  refreshPageList();
+}
+
+function clearGlobalSearch(resetInput) {
+  globalSearchQuery = '';
+  if (resetInput && searchInput) searchInput.value = '';
+  updateSearchClearBtn();
+  hideSearchDropdown();
+  refreshPageList();
+}
+
+function resetSearchForPage(page) {
+  globalSearchQuery = '';
+  if (searchInput) {
+    searchInput.value = '';
+    searchInput.placeholder = SEARCH_PLACEHOLDERS[page] || 'Buscar...';
+  }
+  updateSearchClearBtn();
+  hideSearchDropdown();
 }
 
 // ============================================
@@ -832,13 +1120,32 @@ function openZapPanel(zapId) {
   const personalitySelect = document.getElementById('panelPersonality');
   const areaRow = document.getElementById('panelAreaRow');
   const areaInput = document.getElementById('panelArea');
+  const personalityBadge = document.getElementById('zapPanelPersonality');
+  const personalityLabels = {
+    padrao: 'Personalidade: Padro (Jovem 17 anos)',
+    vendedor: 'Personalidade: Vendedor',
+    atendente: 'Personalidade: Atendente',
+    especialista: 'Personalidade: Especialista'
+  };
+
   personalitySelect.value = zap.personality || 'padrao';
   areaInput.value = zap.area || '';
   areaRow.style.display = personalitySelect.value === 'especialista' ? 'flex' : 'none';
 
+  const updatePersonalityBadge = () => {
+    if (!personalityBadge) return;
+    let text = personalityLabels[personalitySelect.value] || personalityLabels.padrao;
+    const area = areaInput.value.trim();
+    if (personalitySelect.value === 'especialista' && area) text += ` - ${area}`;
+    personalityBadge.textContent = text;
+  };
+  updatePersonalityBadge();
+
   personalitySelect.onchange = () => {
     areaRow.style.display = personalitySelect.value === 'especialista' ? 'flex' : 'none';
+    updatePersonalityBadge();
   };
+  areaInput.oninput = updatePersonalityBadge;
 
   // Connect/Disconnect button
   refreshPanelStatusUI(zapId);
@@ -989,152 +1296,183 @@ function updateToggleZapBtn(zap) {
 }
 
 // ============================================
-// Panel Charts (Canvas)
+// Panel Chart (Canvas) - Atividade da IA por hora
 // ============================================
 function renderPanelCharts(zap) {
-  const tokensData = zap.tokenHistory || [];
   const usageData = zap.usageHistory || [];
-  const totalTokens = zap.tokensUsed || 0;
   const totalMessages = zap.messageCount || 0;
 
-  document.getElementById('tokensValue').textContent = totalTokens.toLocaleString('pt-BR');
-  document.getElementById('usageValue').textContent = totalMessages.toLocaleString('pt-BR');
+  const valueEl = document.getElementById('usageValue');
+  if (valueEl) valueEl.textContent = totalMessages.toLocaleString('pt-BR');
 
-  drawChart('tokensChart', 'tokensTooltip', tokensData, '#111', 'tokens');
-  drawChart('usageChart', 'usageTooltip', usageData, '#555', 'msgs');
+  drawActivityChart('usageChart', 'usageTooltip', usageData);
 }
 
-function drawChart(canvasId, tooltipId, data, color, unit) {
+function getHourlyActivity(data, numBuckets) {
+  const now = Math.floor(Date.now() / 1000);
+  const bucketSize = 3600;
+  const buckets = [];
+
+  for (let i = numBuckets - 1; i >= 0; i--) {
+    const end = now - i * bucketSize;
+    const start = end - bucketSize;
+    let before = 0;
+    let inside = 0;
+
+    (data || []).forEach(p => {
+      const y = p.y || 0;
+      if (p.x < start) {
+        if (y > before) before = y;
+      } else if (p.x < end) {
+        if (y > inside) inside = y;
+      }
+    });
+
+    buckets.push({ time: end, value: Math.max(0, inside - before) });
+  }
+
+  return buckets;
+}
+
+function drawActivityChart(canvasId, tooltipId, data) {
   const canvas = document.getElementById(canvasId);
   const tooltip = document.getElementById(tooltipId);
   if (!canvas) return;
 
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  ctx.scale(dpr, dpr);
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   const w = rect.width;
   const h = rect.height;
   ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#0B0B0B';
+  ctx.fillRect(0, 0, w, h);
 
-  if (data.length === 0) {
-    ctx.fillStyle = '#ccc';
-    ctx.font = '11px Inter';
-    ctx.textAlign = 'center';
-    ctx.fillText('Sem dados ainda', w / 2, h / 2 + 4);
-    return;
-  }
+  const pad = { l: 10, r: 10, t: 16, b: 22 };
+  const innerW = Math.max(1, w - pad.l - pad.r);
+  const innerH = Math.max(1, h - pad.t - pad.b);
 
-  // Group by time buckets for bar chart (last 12 buckets)
-  const now = Math.floor(Date.now() / 1000);
-  const bucketSize = 3600; // 1 hour buckets
-  const numBuckets = Math.min(12, Math.max(data.length, 1));
-  const buckets = [];
-
-  for (let i = numBuckets - 1; i >= 0; i--) {
-    const bucketEnd = now - i * bucketSize;
-    const bucketStart = bucketEnd - bucketSize;
-    let value = 0;
-    data.forEach(p => {
-      if (p.x >= bucketStart && p.x < bucketEnd) value += (p.y || 0);
-    });
-    // For cumulative data (tokens), use max in bucket
-    if (unit === 'tokens') {
-      value = 0;
-      data.forEach(p => {
-        if (p.x >= bucketStart && p.x < bucketEnd) value = Math.max(value, p.y);
-      });
-      // Get the value at end of bucket
-      let lastVal = 0;
-      data.forEach(p => {
-        if (p.x < bucketEnd) lastVal = p.y;
-      });
-      value = lastVal;
-    }
-    buckets.push({ time: bucketEnd, value });
-  }
-
-  // If all zeros, show sample data pattern
+  const buckets = getHourlyActivity(data, 12);
   const hasData = buckets.some(b => b.value > 0);
+
+  // Grid lines
+  ctx.strokeStyle = '#1E1E1E';
+  ctx.lineWidth = 1;
+  for (let g = 0; g <= 3; g++) {
+    const gy = Math.round(pad.t + (innerH * g) / 3) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, gy);
+    ctx.lineTo(w - pad.r, gy);
+    ctx.stroke();
+  }
+
+  const baseY = pad.t + innerH;
+
   if (!hasData) {
-    // Draw flat baseline
-    ctx.fillStyle = '#eee';
-    ctx.fillRect(0, h - 3, w, 3);
-    ctx.fillStyle = '#ccc';
-    ctx.font = '11px Inter';
+    ctx.strokeStyle = '#3A3A3A';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, baseY);
+    ctx.lineTo(w - pad.r, baseY);
+    ctx.stroke();
+
+    ctx.fillStyle = '#666666';
+    ctx.font = '11px Inter, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('Aguardando dados...', w / 2, h / 2 + 4);
+    ctx.fillText('IA parada - nenhuma mensagem nas ultimas 12 horas', w / 2, pad.t + innerH / 2);
+
+    if (tooltip) tooltip.style.display = 'none';
+    canvas.style.cursor = 'default';
+    canvas.onmousemove = null;
+    canvas.onmouseleave = null;
     return;
   }
 
   const maxVal = Math.max(...buckets.map(b => b.value), 1);
-  const barCount = buckets.length;
-  const gap = 3;
-  const totalGap = gap * (barCount + 1);
-  const barWidth = (w - totalGap) / barCount;
-  const maxBarH = h - 8;
+  const stepX = innerW / (buckets.length - 1);
+  const points = buckets.map((bucket, i) => ({
+    x: pad.l + i * stepX,
+    y: baseY - (bucket.value / maxVal) * innerH,
+    bucket
+  }));
 
-  // Store bar positions for hover
-  const barPositions = [];
+  // Area under the line
+  const grad = ctx.createLinearGradient(0, pad.t, 0, baseY);
+  grad.addColorStop(0, 'rgba(255,255,255,0.32)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, baseY);
+  points.forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.lineTo(points[points.length - 1].x, baseY);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
 
-  buckets.forEach((bucket, i) => {
-    const x = gap + i * (barWidth + gap);
-    const barH = Math.max(2, (bucket.value / maxVal) * maxBarH);
-    const y = h - barH;
+  // Spike line (sharp peaks, hour by hour)
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  });
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'miter';
+  ctx.lineCap = 'round';
+  ctx.miterLimit = 4;
+  ctx.stroke();
 
-    barPositions.push({ x, y, w: barWidth, h: barH, bucket });
-
-    // Bar gradient - handle 3-digit hex like #111
-    const colorTransparent = color.length === 4 ? color + '66' : color + '40';
-    const grad = ctx.createLinearGradient(0, y, 0, h);
-    grad.addColorStop(0, color);
-    grad.addColorStop(1, colorTransparent);
-
-    ctx.fillStyle = grad;
-    // Rounded top
-    const r = Math.min(3, barWidth / 2, barH / 2);
+  // Points
+  points.forEach(p => {
     ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + barWidth - r, y);
-    ctx.quadraticCurveTo(x + barWidth, y, x + barWidth, y + r);
-    ctx.lineTo(x + barWidth, h);
-    ctx.lineTo(x, h);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
+    ctx.arc(p.x, p.y, p.bucket.value > 0 ? 3 : 2, 0, Math.PI * 2);
+    ctx.fillStyle = p.bucket.value > 0 ? '#FFFFFF' : '#4A4A4A';
     ctx.fill();
   });
 
-  // Hover tooltip
-  canvas.onmousemove = (e) => {
-    const canvasRect = canvas.getBoundingClientRect();
-    const mx = e.clientX - canvasRect.left;
-    let hovered = null;
+  // Hour labels
+  ctx.fillStyle = '#6B6B6B';
+  ctx.font = '9px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  points.forEach((p, i) => {
+    if (i % 3 !== 0 && i !== points.length - 1) return;
+    const t = new Date(p.bucket.time * 1000);
+    ctx.fillText(t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }), p.x, h - 7);
+  });
 
-    barPositions.forEach(bp => {
-      if (mx >= bp.x && mx <= bp.x + bp.w) hovered = bp;
+  // Hover tooltip
+  canvas.style.cursor = 'default';
+  canvas.onmousemove = (e) => {
+    const cr = canvas.getBoundingClientRect();
+    const mx = e.clientX - cr.left;
+    let nearest = null;
+    let best = Infinity;
+
+    points.forEach(p => {
+      const d = Math.abs(p.x - mx);
+      if (d < best) { best = d; nearest = p; }
     });
 
-    if (hovered) {
+    if (nearest && best <= stepX / 2 + 6 && tooltip) {
       tooltip.style.display = 'block';
-      const time = new Date(hovered.bucket.time * 1000);
-      const label = time.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
-      tooltip.textContent = `${label} - ${hovered.bucket.value.toLocaleString('pt-BR')} ${unit}`;
-      tooltip.style.left = Math.min(hovered.x, w - 120) + 'px';
-      tooltip.style.top = Math.max(hovered.y - 30, 0) + 'px';
-
-      // Highlight bar
+      const t = new Date(nearest.bucket.time * 1000);
+      const label = t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+      tooltip.textContent = `${label} - ${nearest.bucket.value} msg`;
+      tooltip.style.left = (canvas.offsetLeft + Math.min(nearest.x + 10, w - 120)) + 'px';
+      tooltip.style.top = (canvas.offsetTop + Math.max(nearest.y - 34, 0)) + 'px';
       canvas.style.cursor = 'pointer';
     } else {
-      tooltip.style.display = 'none';
+      if (tooltip) tooltip.style.display = 'none';
       canvas.style.cursor = 'default';
     }
   };
   canvas.onmouseleave = () => {
-    tooltip.style.display = 'none';
+    if (tooltip) tooltip.style.display = 'none';
     canvas.style.cursor = 'default';
   };
 }
@@ -1169,26 +1507,33 @@ function renderPanelProviders(zap) {
     const item = document.createElement('div');
     item.className = 'provider-toggle-item';
 
-    let keySelectHtml = '';
-    if (providerKeys.length > 0) {
+    let keyControlHtml = '';
+    if (providerKeys.length > 1) {
       const selIndex = zap.apiKeySelections[provider.id] != null
         ? zap.apiKeySelections[provider.id]
         : 0;
-      const options = providerKeys.map((k, i) =>
-        `<option value="${i}" ${i === selIndex ? 'selected' : ''}>Chave ${i + 1}: ${maskApiKey(k)}</option>`
-      ).join('');
-      keySelectHtml = `
+      const options = providerKeys.map((k, i) => {
+        const label = (provider.apiKeyNames && provider.apiKeyNames[i]) || `Chave ${i + 1}`;
+        return `<option value="${i}" ${i === selIndex ? 'selected' : ''}>${escapeHtml(label)} · ${maskApiKey(k)}</option>`;
+      }).join('');
+      keyControlHtml = `
         <div class="provider-key-row">
-          <label class="provider-key-label">Chave API</label>
-          <select class="provider-key-select" data-provider="${provider.id}">
+          <select class="provider-key-select" data-provider="${provider.id}" title="Chave API">
             ${options}
           </select>
         </div>
       `;
-    } else {
-      keySelectHtml = `
+    } else if (providerKeys.length === 1) {
+      const label = (provider.apiKeyNames && provider.apiKeyNames[0]) || 'Chave 1';
+      keyControlHtml = `
         <div class="provider-key-row">
-          <span class="provider-key-empty">Nenhuma chave cadastrada</span>
+          <span class="provider-key-value" title="Chave API">${escapeHtml(label)} · ${maskApiKey(providerKeys[0])}</span>
+        </div>
+      `;
+    } else {
+      keyControlHtml = `
+        <div class="provider-key-row">
+          <span class="provider-key-empty">Sem chave</span>
         </div>
       `;
     }
@@ -1197,8 +1542,7 @@ function renderPanelProviders(zap) {
       <input type="checkbox" data-provider="${provider.id}" ${isChecked ? 'checked' : ''}>
       <div class="provider-toggle-info">
         <div class="provider-toggle-name">${provider.name}</div>
-        <div class="provider-toggle-models">${provider.models.length} modelos · ${providerKeys.length} chave(s)</div>
-        ${keySelectHtml}
+        ${keyControlHtml}
       </div>
     `;
     container.appendChild(item);
@@ -1233,39 +1577,128 @@ function renderPanelProviders(zap) {
 }
 
 // ============================================
-// Panel Model Config
+// Panel Model Config (lista de modelos p/ marcar)
 // ============================================
-function renderPanelModelConfig(zap) {
-  const select = document.getElementById('panelModelSelect');
-  const autoSwitch = document.getElementById('panelAutoSwitch');
+function modelKeyOf(provider, model) {
+  return `${provider.id}|${model.id}`;
+}
 
-  // Build model options from selected providers
-  select.innerHTML = '<option value="auto">Automtico (Melhor para Pior)</option>';
-  const selectedIds = zap.providers || [];
-
-  selectedIds.forEach(pId => {
+function getPanelModelEntries(zap) {
+  const entries = [];
+  (zap.providers || []).forEach(pId => {
     const provider = providersData.find(p => p.id === pId);
     if (!provider) return;
-    provider.models.forEach(model => {
-      const opt = document.createElement('option');
-      opt.value = `${provider.name}|${model.id}`;
-      opt.textContent = `${model.name} (${provider.name})`;
-      select.appendChild(opt);
+    (provider.models || []).forEach(model => {
+      entries.push({ provider, model, key: modelKeyOf(provider, model) });
+    });
+  });
+  return entries;
+}
+
+function savePanelModelSelection(zapId) {
+  const z = zapsData.find(x => String(x.id) === String(zapId));
+  if (!z) return;
+
+  const boxes = document.querySelectorAll('#panelModelsList input[type="checkbox"]');
+  z.selectedModels = Array.from(boxes)
+    .filter(cb => cb.checked)
+    .map(cb => cb.dataset.key);
+  saveZaps();
+
+  const selectAll = document.getElementById('panelSelectAllModels');
+  if (selectAll) {
+    selectAll.disabled = boxes.length === 0;
+    selectAll.checked = boxes.length > 0 && z.selectedModels.length === boxes.length;
+  }
+}
+
+function renderPanelModelConfig(zap) {
+  const list = document.getElementById('panelModelsList');
+  const selectAll = document.getElementById('panelSelectAllModels');
+  const autoSwitch = document.getElementById('panelAutoSwitch');
+  if (!list) return;
+
+  if (autoSwitch) {
+    autoSwitch.checked = zap.autoSwitch !== false;
+    autoSwitch.onchange = () => {
+      const z = zapsData.find(x => String(x.id) === String(zap.id));
+      if (z) { z.autoSwitch = autoSwitch.checked; saveZaps(); }
+    };
+  }
+
+  const entries = getPanelModelEntries(zap);
+
+  if (entries.length === 0) {
+    list.innerHTML = '<p class="panel-models-empty">Selecione pelo menos um provedor para ver os modelos disponveis.</p>';
+    if (selectAll) {
+      selectAll.checked = false;
+      selectAll.disabled = true;
+      selectAll.onchange = null;
+    }
+    return;
+  }
+
+  const available = new Set(entries.map(e => e.key));
+  let saved = Array.isArray(zap.selectedModels)
+    ? zap.selectedModels.filter(k => available.has(k))
+    : null;
+
+  // Migracao: zap.model especifico salvo pelo antigo select
+  if (saved === null && zap.model && zap.model !== 'auto' && zap.model.includes('|')) {
+    const sep = zap.model.indexOf('|');
+    const provName = zap.model.slice(0, sep);
+    const modelId = zap.model.slice(sep + 1);
+    const prov = providersData.find(p => p.name === provName);
+    const legacyKey = prov ? `${prov.id}|${modelId}` : null;
+    if (legacyKey && available.has(legacyKey)) saved = [legacyKey];
+  }
+
+  const selected = new Set(saved !== null ? saved : entries.map(e => e.key));
+
+  list.innerHTML = '';
+  entries.forEach(entry => {
+    const row = document.createElement('div');
+    row.className = 'panel-model-item';
+    row.innerHTML = `
+      <input type="checkbox" data-key="${entry.key}" ${selected.has(entry.key) ? 'checked' : ''}>
+      <div class="panel-model-info">
+        <span class="panel-model-name">${entry.model.name || entry.model.id}</span>
+        <span class="panel-model-provider">${entry.provider.name} &middot; ${entry.model.id}</span>
+      </div>
+      <button type="button" class="panel-test-btn" data-provider="${entry.provider.id}" data-model="${entry.model.id}" title="Testar modelo">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        Testar
+      </button>
+    `;
+    list.appendChild(row);
+  });
+
+  list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('change', () => savePanelModelSelection(zap.id));
+  });
+
+  list.querySelectorAll('.panel-test-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const provider = providersData.find(p => p.id === btn.dataset.provider);
+      if (!provider) return;
+      const model = (provider.models || []).find(m => m.id === btn.dataset.model);
+      if (!model) return;
+      openTestChatWith(provider, model);
     });
   });
 
-  select.value = zap.model || 'auto';
-  autoSwitch.checked = zap.autoSwitch !== false;
-
-  select.onchange = () => {
-    const z = zapsData.find(x => String(x.id) === String(zap.id));
-    if (z) { z.model = select.value; saveZaps(); }
-  };
-
-  autoSwitch.onchange = () => {
-    const z = zapsData.find(x => String(x.id) === String(zap.id));
-    if (z) { z.autoSwitch = autoSwitch.checked; saveZaps(); }
-  };
+  if (selectAll) {
+    selectAll.disabled = false;
+    selectAll.checked = entries.every(e => selected.has(e.key));
+    selectAll.onchange = () => {
+      list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.checked = selectAll.checked;
+      });
+      savePanelModelSelection(zap.id);
+    };
+  }
 }
 
 // ============================================
@@ -1331,6 +1764,168 @@ async function loadPanelContacts(zapId) {
 
   } catch (err) {
     container.innerHTML = `<p style="font-size:12px;color:#dc2626;">Erro: ${err.message}</p>`;
+  }
+}
+
+// ============================================
+// Pagina Contatos
+// ============================================
+function renderContactsPage() {
+  const container = document.getElementById('contactsZapsList');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  if (zapsData.length === 0) {
+    container.innerHTML = '<p class="empty-hint">Nenhum Zap criado ainda.</p>';
+    return;
+  }
+
+  zapsData.forEach(zap => {
+    const item = document.createElement('div');
+    item.className = 'contact-zap-item';
+    item.innerHTML = `
+      <div class="contact-zap-card">
+        <div class="contact-zap-info">
+          <div class="contact-zap-name">${escapeHtml(zap.name)}</div>
+          <div class="contact-zap-phone">${escapeHtml(zap.phone || '')}</div>
+        </div>
+        <span class="contact-zap-chevron">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </span>
+      </div>
+      <div class="contact-zap-contacts"><div class="spinner" style="margin:14px auto;"></div></div>
+    `;
+    container.appendChild(item);
+
+    item.querySelector('.contact-zap-card').addEventListener('click', () => {
+      item.classList.toggle('collapsed');
+    });
+
+    loadContactsForZap(zap, item.querySelector('.contact-zap-contacts'));
+  });
+
+  filterContactsDOM();
+}
+
+// Esconde zaps/contatos que nao batem com a busca ativa
+function filterContactsDOM() {
+  const container = document.getElementById('contactsZapsList');
+  if (!container) return;
+
+  const items = container.querySelectorAll('.contact-zap-item');
+
+  if (!globalSearchQuery) {
+    items.forEach(item => { item.style.display = ''; });
+    return;
+  }
+
+  items.forEach(item => {
+    const name = item.querySelector('.contact-zap-name');
+    const phone = item.querySelector('.contact-zap-phone');
+    const zapMatch = searchMatches(name ? name.textContent : '', globalSearchQuery)
+      || searchMatches(phone ? phone.textContent : '', globalSearchQuery);
+
+    let rowMatch = false;
+    item.querySelectorAll('.contact-row').forEach(row => {
+      const rn = row.querySelector('.contact-row-name');
+      const rp = row.querySelector('.contact-row-number');
+      const match = zapMatch
+        || searchMatches(rn ? rn.textContent : '', globalSearchQuery)
+        || searchMatches(rp ? rp.textContent : '', globalSearchQuery);
+      row.style.display = match ? '' : 'none';
+      if (match) rowMatch = true;
+    });
+
+    item.style.display = (zapMatch || rowMatch) ? '' : 'none';
+    if (zapMatch || rowMatch) item.classList.remove('collapsed');
+  });
+}
+
+async function loadContactsForZap(zap, container) {
+  if (!container) return;
+
+  if (!window.electronAPI) {
+    container.innerHTML = '<p class="empty-hint">API nao disponivel.</p>';
+    filterContactsDOM();
+    return;
+  }
+
+  try {
+    const conversations = await window.electronAPI.whatsappConversations(String(zap.id));
+    const blocked = (zap.blockedContacts || []);
+    const contacts = (conversations || []).filter(c =>
+      c && c.contact && c.contact.id &&
+      !c.contact.id.includes('@g.us') &&
+      !c.contact.id.includes('@newsletter')
+    );
+
+    if (contacts.length === 0) {
+      container.innerHTML = '<p class="empty-hint">Nenhum contato encontrado. Conecte o Zap e receba mensagens.</p>';
+      return;
+    }
+
+    container.innerHTML = '';
+    contacts.forEach(conv => {
+      const isBlocked = blocked.includes(conv.contact.id);
+      const row = document.createElement('div');
+      row.className = 'contact-row';
+      row.innerHTML = `
+        <div class="contact-row-info">
+          <span class="contact-row-name">${escapeHtml(conv.contact.name || 'Sem nome')}</span>
+          <span class="contact-row-number">${escapeHtml(conv.contact.number || '')}</span>
+        </div>
+        <div class="contact-row-actions">
+          <button type="button" class="contact-chat-btn" title="Conversar">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+            </svg>
+          </button>
+          <input type="checkbox" class="contact-ai-check" title="A IA tem acesso para responder" ${!isBlocked ? 'checked' : ''}>
+        </div>
+      `;
+      container.appendChild(row);
+
+      row.querySelector('.contact-chat-btn').addEventListener('click', () => {
+        openContactChat(zap.id, conv.contact.id);
+      });
+
+      const cb = row.querySelector('.contact-ai-check');
+      cb.addEventListener('change', () => {
+        const z = zapsData.find(x => String(x.id) === String(zap.id));
+        if (!z) return;
+        if (!z.blockedContacts) z.blockedContacts = [];
+        if (cb.checked) {
+          z.blockedContacts = z.blockedContacts.filter(id => id !== conv.contact.id);
+        } else if (!z.blockedContacts.includes(conv.contact.id)) {
+          z.blockedContacts.push(conv.contact.id);
+        }
+        saveZaps();
+      });
+    });
+  } catch (err) {
+    container.innerHTML = `<p class="empty-hint" style="color:#dc2626;">Erro: ${escapeHtml(err.message)}</p>`;
+  } finally {
+    filterContactsDOM();
+  }
+}
+
+async function openContactChat(zapId, contactId) {
+  navigateTo('conversas');
+  updateZapSelector();
+
+  const selector = document.getElementById('zapSelector');
+  if (selector) selector.value = String(zapId);
+
+  try {
+    const conversations = await window.electronAPI.whatsappConversations(String(zapId));
+    renderConversations(conversations, zapId);
+    const conv = (conversations || []).find(c => c.contact && c.contact.id === contactId);
+    if (conv) await openChat(zapId, conv);
+  } catch (err) {
+    console.error('Erro ao abrir conversa:', err);
   }
 }
 
@@ -1543,13 +2138,20 @@ function renderProvidersList() {
   const container = document.getElementById('providersList');
   if (!container) return;
 
-  if (providersData.length === 0) {
-    container.innerHTML = '<div class="provider-empty">Nenhum provedor adicionado. Clique em "Adicionar Provedor" para comear.</div>';
+  const list = globalSearchQuery
+    ? providersData.filter(p => searchMatches(p.name, globalSearchQuery)
+        || (p.models || []).some(m => searchMatches(m.name || m, globalSearchQuery)))
+    : providersData;
+
+  if (list.length === 0) {
+    container.innerHTML = globalSearchQuery
+      ? '<div class="provider-empty">Nenhum provedor encontrado para a busca.</div>'
+      : '<div class="provider-empty">Nenhum provedor adicionado. Clique em "Adicionar Provedor" para comear.</div>';
     return;
   }
 
   container.innerHTML = '';
-  providersData.forEach(provider => {
+  list.forEach(provider => {
     const item = document.createElement('div');
     item.className = 'provider-item';
     item.innerHTML = `
@@ -1567,11 +2169,10 @@ function renderProvidersList() {
       </div>
       <div class="provider-item-actions">
         <button class="provider-card-edit" data-id="${provider.id}" title="Configurar">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
           </svg>
-          Configurar
         </button>
         <button class="provider-item-btn delete" data-id="${provider.id}" title="Excluir">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
@@ -1736,24 +2337,55 @@ function renderModelsList(models) {
 // Provider Config Page
 // ============================================
 let currentEditingProvider = null;
+let providerSnapshot = null;
+let provDirty = false;
 let currentTestProvider = null;
 let currentTestModel = null;
 let testChatHistory = [];
 
 function initProviderConfig() {
-  const closeBtn = document.getElementById('closeProviderConfigModal');
-  const cancelBtn = document.getElementById('cancelProviderConfigBtn');
-  const saveBtn = document.getElementById('saveProviderConfigBtn');
-  const addApiBtn = document.getElementById('addApiKeyBtn');
+  const backBtn = document.getElementById('provBackBtn');
+  const saveBtn = document.getElementById('provSaveBtn');
+  const renameBtn = document.getElementById('provRenameBtn');
+  const nameConfirm = document.getElementById('provNameConfirm');
+  const nameCancel = document.getElementById('provNameCancel');
+  const nameInput = document.getElementById('provNameInput');
+  const addKeyBtn = document.getElementById('provAddKeyBtn');
+  const keyConfirm = document.getElementById('provKeyConfirmBtn');
+  const keyCancel = document.getElementById('provKeyCancelBtn');
+  const keyNameInput = document.getElementById('provKeyNameInput');
+  const keyValueInput = document.getElementById('provKeyValueInput');
 
   const closeChatBtn = document.getElementById('closeTestChatModal');
   const sendBtn = document.getElementById('sendTestMessage');
   const chatInput = document.getElementById('testChatInput');
 
-  if (closeBtn) closeBtn.addEventListener('click', closeProviderConfig);
-  if (cancelBtn) cancelBtn.addEventListener('click', closeProviderConfig);
+  if (backBtn) backBtn.addEventListener('click', closeProviderConfig);
   if (saveBtn) saveBtn.addEventListener('click', saveProviderChanges);
-  if (addApiBtn) addApiBtn.addEventListener('click', addNewApiKey);
+  if (renameBtn) renameBtn.addEventListener('click', startEditProvName);
+  if (nameConfirm) nameConfirm.addEventListener('click', confirmEditProvName);
+  if (nameCancel) nameCancel.addEventListener('click', cancelEditProvName);
+  if (nameInput) {
+    nameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); confirmEditProvName(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancelEditProvName(); }
+    });
+  }
+  if (addKeyBtn) addKeyBtn.addEventListener('click', openProvKeyForm);
+  if (keyConfirm) keyConfirm.addEventListener('click', confirmAddProvKey);
+  if (keyCancel) keyCancel.addEventListener('click', closeProvKeyForm);
+  if (keyValueInput) {
+    keyValueInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); confirmAddProvKey(); }
+      if (e.key === 'Escape') { e.preventDefault(); closeProvKeyForm(); }
+    });
+  }
+  if (keyNameInput) {
+    keyNameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); confirmAddProvKey(); }
+      if (e.key === 'Escape') { e.preventDefault(); closeProvKeyForm(); }
+    });
+  }
 
   if (closeChatBtn) closeChatBtn.addEventListener('click', closeTestChat);
   if (sendBtn) sendBtn.addEventListener('click', sendTestMessage);
@@ -1763,13 +2395,6 @@ function initProviderConfig() {
         e.preventDefault();
         sendTestMessage();
       }
-    });
-  }
-
-  const configModal = document.getElementById('providerConfigModal');
-  if (configModal) {
-    configModal.addEventListener('click', (e) => {
-      if (e.target === configModal) closeProviderConfig();
     });
   }
 
@@ -1786,155 +2411,382 @@ function openProviderConfig(providerId) {
   if (!provider) return;
 
   currentEditingProvider = provider;
+  providerSnapshot = JSON.parse(JSON.stringify(provider));
+  provDirty = false;
 
-  // Fill form
-  document.getElementById('editProviderName').value = provider.name;
+  // Normaliza estrutura de chaves (legado: s apiKey)
+  if (!Array.isArray(provider.apiKeys) || provider.apiKeys.length === 0) {
+    provider.apiKeys = provider.apiKey ? [provider.apiKey] : [];
+  }
+  provider.apiKeyNames = provider.apiKeys.map((k, i) =>
+    (Array.isArray(provider.apiKeyNames) && provider.apiKeyNames[i]) || `Chave ${i + 1}`
+  );
 
-  // Render API keys
-  renderApiKeysList(provider);
+  document.getElementById('providersListView').style.display = 'none';
+  document.getElementById('providerDetailView').style.display = 'block';
 
-  // Render models
-  renderConfigModelsList(provider);
-
-  // Open modal
-  document.getElementById('providerConfigTitle').textContent = `Configurar: ${provider.name}`;
-  document.getElementById('providerConfigModal').classList.add('active');
+  document.getElementById('provDetailName').textContent = provider.name;
+  cancelEditProvName();
+  closeProvKeyForm();
+  setProvDirty(false);
+  renderProvKeysList();
+  renderProvModelsList();
 }
 
 function closeProviderConfig() {
-  document.getElementById('providerConfigModal').classList.remove('active');
-  currentEditingProvider = null;
-}
-
-function renderApiKeysList(provider) {
-  const container = document.getElementById('apiKeysList');
-  const apiKeys = provider.apiKeys || [provider.apiKey];
-
-  container.innerHTML = '';
-  apiKeys.forEach((key, index) => {
-    const item = document.createElement('div');
-    item.className = 'api-key-item';
-    item.innerHTML = `
-      <input type="password" value="${key}" data-index="${index}" class="api-key-input" readonly>
-      <button class="btn-icon toggle-visibility" title="Mostrar/Ocultar">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-          <circle cx="12" cy="12" r="3"/>
-        </svg>
-      </button>
-      ${apiKeys.length > 1 ? `<button class="btn-icon delete" data-index="${index}" title="Remover">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="18" y1="6" x2="6" y2="18"/>
-          <line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-      </button>` : ''}
-    `;
-    container.appendChild(item);
-  });
-
-  // Toggle visibility
-  container.querySelectorAll('.toggle-visibility').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const input = btn.parentElement.querySelector('.api-key-input');
-      input.type = input.type === 'password' ? 'text' : 'password';
-    });
-  });
-
-  // Delete key
-  container.querySelectorAll('.btn-icon.delete').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const index = parseInt(btn.dataset.index);
-      const keys = provider.apiKeys || [provider.apiKey];
-      keys.splice(index, 1);
-      provider.apiKeys = keys;
-      provider.apiKey = keys[0] || '';
-      renderApiKeysList(provider);
-    });
-  });
-}
-
-function addNewApiKey() {
-  if (!currentEditingProvider) return;
-
-  const keys = currentEditingProvider.apiKeys || [currentEditingProvider.apiKey];
-  keys.push('');
-  currentEditingProvider.apiKeys = keys;
-  renderApiKeysList(currentEditingProvider);
-
-  // Focus on the new input
-  const inputs = document.querySelectorAll('#apiKeysList .api-key-input');
-  if (inputs.length > 0) {
-    const lastInput = inputs[inputs.length - 1];
-    lastInput.readOnly = false;
-    lastInput.type = 'text';
-    lastInput.focus();
+  if (provDirty && providerSnapshot) {
+    if (!confirm('Descartar as alteraes feitas neste provedor?')) return;
+    const idx = providersData.findIndex(p => p.id === providerSnapshot.id);
+    if (idx >= 0) providersData[idx] = providerSnapshot;
   }
+
+  currentEditingProvider = null;
+  providerSnapshot = null;
+  provDirty = false;
+
+  const detail = document.getElementById('providerDetailView');
+  const list = document.getElementById('providersListView');
+  if (detail) detail.style.display = 'none';
+  if (list) list.style.display = 'block';
+  renderProvidersList();
 }
 
-function renderConfigModelsList(provider) {
-  const container = document.getElementById('configModelsList');
-  container.innerHTML = '';
+function setProvDirty(value) {
+  provDirty = !!value;
+  const btn = document.getElementById('provSaveBtn');
+  if (btn) btn.style.display = provDirty ? 'inline-flex' : 'none';
+}
 
-  provider.models.forEach(model => {
+function provKeyNameAt(provider, index) {
+  const names = provider.apiKeyNames || [];
+  return names[index] || `Chave ${index + 1}`;
+}
+
+function renderProvKeysList() {
+  const provider = currentEditingProvider;
+  const container = document.getElementById('provKeysList');
+  if (!container) return;
+  if (!provider) { container.innerHTML = ''; return; }
+
+  const keys = provider.apiKeys || [];
+  if (keys.length === 0) {
+    container.innerHTML = '<div class="prov-empty">Nenhuma chave API cadastrada.</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  keys.forEach((key, index) => {
     const item = document.createElement('div');
-    item.className = 'config-model-item';
+    item.className = 'prov-key-row';
+    item.dataset.index = index;
     item.innerHTML = `
-      <div class="config-model-info">
-        <div class="config-model-name">${model.name}</div>
-        <div class="config-model-id">${model.id}</div>
-        ${model.limits ? `<div class="config-model-limits">${model.limits}</div>` : ''}
+      <div class="prov-key-main">
+        <span class="prov-key-name">${escapeHtml(provKeyNameAt(provider, index))}</span>
+        <span class="prov-key-secret">${escapeHtml(maskApiKey(key))}</span>
       </div>
-      <div class="config-model-actions">
-        <button class="provider-card-edit test-model-btn" data-model-id="${model.id}" title="Testar Modelo">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      <div class="prov-key-actions">
+        <button class="prov-icon-btn" data-action="reveal" title="Mostrar/Ocultar">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+            <circle cx="12" cy="12" r="3"/>
           </svg>
-          Testar
+        </button>
+        <button class="prov-icon-btn" data-action="edit" title="Editar chave">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+          </svg>
+        </button>
+        <button class="prov-icon-btn danger" data-action="remove" title="Remover chave">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
         </button>
       </div>
     `;
     container.appendChild(item);
   });
 
-  // Add test listeners
-  container.querySelectorAll('.test-model-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const modelId = btn.dataset.modelId;
-      openTestChat(modelId);
+  container.querySelectorAll('.prov-key-row').forEach(row => {
+    const index = parseInt(row.dataset.index, 10);
+    row.querySelectorAll('[data-action]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const action = btn.dataset.action;
+        if (action === 'reveal') toggleProvKeySecret(row, index);
+        if (action === 'edit') startEditProvKey(row, index);
+        if (action === 'remove') removeProvKey(index);
+      });
     });
   });
 }
 
-function saveProviderChanges() {
-  if (!currentEditingProvider) return;
+function toggleProvKeySecret(row, index) {
+  const provider = currentEditingProvider;
+  if (!provider) return;
+  const secret = row.querySelector('.prov-key-secret');
+  if (!secret) return;
+  const revealed = secret.dataset.revealed === '1';
+  secret.dataset.revealed = revealed ? '0' : '1';
+  secret.textContent = revealed
+    ? maskApiKey((provider.apiKeys || [])[index] || '')
+    : ((provider.apiKeys || [])[index] || '');
+}
 
-  const newName = document.getElementById('editProviderName').value.trim();
-  if (!newName) {
-    alert('Por favor, insira um nome para o provedor.');
-    return;
-  }
+function startEditProvKey(row, index) {
+  const provider = currentEditingProvider;
+  if (!provider) return;
+  const key = (provider.apiKeys || [])[index] || '';
+  const main = row.querySelector('.prov-key-main');
+  const actions = row.querySelector('.prov-key-actions');
+  if (!main || row.dataset.editing === '1') return;
+  row.dataset.editing = '1';
+  actions.style.display = 'none';
+  main.className = 'prov-key-edit';
+  main.innerHTML = `
+    <input type="text" class="prov-key-edit-input name" value="${escapeHtml(provKeyNameAt(provider, index))}" placeholder="Nome da chave" maxlength="40">
+    <input type="password" class="prov-key-edit-input value" value="${escapeHtml(key)}" placeholder="Chave API">
+    <button class="prov-icon-btn ok" data-action="confirm" title="Salvar">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+    </button>
+    <button class="prov-icon-btn" data-action="cancel" title="Cancelar">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  `;
+  const nameInput = main.querySelector('.name');
+  const valueInput = main.querySelector('.value');
+  const confirmBtn = main.querySelector('[data-action="confirm"]');
+  const cancelBtn = main.querySelector('[data-action="cancel"]');
 
-  // Save API keys
-  const keyInputs = document.querySelectorAll('#apiKeysList .api-key-input');
-  const apiKeys = [];
-  keyInputs.forEach(input => {
-    const val = input.value.trim();
-    if (val) apiKeys.push(val);
+  confirmBtn.addEventListener('click', () => {
+    const newValue = valueInput.value.trim();
+    if (!newValue) { alert('Informe a chave API.'); return; }
+    provider.apiKeys[index] = newValue;
+    provider.apiKeyNames = provider.apiKeyNames || [];
+    provider.apiKeyNames[index] = nameInput.value.trim() || `Chave ${index + 1}`;
+    provider.apiKey = provider.apiKeys.find(k => k && k.trim()) || provider.apiKeys[0] || '';
+    setProvDirty(true);
+    renderProvKeysList();
   });
 
-  if (apiKeys.length === 0) {
-    alert('Por favor, mantenha pelo menos uma chave API.');
+  cancelBtn.addEventListener('click', () => renderProvKeysList());
+
+  const onKey = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); confirmBtn.click(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancelBtn.click(); }
+  };
+  nameInput.addEventListener('keydown', onKey);
+  valueInput.addEventListener('keydown', onKey);
+  valueInput.focus();
+}
+
+function removeProvKey(index) {
+  const provider = currentEditingProvider;
+  if (!provider) return;
+  const keys = provider.apiKeys || [];
+  if (keys.length <= 1) {
+    alert('O provedor precisa de pelo menos uma chave API.');
+    return;
+  }
+  if (!confirm('Remover esta chave API?')) return;
+  keys.splice(index, 1);
+  provider.apiKeys = keys;
+  if (Array.isArray(provider.apiKeyNames)) provider.apiKeyNames.splice(index, 1);
+  provider.apiKey = keys.find(k => k && k.trim()) || keys[0] || '';
+  setProvDirty(true);
+  renderProvKeysList();
+}
+
+function openProvKeyForm() {
+  const form = document.getElementById('provKeyForm');
+  if (!form) return;
+  form.style.display = 'flex';
+  document.getElementById('provKeyNameInput').value = '';
+  document.getElementById('provKeyValueInput').value = '';
+  document.getElementById('provKeyNameInput').focus();
+}
+
+function closeProvKeyForm() {
+  const form = document.getElementById('provKeyForm');
+  if (form) form.style.display = 'none';
+}
+
+function confirmAddProvKey() {
+  const provider = currentEditingProvider;
+  if (!provider) return;
+  const name = document.getElementById('provKeyNameInput').value.trim();
+  const value = document.getElementById('provKeyValueInput').value.trim();
+  if (!value) { alert('Informe a chave API.'); return; }
+
+  provider.apiKeys = provider.apiKeys || [];
+  provider.apiKeyNames = provider.apiKeyNames || [];
+  provider.apiKeys.push(value);
+  provider.apiKeyNames.push(name || `Chave ${provider.apiKeys.length}`);
+  provider.apiKey = provider.apiKeys.find(k => k && k.trim()) || provider.apiKeys[0];
+
+  setProvDirty(true);
+  renderProvKeysList();
+  closeProvKeyForm();
+}
+
+function renderProvModelsList() {
+  const provider = currentEditingProvider;
+  const container = document.getElementById('provModelsList');
+  const count = document.getElementById('provModelsCount');
+  if (!container) return;
+  if (!provider) { container.innerHTML = ''; if (count) count.textContent = ''; return; }
+
+  const models = provider.models || [];
+  if (count) count.textContent = models.length ? `${models.length} modelos` : '';
+
+  if (models.length === 0) {
+    container.innerHTML = '<div class="prov-empty">Nenhum modelo disponvel.</div>';
     return;
   }
 
-  // Update provider
-  currentEditingProvider.name = newName;
-  currentEditingProvider.apiKeys = apiKeys;
-  currentEditingProvider.apiKey = apiKeys[0];
+  container.innerHTML = '';
+  models.forEach(model => {
+    const item = document.createElement('div');
+    item.className = 'prov-model-row';
+    item.innerHTML = `
+      <span class="prov-model-name">${escapeHtml(model.name || model.id)}</span>
+      <span class="prov-model-id">${escapeHtml(model.id)}</span>
+      <button class="prov-icon-btn" data-model-id="${escapeHtml(model.id)}" title="Testar modelo">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
+    `;
+    container.appendChild(item);
+  });
+
+  container.querySelectorAll('[data-model-id]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const model = models.find(m => m.id === btn.dataset.modelId);
+      if (model) openTestChatWith(provider, model);
+    });
+  });
+}
+
+function startEditProvName() {
+  if (!currentEditingProvider) return;
+  document.getElementById('provDetailName').style.display = 'none';
+  document.getElementById('provRenameBtn').style.display = 'none';
+  const editor = document.getElementById('provNameEditor');
+  editor.style.display = 'flex';
+  const input = document.getElementById('provNameInput');
+  input.value = currentEditingProvider.name;
+  input.focus();
+  input.select();
+}
+
+function confirmEditProvName() {
+  if (!currentEditingProvider) return;
+  const input = document.getElementById('provNameInput');
+  const value = input.value.trim();
+  if (!value) { alert('Informe um nome para o provedor.'); return; }
+  if (value !== currentEditingProvider.name) {
+    currentEditingProvider.name = value;
+    document.getElementById('provDetailName').textContent = value;
+    setProvDirty(true);
+  }
+  cancelEditProvName();
+}
+
+function cancelEditProvName() {
+  const editor = document.getElementById('provNameEditor');
+  const name = document.getElementById('provDetailName');
+  const renameBtn = document.getElementById('provRenameBtn');
+  if (editor) editor.style.display = 'none';
+  if (name) name.style.display = '';
+  if (renameBtn) renameBtn.style.display = '';
+}
+
+function syncZapsWithProvider(provider, oldName) {
+  let changed = false;
+  const keys = provider.apiKeys || [];
+  const validModelKeys = new Set();
+  providersData.forEach(p => (p.models || []).forEach(m => validModelKeys.add(`${p.id}|${m.id}`)));
+
+  zapsData.forEach(zap => {
+    // Selecao de chave invalidada pela remocao de chaves
+    if (zap.apiKeySelections && zap.apiKeySelections[provider.id] != null) {
+      const idx = zap.apiKeySelections[provider.id];
+      if (idx >= keys.length) {
+        delete zap.apiKeySelections[provider.id];
+        changed = true;
+      }
+    }
+
+    // Referencia legada "Nome do Provedor|modelId"
+    if (typeof zap.model === 'string' && zap.model.includes('|')) {
+      const [provName, modelId] = zap.model.split('|');
+      if (provName === oldName && provider.name !== oldName) {
+        zap.model = `${provider.name}|${modelId}`;
+        changed = true;
+      } else if (provName === provider.name && !(provider.models || []).some(m => m.id === modelId)) {
+        zap.model = 'auto';
+        changed = true;
+      }
+    }
+
+    // Modelos marcados que deixaram de existir
+    if (Array.isArray(zap.selectedModels) && zap.selectedModels.length) {
+      const before = zap.selectedModels.length;
+      zap.selectedModels = zap.selectedModels.filter(k => validModelKeys.has(k));
+      if (zap.selectedModels.length !== before) changed = true;
+      if (zap.selectedModels.length === 0) delete zap.selectedModels;
+    }
+  });
+
+  return changed;
+}
+
+function saveProviderChanges() {
+  const provider = currentEditingProvider;
+  if (!provider) return;
+
+  const name = (document.getElementById('provDetailName').textContent || '').trim();
+  if (!name) { alert('Por favor, insira um nome para o provedor.'); return; }
+  provider.name = name;
+
+  const keys = (provider.apiKeys || []).map(k => (k || '').trim()).filter(Boolean);
+  if (keys.length === 0) { alert('Por favor, mantenha pelo menos uma chave API.'); return; }
+  provider.apiKeys = keys;
+  provider.apiKey = keys[0];
+
+  const oldName = providerSnapshot ? providerSnapshot.name : provider.name;
 
   saveProviders();
+
+  if (syncZapsWithProvider(provider, oldName)) {
+    saveZaps();
+    renderZaps(zapsData);
+  }
+
+  providerSnapshot = JSON.parse(JSON.stringify(provider));
+  setProvDirty(false);
+  document.getElementById('provDetailName').textContent = provider.name;
+  cancelEditProvName();
+  closeProvKeyForm();
+  renderProvKeysList();
+  renderProvModelsList();
   renderProvidersList();
-  closeProviderConfig();
+
+  // Reaplica as mudancas no painel do Zap aberto
+  if (currentPanelZapId != null) {
+    const zap = zapsData.find(z => String(z.id) === String(currentPanelZapId));
+    if (zap) {
+      renderPanelProviders(zap);
+      renderPanelModelConfig(zap);
+    }
+  }
+
+  refreshAllZapStatuses();
 }
 
 // ============================================
@@ -1946,12 +2798,18 @@ function openTestChat(modelId) {
   const model = currentEditingProvider.models.find(m => m.id === modelId);
   if (!model) return;
 
+  openTestChatWith(currentEditingProvider, model);
+}
+
+function openTestChatWith(provider, model) {
+  if (!provider || !model) return;
+
   currentTestModel = model;
-  currentTestProvider = currentEditingProvider;
+  currentTestProvider = provider;
   testChatHistory = [];
 
-  document.getElementById('testChatTitle').textContent = `Testar: ${model.name}`;
-  document.getElementById('testChatHistory').innerHTML = '<div class="test-chat-empty">Envie uma mensagem para testar o modelo...</div>';
+  document.getElementById('testChatTitle').textContent = `Testar: ${model.name || model.id}`;
+  document.getElementById('testChatHistory').innerHTML = `<div class="test-chat-empty">Conversando com <strong>${provider.name}</strong> / ${model.id}<br>Envie uma mensagem para testar o modelo...</div>`;
   document.getElementById('testChatInput').value = '';
   document.getElementById('testChatModal').classList.add('active');
 
@@ -2032,8 +2890,28 @@ function updateChatMessage(id, role, content) {
   container.scrollTop = container.scrollHeight;
 }
 
+const TEST_SYSTEM_PROMPT = `Voce e um jovem de 17 anos, homem, que gosta de celulares e tecnologia. Voce conversa no WhatsApp como uma pessoa normal, educada e que sabe puxar conversa.
+
+REGRAS DE RESPOSTA (IMPORTANTE):
+- Responda com NO MAXIMO 1 frase. 2 frases so se realmente necessario. NUNCA mais que 2 linhas.
+- Se a pessoa mandar "oi" ou "ola", responda em 1 frase curta: "Oi, em que posso ajudar?".
+- Nao faca listas, nao faca paragrafos, nao seja formal e NAO repita a pergunta da pessoa.
+- Responda apenas o que foi perguntado. Nao adicione informacoes extras, nem explicacoes longas.
+
+ESTILO DE CONVERSA:
+- Abreviacoes as vezes: "tmj", "vlw", "blz", "td bem".
+- "kkkkkk" ou "rsrsrs" quando a conversa for engraçada.
+- Seja descontraido, mas educado. Fale como um jovem normal no WhatsApp.
+
+FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
+- Responda com NO MAXIMO 1 frase. NUNCA mais de 2 linhas: tudo em uma unica linha.
+- Direto ao ponto: sem preambulo, sem repetir a pergunta da pessoa, sem lista.
+- Saudacao -> 1 frase: "Oi, em que posso ajudar?". Pergunta simples -> so a resposta.
+- Economia de tokens: quanto mais curta e direta a resposta, melhor.`;
+
 async function callAIModel(providerName, modelId, apiKey, message) {
   const lowerProvider = providerName.toLowerCase();
+  const systemMessages = [{ role: 'system', content: TEST_SYSTEM_PROMPT }];
 
   // OpenRouter
   if (lowerProvider.includes('openrouter')) {
@@ -2047,8 +2925,9 @@ async function callAIModel(providerName, modelId, apiKey, message) {
       },
       body: JSON.stringify({
         model: modelId,
-        messages: [{ role: 'user', content: message }],
-        max_tokens: 1024
+        messages: [...systemMessages, { role: 'user', content: message }],
+        max_tokens: 200,
+        temperature: 0.6
       })
     });
 
@@ -2068,7 +2947,12 @@ async function callAIModel(providerName, modelId, apiKey, message) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: message }] }]
+        contents: [{ role: 'user', parts: [{ text: message }] }],
+        systemInstruction: { parts: [{ text: TEST_SYSTEM_PROMPT }] },
+        generationConfig: {
+          maxOutputTokens: 200,
+          temperature: 0.6
+        }
       })
     });
 
@@ -2096,8 +2980,9 @@ async function callAIModel(providerName, modelId, apiKey, message) {
       },
       body: JSON.stringify({
         model: modelId,
-        messages: [{ role: 'user', content: message }],
-        max_tokens: 1024
+        messages: [...systemMessages, { role: 'user', content: message }],
+        max_tokens: 200,
+        temperature: 0.6
       })
     });
 
@@ -2520,13 +3405,30 @@ function renderConversations(conversations, zapId) {
   const container = document.getElementById('conversationsList');
   if (!container) return;
 
+  lastRenderedConversations = conversations || [];
+  lastRenderedConversationsZapId = zapId;
+
   if (!conversations || conversations.length === 0) {
     container.innerHTML = '<div class="conversations-empty"><p>Nenhuma conversa ainda</p></div>';
     return;
   }
 
+  const list = globalSearchQuery
+    ? conversations.filter(conv => {
+        const last = conv.lastMessage ? (conv.lastMessage.body || '') : '';
+        return searchMatches(conv.contact ? conv.contact.name : '', globalSearchQuery)
+          || searchMatches(conv.contact ? conv.contact.number : '', globalSearchQuery)
+          || searchMatches(last, globalSearchQuery);
+      })
+    : conversations;
+
+  if (list.length === 0) {
+    container.innerHTML = '<div class="conversations-empty"><p>Nenhuma conversa encontrada para a busca</p></div>';
+    return;
+  }
+
   container.innerHTML = '';
-  conversations.forEach(conv => {
+  list.forEach(conv => {
     const item = document.createElement('div');
     item.className = 'conversation-item';
     item.dataset.chatId = conv.chatId;
@@ -2552,9 +3454,17 @@ function renderConversations(conversations, zapId) {
     item.addEventListener('click', () => openChat(zapId, conv));
     container.appendChild(item);
   });
+
+  if (selectedConversation) {
+    container.querySelectorAll('.conversation-item').forEach(el => {
+      if (el.dataset.chatId === selectedConversation.chatId) el.classList.add('active');
+    });
+  }
 }
 
 function clearConversations() {
+  lastRenderedConversations = null;
+  lastRenderedConversationsZapId = null;
   const container = document.getElementById('conversationsList');
   if (container) {
     container.innerHTML = '<div class="conversations-empty"><p>Selecione um Zap para ver as conversas</p></div>';
@@ -2769,15 +3679,33 @@ function renderTrainingZapsList() {
     return;
   }
 
+  const list = globalSearchQuery
+    ? zapsData.filter(zap => zapMatchesSearch(zap, globalSearchQuery)
+        || (trainingsData[String(zap.id)] || []).some(t => searchMatches(t.title, globalSearchQuery)))
+    : zapsData;
+
+  if (list.length === 0) {
+    container.innerHTML = '<p class="empty-hint">Nenhum resultado para a busca.</p>';
+    return;
+  }
+
   container.innerHTML = '';
-  zapsData.forEach(zap => {
+  list.forEach(zap => {
     const count = (trainingsData[String(zap.id)] || []).length;
     const item = document.createElement('div');
     item.className = 'training-zap-item';
     item.innerHTML = `
       <div class="training-zap-info">
-        <span class="training-zap-name">${escapeHtml(zap.name)}</span>
-        <span class="training-zap-phone">${escapeHtml(zap.phone)}</span>
+        <div class="training-zap-name-row">
+          <span class="training-zap-name">${escapeHtml(zap.name)}</span>
+          <span class="training-zap-phone">${escapeHtml(zap.phone)}</span>
+          <button type="button" class="training-zap-copy" title="Copiar nmero">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+          </button>
+        </div>
       </div>
       <div class="training-zap-meta">
         <span class="training-zap-count">${count} treinamento${count === 1 ? '' : 's'}</span>
@@ -2785,6 +3713,21 @@ function renderTrainingZapsList() {
       </div>
     `;
     item.addEventListener('click', () => openTrainingEditor(zap.id));
+
+    const copyBtn = item.querySelector('.training-zap-copy');
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(zap.phone).then(() => {
+        const orig = copyBtn.innerHTML;
+        copyBtn.classList.add('copied');
+        copyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+        setTimeout(() => {
+          copyBtn.classList.remove('copied');
+          copyBtn.innerHTML = orig;
+        }, 1600);
+      }).catch(() => {});
+    });
+
     container.appendChild(item);
   });
 }
@@ -2813,38 +3756,118 @@ function renderTrainingsList() {
   const container = document.getElementById('trainingsList');
   if (!container || currentTrainingZapId == null) return;
 
+  renderImageLibrary();
+
   const list = trainingsData[String(currentTrainingZapId)] || [];
   if (list.length === 0) {
     container.innerHTML = '<p class="empty-hint">Nenhum treinamento ainda. Clique em "Adicionar Treinamento" para começar.</p>';
     return;
   }
 
+  const visible = globalSearchQuery
+    ? list.filter(t => searchMatches(t.title, globalSearchQuery))
+    : list;
+
+  if (visible.length === 0) {
+    container.innerHTML = '<p class="empty-hint">Nenhum treinamento encontrado para a busca.</p>';
+    return;
+  }
+
   container.innerHTML = '';
-  list.forEach(t => {
-    const content = t.content || '';
-    const preview = content.substring(0, 180);
+  visible.forEach(t => {
     const imgs = Array.isArray(t.images) ? t.images : [];
+    const lnks = Array.isArray(t.links) ? t.links : [];
     const item = document.createElement('div');
     item.className = 'training-item' + (t.enabled === false ? ' disabled' : '');
     item.innerHTML = `
       <div class="training-item-main">
         <div class="training-item-title">${escapeHtml(t.title || 'Sem título')}</div>
-        <div class="training-item-preview">${escapeHtml(preview)}${content.length > 180 ? '...' : ''}</div>
-        <div class="training-item-meta">
-          <span>${t.enabled === false ? 'Desativado' : 'Ativado'}</span>
-          ${imgs.length ? `<span>${imgs.length} imagem${imgs.length === 1 ? '' : 's'}</span>` : ''}
-          <span>Atualizado ${formatDateShort(t.updatedAt || t.createdAt)}</span>
-        </div>
-        ${imgs.length ? `<div class="training-item-thumbs">${imgs.map(i => `<img src="${i.thumb || ''}" alt="" class="training-item-thumb">`).join('')}</div>` : ''}
+        ${imgs.length ? `<div class="training-item-thumbs">${imgs.map(i => `<img src="${i.thumb || i.data || ''}" alt="" class="training-item-thumb">`).join('')}</div>` : ''}
+        ${lnks.length ? `<div class="training-item-links">${lnks.length} link${lnks.length === 1 ? '' : 's'}</div>` : ''}
       </div>
       <div class="training-item-actions">
-        <button class="btn btn-outline" data-action="toggle" data-id="${t.id}">${t.enabled === false ? 'Ativar' : 'Desativar'}</button>
-        <button class="btn btn-outline" data-action="edit" data-id="${t.id}">Editar</button>
-        <button class="btn btn-outline" data-action="delete" data-id="${t.id}">Excluir</button>
+        <button type="button" class="train-act" data-action="toggle" data-id="${t.id}" title="${t.enabled === false ? 'Ativar' : 'Desativar'}">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+            <line x1="12" y1="2" x2="12" y2="12"/>
+          </svg>
+        </button>
+        <button type="button" class="train-act" data-action="edit" data-id="${t.id}" title="Editar">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+          </svg>
+        </button>
+        <button type="button" class="train-act danger" data-action="delete" data-id="${t.id}" title="Excluir">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+        </button>
       </div>
     `;
     container.appendChild(item);
   });
+}
+
+function renderImageLibrary() {
+  const grid = document.getElementById('imageLibraryGrid');
+  const count = document.getElementById('imageLibraryCount');
+  if (!grid) return;
+
+  const items = [];
+  Object.keys(trainingsData || {}).forEach(zapId => {
+    const zap = zapsData.find(z => String(z.id) === String(zapId));
+    (trainingsData[zapId] || []).forEach(t => {
+      (Array.isArray(t.images) ? t.images : []).forEach(img => {
+        if (!img) return;
+        items.push({
+          img,
+          zapName: zap ? zap.name : 'Zap',
+          trainingTitle: t.title || 'Sem título'
+        });
+      });
+    });
+  });
+
+  if (count) count.textContent = items.length ? `${items.length} imagem${items.length === 1 ? '' : 's'}` : '';
+
+  if (items.length === 0) {
+    grid.innerHTML = '<p class="empty-hint">Nenhuma imagem adicionada ainda.</p>';
+    return;
+  }
+
+  grid.innerHTML = items.map((it, i) => `
+    <button type="button" class="image-library-item" data-index="${i}" title="${escapeHtml(it.img.filename || 'Imagem')}">
+      <img src="${it.img.thumb || it.img.data || ''}" alt="${escapeHtml(it.img.filename || 'Imagem')}">
+      <span class="image-library-label">${escapeHtml(it.zapName)}</span>
+    </button>
+  `).join('');
+
+  grid.querySelectorAll('[data-index]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const it = items[parseInt(btn.dataset.index, 10)];
+      if (it) openImageViewer(it);
+    });
+  });
+}
+
+function openImageViewer(item) {
+  const modal = document.getElementById('imageViewerModal');
+  if (!modal) return;
+  document.getElementById('imageViewerTitle').textContent = item.img.filename || 'Imagem';
+  const img = document.getElementById('imageViewerImg');
+  img.src = item.img.data || item.img.thumb || '';
+  const parts = [item.zapName, item.trainingTitle];
+  if (item.img.description) parts.push(item.img.description);
+  document.getElementById('imageViewerCaption').textContent = parts.join(' · ');
+  modal.classList.add('active');
+}
+
+function closeImageViewer() {
+  const modal = document.getElementById('imageViewerModal');
+  if (modal) modal.classList.remove('active');
+  const img = document.getElementById('imageViewerImg');
+  if (img) img.src = '';
 }
 
 function updateTrainingCharCount() {
@@ -2873,11 +3896,21 @@ function renderModalImages() {
       <img src="${thumb}" alt="${escapeHtml(img.filename || 'imagem')}" class="modal-image-thumb">
       <div class="modal-image-info">
         <div class="modal-image-name">${escapeHtml(img.filename || 'imagem')}</div>
-        <input type="text" class="modal-image-desc" placeholder="Descrição (ex: Cardápio do almoço)" value="${escapeHtml(img.description || '')}" data-idx="${idx}">
+        <input type="text" class="modal-image-name-field" placeholder="Nome (ex: Cardápio salgados)" value="${escapeHtml(img.name || '')}" data-idx="${idx}">
+        <input type="text" class="modal-image-desc" placeholder="Sobre o que é esta imagem" value="${escapeHtml(img.description || '')}" data-idx="${idx}">
       </div>
       <button type="button" class="modal-image-remove" data-idx="${idx}" title="Remover">&times;</button>
     `;
     container.appendChild(div);
+  });
+
+  container.querySelectorAll('.modal-image-name-field').forEach(input => {
+    input.addEventListener('input', (e) => {
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (modalPendingImages[idx]) {
+        modalPendingImages[idx].name = e.target.value;
+      }
+    });
   });
 
   container.querySelectorAll('.modal-image-desc').forEach(input => {
@@ -2902,6 +3935,79 @@ function renderModalImages() {
   });
 }
 
+function renderModalLinks() {
+  const container = document.getElementById('trainingLinksList');
+  if (!container) return;
+
+  if (modalPendingLinks.length === 0) {
+    container.innerHTML = '<p class="form-hint" style="margin-top:8px;margin-bottom:0">Nenhum link adicionado.</p>';
+    return;
+  }
+
+  container.innerHTML = '';
+  modalPendingLinks.forEach((lk, idx) => {
+    const div = document.createElement('div');
+    div.className = 'modal-link-item';
+    div.innerHTML = `
+      <div class="modal-image-info">
+        <div class="modal-image-name">${escapeHtml(lk.url || '')}</div>
+        <input type="text" class="modal-link-url" placeholder="https://..." value="${escapeHtml(lk.url || '')}" data-idx="${idx}">
+        <input type="text" class="modal-image-desc" placeholder="Nome/sobre o que é este link" value="${escapeHtml(lk.description || '')}" data-idx="${idx}">
+      </div>
+      <button type="button" class="modal-link-remove" data-idx="${idx}" title="Remover">&times;</button>
+    `;
+    container.appendChild(div);
+  });
+
+  container.querySelectorAll('.modal-link-url').forEach(input => {
+    input.addEventListener('input', (e) => {
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (modalPendingLinks[idx]) modalPendingLinks[idx].url = e.target.value;
+    });
+  });
+
+  container.querySelectorAll('.modal-image-desc').forEach(input => {
+    input.addEventListener('input', (e) => {
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (modalPendingLinks[idx]) modalPendingLinks[idx].description = e.target.value;
+    });
+  });
+
+  container.querySelectorAll('.modal-link-remove').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const idx = parseInt(e.currentTarget.dataset.idx, 10);
+      modalPendingLinks.splice(idx, 1);
+      renderModalLinks();
+    });
+  });
+}
+
+function addTrainingLinkFromInputs() {
+  const urlInput = document.getElementById('trainingLinkUrl');
+  const descInput = document.getElementById('trainingLinkDesc');
+  const url = (urlInput?.value || '').trim();
+  const description = (descInput?.value || '').trim();
+
+  if (!url) { alert('Digite o endereço do link.'); return; }
+  if (!/^https?:\/\//i.test(url) && !/^[\w-]+(\.[\w-]+)+/.test(url)) {
+    alert('Link inválido. Comece com https:// (ex: https://exemplo.com/cardapio).');
+    return;
+  }
+  if (modalPendingLinks.length >= 10) { alert('Máximo de 10 links por treinamento.'); return; }
+
+  const normalized = /^https?:\/\//i.test(url) ? url : 'https://' + url;
+  modalPendingLinks.push({
+    id: 'lnk_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    url: normalized,
+    description
+  });
+
+  if (urlInput) urlInput.value = '';
+  if (descInput) descInput.value = '';
+  renderModalLinks();
+  if (urlInput) urlInput.focus();
+}
+
 async function processTrainingFiles(fileList) {
   const files = Array.from(fileList || []);
   for (const file of files) {
@@ -2921,6 +4027,7 @@ async function processTrainingFiles(fileList) {
         id: 'img_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
         filename: file.name,
         mimeType: file.type,
+        name: '',
         description: '',
         thumb,
         data
@@ -2937,6 +4044,7 @@ function openTrainingModal(trainingId = null) {
   editingTrainingId = trainingId;
   modalPendingImages = [];
   modalDeletedFiles = [];
+  modalPendingLinks = [];
 
   const modal = document.getElementById('trainingModal');
   const titleInput = document.getElementById('trainingTitle');
@@ -2952,6 +4060,7 @@ function openTrainingModal(trainingId = null) {
     titleInput.value = t.title || '';
     contentInput.value = t.content || '';
     modalPendingImages = JSON.parse(JSON.stringify(t.images || []));
+    modalPendingLinks = JSON.parse(JSON.stringify(t.links || []));
   } else {
     if (modalTitle) modalTitle.textContent = 'Adicionar Treinamento';
     titleInput.value = '';
@@ -2960,6 +4069,7 @@ function openTrainingModal(trainingId = null) {
 
   updateTrainingCharCount();
   renderModalImages();
+  renderModalLinks();
   modal.classList.add('active');
 }
 
@@ -2969,6 +4079,7 @@ function closeTrainingModal() {
   editingTrainingId = null;
   modalPendingImages = [];
   modalDeletedFiles = [];
+  modalPendingLinks = [];
 }
 
 async function saveTrainingFromModal() {
@@ -2977,8 +4088,8 @@ async function saveTrainingFromModal() {
   const title = (document.getElementById('trainingTitle')?.value || '').trim();
   const content = (document.getElementById('trainingContent')?.value || '').trim();
 
-  if (!content && modalPendingImages.length === 0) {
-    alert('Adicione um conteúdo ou pelo menos uma imagem.');
+  if (!content && modalPendingImages.length === 0 && modalPendingLinks.length === 0) {
+    alert('Adicione um conteúdo, uma imagem ou um link.');
     return;
   }
 
@@ -2987,6 +4098,7 @@ async function saveTrainingFromModal() {
       id: img.id,
       filename: img.filename,
       mimeType: img.mimeType,
+      name: img.name || '',
       description: img.description || '',
       thumb: img.thumb || null
     };
@@ -2994,6 +4106,14 @@ async function saveTrainingFromModal() {
     if (img.data) out.data = img.data;
     return out;
   });
+
+  const links = modalPendingLinks
+    .filter(lk => lk && lk.url)
+    .map(lk => ({
+      id: lk.id,
+      url: lk.url,
+      description: lk.description || ''
+    }));
 
   const key = String(currentTrainingZapId);
   if (!trainingsData[key]) trainingsData[key] = [];
@@ -3006,6 +4126,7 @@ async function saveTrainingFromModal() {
       t.title = title;
       t.content = content;
       t.images = images;
+      t.links = links;
       t.updatedAt = now;
     }
   } else {
@@ -3014,6 +4135,7 @@ async function saveTrainingFromModal() {
       title,
       content,
       images,
+      links,
       enabled: true,
       createdAt: now,
       updatedAt: now
@@ -3074,9 +4196,28 @@ function setupTrainingListeners() {
     if (e.target.id === 'trainingModal') closeTrainingModal();
   });
 
+  document.getElementById('closeImageViewer')?.addEventListener('click', closeImageViewer);
+  document.getElementById('imageViewerModal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'imageViewerModal') closeImageViewer();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const viewer = document.getElementById('imageViewerModal');
+      if (viewer && viewer.classList.contains('active')) closeImageViewer();
+    }
+  });
+
   document.getElementById('trainingImageInput')?.addEventListener('change', (e) => {
     processTrainingFiles(e.target.files);
     e.target.value = '';
+  });
+
+  document.getElementById('addTrainingLink')?.addEventListener('click', addTrainingLinkFromInputs);
+  document.getElementById('trainingLinkUrl')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addTrainingLinkFromInputs(); }
+  });
+  document.getElementById('trainingLinkDesc')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addTrainingLinkFromInputs(); }
   });
 
   document.getElementById('trainingContent')?.addEventListener('input', updateTrainingCharCount);

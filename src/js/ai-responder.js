@@ -6,10 +6,10 @@ class AIResponder {
     this.defaultPrompt = `Voce e um jovem de 17 anos, homem, que gosta de celulares e tecnologia. Voce conversa no WhatsApp como uma pessoa normal, educada e que sabe puxar conversa.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Respostas curtas: maximo 1-2 frases. NUNCA mais que 2 linhas.
-- Se a pessoa mandar "oi", responda algo como "Oi, tudo bem?" ou "Oii, e ai?"
-- Nao faca listas, nao faca paragrafos, nao seja formal.
-- Responda apenas o que foi perguntado. Nao adicione informacoes extras.
+- Responda com NO MAXIMO 1 frase. 2 frases so se realmente necessario. NUNCA mais que 2 linhas.
+- Se a pessoa mandar "oi" ou "ola", responda em 1 frase curta: "Oi, em que posso ajudar?".
+- Nao faca listas, nao faca paragrafos, nao seja formal e NAO repita a pergunta da pessoa.
+- Responda apenas o que foi perguntado. Nao adicione informacoes extras, nem explicacoes longas.
 
 ESTILO DE CONVERSA:
 - Use abreviacoes como "tmj" (tamo junto), "vlw" (valeu), "blz" (beleza), "td bem" (tudo bem) AS VEZES, nao sempre.
@@ -24,7 +24,7 @@ ESTILO DE CONVERSA:
       'vendedor': `Voce e um vendedor experiente, educado, bom de conversa e divertido, treinado nas tecnicas de negociacao do FBI. Seu objetivo e guiar o cliente ate a compra usando empatia tactica, sem parecer um vendedor chato ou agressivo.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Respostas curtas: maximo 1-2 frases. NUNCA mais que 2 linhas.
+- Responda com NO MAXIMO 1 frase (2 no maximo). NUNCA mais que 2 linhas. Sem preambulo, direto ao ponto.
 - NUNCA faca perguntas fechadas que terminem em "Sim" ou "Nao" para fechar vendas.
 - NUNCA confronte o cliente quando ele reclamar do preço. Use Rotulagem: "Parece que o valor pegou voce de surpresa".
 - Use Espelhamento: repita as ultimas 2-3 palavras da frase do cliente como pergunta leve para ele dar mais detalhes.
@@ -42,7 +42,7 @@ ESTILO:
       'especialista': `Voce e um profissional experiente e qualificado na area de {AREA}. Atua nessa area ha muitos anos e e referencia no assunto.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Respostas curtas: maximo 1-2 frases. NUNCA mais que 2 linhas.
+- Responda com NO MAXIMO 1 frase (2 no maximo). NUNCA mais que 2 linhas. Sem preambulo, direto ao ponto.
 - Seja sempre profissional, formal e educado.
 - Responda apenas o que foi perguntado dentro da sua area de atuacao.
 - Se a pergunta for fora da sua area, diga de forma educada que nao e sua especialidade e sugira procurar um profissional adequado.
@@ -57,7 +57,7 @@ ESTILO:
       'atendente': `Voce e um atendente de loja normal, educado, prestativo e paciente. Seu objetivo e tirar duvidas, atender bem e ajudar as pessoas que mandam mensagem no WhatsApp da loja.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Respostas curtas: maximo 1-2 frases. NUNCA mais que 2 linhas.
+- Responda com NO MAXIMO 1 frase (2 no maximo). NUNCA mais que 2 linhas. Sem preambulo, direto ao ponto.
 - Responda apenas o que foi perguntado. Nao adicione informacoes extras.
 - Se perguntarem se a loja esta aberta, responda direto: "Sim, estamos abertos!" ou "Nao, abrimos amanha as 9h".
 - Se nao souber algo (horario, preco, endereco), diga de forma natural: "Deixa eu confirmar e ja te falo!" ou "Pode me perguntar de novo que eu confirmo com a equipe".
@@ -82,11 +82,13 @@ ESTILO:
 
     let section = 'INFORMACOES DO NEGOCIO (use fielmente para responder):\n';
     const imageLines = [];
+    const linkLines = [];
 
     for (const t of enabled) {
       const title = (t.title || '').trim();
       const content = (t.content || '').trim();
       const images = Array.isArray(t.images) ? t.images : [];
+      const links = Array.isArray(t.links) ? t.links : [];
 
       let block = '';
       if (title) block += `[${title}]\n`;
@@ -94,9 +96,24 @@ ESTILO:
 
       for (const img of images) {
         if (!img || !img.id) continue;
-        const label = (img.description || img.filename || 'imagem').trim();
-        const titleHint = title ? ` (treinamento: ${title})` : '';
-        imageLines.push(`- [SEND_IMAGE:${img.id}] -> ${label}${titleHint}`);
+        const parts = [];
+        const nm = String(img.name || '').trim();
+        const ds = String(img.description || '').trim();
+        if (nm) parts.push(`nome: ${nm}`);
+        if (ds) parts.push(`sobre: ${ds}`);
+        if (title) parts.push(`treinamento: ${title}`);
+        imageLines.push(`- [SEND_IMAGE:${img.id}] -> ${parts.join(' | ') || (img.filename || 'imagem')}`);
+      }
+
+      for (const lk of links) {
+        if (!lk || !lk.id || !lk.url) continue;
+        const parts = [];
+        const nm = String(lk.name || '').trim();
+        const ds = String(lk.description || '').trim();
+        if (nm) parts.push(`nome: ${nm}`);
+        if (ds) parts.push(`sobre: ${ds}`);
+        if (title) parts.push(`treinamento: ${title}`);
+        linkLines.push(`- [SEND_LINK:${lk.id}] -> ${parts.join(' | ') || 'link'}`);
       }
 
       if (section.length + block.length > MAX) break;
@@ -105,11 +122,25 @@ ESTILO:
 
     if (imageLines.length > 0) {
       section += `
-IMAGENS DISPONIVEIS PARA ENVIAR:
-Quando o cliente pedir uma imagem (cardapio, catalogo, foto, etc), inclua o marcador [SEND_IMAGE:id] exatamente na resposta. O sistema envia a imagem automaticamente e a marcacao sera removida do texto.
+REGRAS DE IMAGEM (OBRIGATORIO, SEM EXCECAO):
+Se o cliente pedir qualquer imagem (cardapio, catalogo, foto, menu, etc), a resposta DEVE conter o marcador [SEND_IMAGE:id] escolhido da lista abaixo.
 ${imageLines.join('\n')}
-Exemplo de resposta: "Claro! Aqui esta o cardapio: [SEND_IMAGE:img123]"
-Nao descreva a imagem - envie o marcador e pronto. Pode mandar texto junto ou so o marcador.`;
+Exemplo de resposta: "Claro, aqui esta o cardapio: [SEND_IMAGE:img123]"
+O sistema envia a imagem sozinha e apaga o marcador do texto - o cliente nunca ve o codigo.
+Nao descreva a imagem, so coloque o marcador. Pode ter texto junto ou so o marcador.
+Se voce responder prometendo imagem sem colocar o marcador, a imagem NAO sai e o cliente vai ter que repetir o pedido.
+Se o pedido cobrir MAIS DE UMA imagem (ex: cardapio em 2 partes), coloque todos os marcadores necessarios, um ao lado do outro.
+Se o pedido for por uma imagem so, coloque UM marcador apenas - nunca marque imagens que nao tem a ver com o pedido.`;
+    }
+
+    if (linkLines.length > 0) {
+      section += `
+REGRAS DE LINK (OBRIGATORIO, SEM EXCECAO):
+Se o cliente pedir um link (cardapio digital, catalogo online, site, preco em pagina, etc), a resposta DEVE conter o marcador [SEND_LINK:id] da lista abaixo.
+${linkLines.join('\n')}
+Exemplo de resposta: "Claro, aqui esta o cardapio digital: [SEND_LINK:link123]"
+O sistema troca o marcador pela URL antes de enviar - nunca escreva a URL na mao.
+Se o cliente pedir um link e voce nao colocar o marcador, o link NAO chega.`;
     }
 
     return section.trim();
@@ -136,20 +167,32 @@ Nao descreva a imagem - envie o marcador e pronto. Pode mandar texto junto ou so
       if (name) {
         base += ` Voce se chama ${name}.`;
       }
+    }
 
-      base += `
+    base += `
 
 REGRA UNIVERSAL DE ENTENDIMENTO:
 - Se voce NAO entender a mensagem, NAO tente adivinhar ou responder algo fora do assunto.
 - Responda pedindo para a pessoa repetir, de forma natural. Exemplos: "Nao entendi, pode repetir?" ou "Pode mandar de novo? Nao peguei bem".
 - Isso vale para textos confusos, mensagens muito curtas sem contexto, audios com transcricao ruim, ou qualquer situacao em que voce tenha duvida real sobre o que a pessoa quis dizer.
 - Quando tiver duvida, SEMPRE pedir para repetir em vez de arriscar uma resposta errada.`;
-    }
 
     const trainingsSection = this.buildTrainingsSection(trainings);
     if (trainingsSection) {
       base += '\n\n' + trainingsSection;
     }
+
+    // Sempre por ultimo: o final do system prompt e o trecho que o modelo mais obedece.
+    base += `
+
+FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
+- Responda com NO MAXIMO 1 frase. 2 frases so se realmente necessario. NUNCA mais de 2 linhas.
+- Direto ao ponto: sem preambulo ("Claro!", "Olha", "Certo!"), sem repetir a pergunta da pessoa, sem fechar com frase de efeito.
+- Saudacao ("oi", "ola", "bom dia") -> 1 frase: "Oi, em que posso ajudar?".
+- Pergunta simples -> so a resposta, 1 frase: "Sai por R$ 50, quer que eu reserve?".
+- Nao use listas, nao use marcadores e nao quebre linha: tudo em uma unica linha.
+- UNICA EXCECAO a "nao use marcadores": quando o cliente pedir imagem ou link, os marcadores [SEND_IMAGE:id] e [SEND_LINK:id] sao OBRIGATORIOS. Sem eles nada e enviado.
+- Economia de tokens: quanto mais curta e direta a resposta, melhor.`;
 
     return base;
   }
@@ -214,19 +257,51 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
 
     const resolveKey = (provider) => {
       if (!provider) return null;
-      if (provider.apiKey) return provider.apiKey;
-      if (Array.isArray(provider.apiKeys) && provider.apiKeys.length) {
-        const sel = zap.apiKeySelections && zap.apiKeySelections[provider.id];
-        const idx = sel != null ? sel : 0;
-        return provider.apiKeys[idx] || provider.apiKeys[0];
-      }
-      if (Array.isArray(provider.keys) && provider.keys.length) {
-        const sel = zap.apiKeySelections && zap.apiKeySelections[provider.id];
-        const idx = sel != null ? sel : 0;
-        return provider.keys[idx] || provider.keys[0];
-      }
-      return null;
+      const keys = (Array.isArray(provider.apiKeys) && provider.apiKeys.length)
+        ? provider.apiKeys
+        : (Array.isArray(provider.keys) && provider.keys.length)
+          ? provider.keys
+          : (provider.apiKey ? [provider.apiKey] : []);
+      if (!keys.length) return null;
+      const sel = zap.apiKeySelections && zap.apiKeySelections[provider.id];
+      const idx = (sel != null && sel >= 0 && sel < keys.length) ? sel : 0;
+      return keys[idx] || keys[0];
     };
+
+    // Modelos marcados no painel do Zap (marcar/desmarcar)
+    if (Array.isArray(zap.selectedModels) && zap.selectedModels.length) {
+      const byKey = new Map();
+      providersData.forEach(p => {
+        (p.models || []).forEach(m => byKey.set(`${p.id}|${m.id}`, { p, m }));
+      });
+
+      const out = [];
+      const used = new Set();
+      const push = (p, m) => {
+        const id = `${p.id}|${m.id}`;
+        if (used.has(id)) return;
+        const key = resolveKey(p);
+        if (!key) return;
+        used.add(id);
+        out.push({ provider: { ...p, apiKey: key }, model: m });
+      };
+
+      zap.selectedModels.forEach(k => {
+        const hit = byKey.get(k);
+        if (hit) push(hit.p, hit.m);
+      });
+
+      if (out.length > 0) {
+        // Fallback: demais modelos dos provedores selecionados
+        if (zap.autoSwitch !== false) {
+          for (const pp of providers) {
+            for (const mm of (pp.models || [])) push(pp, mm);
+          }
+        }
+        return out;
+      }
+      // nenhum modelo marcado valido: segue o automatico
+    }
 
     // Specific model selected like "OpenRouter|qwen/qwen3.8-27b:free"
     if (zap.model && zap.model !== 'auto' && zap.model.includes('|')) {
@@ -275,65 +350,137 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
     return out;
   }
 
-  async transcribeAudio(audio, providersData, zapId, apiKeySelections) {
+  async transcribeAudio(audio, providersData, zapId, apiKeySelections, log) {
     // audio: { data: base64, mimetype, size }
-    // Try OpenAI Whisper via any provider with key, prefer openai/groq/openrouter
-    const candidates = [];
-    for (const p of (providersData || [])) {
-      const name = (p.name || '').toLowerCase();
-      let key = p.apiKey;
-      if (!key && Array.isArray(p.apiKeys) && p.apiKeys.length) {
+    // Ordem: Whisper (openai/groq) -> Gemini (audio inline, chave Google)
+    //        -> openrouter -> qualquer outro com chave
+    const say = (type, msg) => { if (typeof log === 'function') { try { log(type, msg); } catch (_) {} } };
+    const keyOf = (p) => {
+      if (p.apiKey) return p.apiKey;
+      if (Array.isArray(p.apiKeys) && p.apiKeys.length) {
         const sel = apiKeySelections && apiKeySelections[p.id];
-        key = p.apiKeys[sel != null ? sel : 0] || p.apiKeys[0];
+        return p.apiKeys[sel != null ? sel : 0] || p.apiKeys[0];
       }
+      return null;
+    };
+
+    const whisper = [], gemini = [], others = [];
+    for (const p of (providersData || [])) {
+      const key = keyOf(p);
       if (!key) continue;
-      if (name.includes('openai') || name.includes('groq') || name.includes('openrouter')) candidates.push({ p, key, name });
+      const name = (p.name || '').toLowerCase();
+      const entry = { p, key, name };
+      if (name.includes('openai') || name.includes('groq')) whisper.push(entry);
+      else if (name.includes('google')) gemini.push(entry);
+      else others.push(entry);
     }
-    // fallback any provider with key
-    if (candidates.length === 0) {
-      for (const p of (providersData || [])) {
-        let key = p.apiKey;
-        if (!key && Array.isArray(p.apiKeys) && p.apiKeys.length) key = p.apiKeys[0];
-        if (key) { candidates.push({ p, key, name: (p.name||'').toLowerCase() }); break; }
-      }
-    }
-    if (candidates.length === 0) throw new Error('Nenhum provedor com chave para transcrever audio');
+    const candidates = [...whisper, ...gemini, ...others];
+    if (!candidates.length) throw new Error('Nenhum provedor com chave para transcrever audio');
 
     let b64 = audio.data || '';
     const commaIdx = b64.indexOf(',');
     if (b64.startsWith('data:') && commaIdx !== -1) b64 = b64.slice(commaIdx + 1);
-    const buf = Buffer.from(b64.trim(), 'base64');
-    // Try each candidate via OpenAI-compatible transcription endpoint
+    b64 = b64.trim();
+    const buf = Buffer.from(b64, 'base64');
+    const mime = (audio.mimetype || 'audio/ogg').split(';')[0].trim();
+
     let lastErr = null;
     for (const c of candidates) {
       try {
-        // Use OpenAI Whisper API: POST /v1/audio/transcriptions with multipart
-        // For simplicity, use Groq/OpenAI endpoint if available, else OpenRouter
-        let url = 'https://api.openai.com/v1/audio/transcriptions';
-        if (c.name.includes('groq')) url = 'https://api.groq.com/openai/v1/audio/transcriptions';
-        else if (c.name.includes('openrouter')) url = 'https://openrouter.ai/api/v1/audio/transcriptions';
-
-        const form = new FormData();
-        // Node 18+ has global FormData/Blob
-        const blob = new Blob([buf], { type: audio.mimetype || 'audio/ogg' });
-        form.append('file', blob, 'audio.ogg');
-        form.append('model', c.name.includes('groq') ? 'whisper-large-v3' : 'whisper-1');
-        form.append('language', 'pt');
-
-        const headers = { 'Authorization': `Bearer ${c.key}` };
-        if (c.name.includes('openrouter')) {
-          headers['HTTP-Referer'] = 'https://link-no-whatsapp.app';
-          headers['X-Title'] = 'Link no WhatsApp';
+        console.log(`[TRANSCRIBE][${zapId}] tentando ${c.p.name}...`);
+        say('info', `Transcrevendo audio com ${c.p.name}...`);
+        let text;
+        if (gemini.includes(c)) {
+          text = await this._transcribeWithGemini(c.key, b64, mime, c.p);
+        } else {
+          text = await this._transcribeWithWhisper(c, buf, mime);
         }
-        const resp = await fetch(url, { method: 'POST', headers, body: form });
-        const j = await resp.json();
-        if (!resp.ok) throw new Error(j.error?.message || `HTTP ${resp.status}`);
-        const text = j.text || j.transcription || '';
-        if (text && text.trim()) return text.trim();
+        if (text && text.trim()) {
+          console.log(`[TRANSCRIBE][${zapId}] sucesso com ${c.p.name}`);
+          say('success', `Transcricao feita com ${c.p.name}.`);
+          return text.trim();
+        }
         throw new Error('Transcricao vazia');
-      } catch (e) { lastErr = e; continue; }
+      } catch (e) {
+        lastErr = e;
+        console.warn(`[TRANSCRIBE][${zapId}] falhou em ${c.p.name}: ${e.message}`);
+        say('warning', `Transcricao com ${c.p.name} falhou: ${e.message}`);
+      }
     }
     throw lastErr || new Error('Falha na transcricao');
+  }
+
+  async _transcribeWithWhisper(c, buf, mime) {
+    let url = 'https://api.openai.com/v1/audio/transcriptions';
+    if (c.name.includes('groq')) url = 'https://api.groq.com/openai/v1/audio/transcriptions';
+    else if (c.name.includes('openrouter')) url = 'https://openrouter.ai/api/v1/audio/transcriptions';
+
+    const ext = mime.includes('mp3') ? 'mp3' : mime.includes('mp4') ? 'm4a' : mime.includes('wav') ? 'wav' : 'ogg';
+    const form = new FormData();
+    const blob = new Blob([buf], { type: mime });
+    form.append('file', blob, `audio.${ext}`);
+    form.append('model', c.name.includes('groq') ? 'whisper-large-v3' : 'whisper-1');
+    form.append('language', 'pt');
+
+    const headers = { 'Authorization': `Bearer ${c.key}` };
+    if (c.name.includes('openrouter')) {
+      headers['HTTP-Referer'] = 'https://link-no-whatsapp.app';
+      headers['X-Title'] = 'Link no WhatsApp';
+    }
+    const resp = await fetch(url, { method: 'POST', headers, body: form });
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(j.error?.message || `HTTP ${resp.status}`);
+    return j.text || j.transcription || '';
+  }
+
+  async _transcribeWithGemini(key, b64, mime, provider) {
+    // Gemini aceita audio inline via generateContent - nao precisa de Whisper
+    const models = (provider.models || []).map(m => m.id).filter(Boolean);
+    const modelId = models.find(id => id.includes('flash')) || models[0] || 'gemini-3.6-flash';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${key}`;
+    const body = {
+      contents: [{
+        role: 'user',
+        parts: [
+          { inline_data: { mime_type: mime, data: b64 } },
+          { text: 'Transcreva este audio em portugues do Brasil. Responda apenas com o texto transcrito, sem comentarios, sem aspas e sem emojis.' }
+        ]
+      }],
+      generationConfig: {
+        maxOutputTokens: 1024,
+        temperature: 0
+      }
+    };
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(j.error?.message || `HTTP ${resp.status}`);
+    const parts = j.candidates?.[0]?.content?.parts || [];
+    return parts.map(p => p.text || '').join('');
+  }
+
+  // Textos que NUNCA podem chegar ao cliente: artefatos internos da IA
+  // (pensamento oculto, erros de API, lixo de schema, etc).
+  isJunkResponse(text) {
+    const t = typeof text === 'string' ? text.trim() : '';
+    if (!t || t.length < 2) return true;
+    const pats = [
+      /check\s*const/i,                              // "Check Constreainsts:*** Max"
+      /finish_?reason/i,
+      /max_?tokens?|maxoutputtokens/i,
+      /\bquota\b|rate.?limit|too many requests/i,
+      /invalid api key|api key not|unauthorized/i,
+      /internal server error|service unavailable/i,
+      /tool_use|tool_call|function_call/i,
+      /\[object Object\]/,
+      /promptFeedback|safetyRatings/i,
+      /\btraceback\b/i,
+      /thought\s*[:=]?\s*true/i
+    ];
+    return pats.some(p => p.test(t));
   }
 
   async generateResponse(messageData, zapConfig, allProviders) {
@@ -346,7 +493,24 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
     this.addToHistory(zapId, chat.id, 'user', body);
 
     const history = this.getHistory(zapId, chat.id);
-    const systemPrompt = this.getSystemPrompt(zapConfig);
+    let systemPrompt = this.getSystemPrompt(zapConfig);
+
+    // Nome do contato: a IA pode usa-lo na conversa (saudacao, confirmacao...)
+    const contactName = String(
+      (messageData.contact && (messageData.contact.name || messageData.contact.number)) || ''
+    ).trim();
+    const hasRealName = contactName.length >= 2 &&
+      /[a-zA-ZÀ-ÿ]/.test(contactName) &&       // tem letras (nao e so numero)
+      !/^(desconhecido|eu \(autochat\))$/i.test(contactName) &&
+      contactName !== String(from || '').split('@')[0];
+    if (hasRealName) {
+      systemPrompt += `
+
+NOME DO CLIENTE: ${contactName}
+- Use o nome do cliente de forma natural quando fizer sentido (saudacao, ao confirmar pedido, ao despedir).
+- Exemplos: "Oi ${contactName.split(' ')[0]}, em que posso ajudar?" ou "Fechado, ${contactName.split(' ')[0]}!".
+- NAO repita o nome em toda frase - no maximo uma vez por resposta.`;
+    }
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -402,12 +566,19 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       try {
         console.log(`[FALLBACK] Tentando ${entry.provider.name} / ${entry.model.id}...`);
         const response = await this.callAI(entry.provider, entry.model, messages);
+        const text = typeof response === 'string' ? response.trim() : '';
 
-        if (response && response.trim().length > 0) {
+        if (text.length > 0) {
+          if (this.isJunkResponse(text)) {
+            lastError = 'Resposta invalida (texto de sistema/erro) - descartada';
+            this.markModelFailed(entry.key);
+            console.log(`[FALLBACK] ${entry.key} retornou texto invalido - NAO enviado ao cliente: "${text.substring(0, 80)}"`);
+            continue;
+          }
           this.markModelSuccess(entry.key);
-          this.addToHistory(zapId, chat.id, 'assistant', response);
+          this.addToHistory(zapId, chat.id, 'assistant', text);
           console.log(`[FALLBACK] Sucesso com ${entry.provider.name} / ${entry.model.id}`);
-          return response;
+          return text;
         }
       } catch (error) {
         lastError = error;
@@ -444,6 +615,22 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
     return this.callOpenAICompatible(providerName, model.id, apiKey, messages);
   }
 
+  // Resposta cortada no meio (finish_reason=length / MAX_TOKENS): corta na
+  // ultima frase completa. Se nao houver nenhuma frase completa, devolve null
+  // e o chamador falha - assim NUNCA um texto pela metade vai ao cliente.
+  finishTruncated(text) {
+    const t = String(text || '').trim();
+    if (!t) return null;
+    let cut = -1;
+    for (let i = t.length - 1; i >= 0; i--) {
+      const c = t[i];
+      if (c === '.' || c === '!' || c === '?' || c === '…') { cut = i + 1; break; }
+    }
+    if (cut < 10) return null;
+    const out = t.slice(0, cut).trim();
+    return out.length >= 10 ? out : null;
+  }
+
   async callOpenRouter(modelId, apiKey, messages) {
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -456,8 +643,8 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       body: JSON.stringify({
         model: modelId,
         messages,
-        max_tokens: 350,
-        temperature: 0.8
+        max_tokens: 2048,
+        temperature: 0.6
       })
     });
 
@@ -467,7 +654,15 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       throw new Error(data.error?.message || `Erro HTTP: ${response.status}`);
     }
 
-    return data.choices?.[0]?.message?.content || '';
+    const choice = Array.isArray(data.choices) ? data.choices[0] : null;
+    const content = typeof choice?.message?.content === 'string' ? choice.message.content : '';
+    if (!content) return '';
+    if (choice?.finish_reason === 'length') {
+      const complete = this.finishTruncated(content);
+      if (!complete) throw new Error('Resposta cortada pelo limite de tokens (sem frase completa)');
+      return complete;
+    }
+    return content;
   }
 
   async callGoogleAI(modelId, apiKey, messages) {
@@ -484,8 +679,8 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
     const body = {
       contents,
       generationConfig: {
-        maxOutputTokens: 350,
-        temperature: 0.8
+        maxOutputTokens: 2048,
+        temperature: 0.6
       }
     };
 
@@ -508,7 +703,33 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       throw new Error(data.error?.message || `Erro HTTP: ${response.status}`);
     }
 
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const cand = Array.isArray(data.candidates) ? data.candidates[0] : null;
+    if (!cand) {
+      const reason = (data.promptFeedback && (data.promptFeedback.blockReason || data.promptFeedback.blockReasonMessage)) || 'sem candidatos';
+      throw new Error(`Gemini sem resposta: ${reason}`);
+    }
+
+    const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
+    // So o texto visivel: partes com thought=true sao pensamento oculto da IA
+    // (pode conter coisas como "Check Constreainsts:...") e NUNCA vao ao cliente.
+    const text = parts
+      .filter(p => p && typeof p.text === 'string' && !p.thought)
+      .map(p => p.text)
+      .join('');
+
+    if (!text.trim()) {
+      throw new Error(`Gemini sem texto visivel (finishReason=${cand.finishReason || 'desconhecido'})`);
+    }
+
+    // Cortado no meio (tokens esgotados pelo thinking ou pelo limite): so
+    // envia se terminar em frase completa, senao falha e outro modelo e tentado.
+    const fr = String(cand.finishReason || '');
+    if (/MAX_TOKENS|LENGTH/i.test(fr)) {
+      const complete = this.finishTruncated(text);
+      if (!complete) throw new Error(`Resposta cortada pelo limite de tokens (finishReason=${fr})`);
+      return complete;
+    }
+    return text;
   }
 
   async callOpenAICompatible(providerName, modelId, apiKey, messages) {
@@ -526,8 +747,8 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       body: JSON.stringify({
         model: modelId,
         messages,
-        max_tokens: 350,
-        temperature: 0.8
+        max_tokens: 2048,
+        temperature: 0.6
       })
     });
 
@@ -537,7 +758,15 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       throw new Error(data.error?.message || `Erro HTTP: ${response.status}`);
     }
 
-    return data.choices?.[0]?.message?.content || '';
+    const choice = Array.isArray(data.choices) ? data.choices[0] : null;
+    const content = typeof choice?.message?.content === 'string' ? choice.message.content : '';
+    if (!content) return '';
+    if (choice?.finish_reason === 'length') {
+      const complete = this.finishTruncated(content);
+      if (!complete) throw new Error('Resposta cortada pelo limite de tokens (sem frase completa)');
+      return complete;
+    }
+    return content;
   }
 }
 

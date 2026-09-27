@@ -5,7 +5,11 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --dev"
+    "dev": "electron . --dev",
+    "test": "node test/run.js && node test/ai.js && node test/flow.js",
+    "test:ai": "node test/ai.js",
+    "test:ai-live": "node test/ai-live.js",
+    "test:flow": "node test/flow.js"
   },
   "author": "Link no WhatsApp",
   "license": "MIT",

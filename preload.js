@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopDrag: () => ipcRenderer.send('window-stop-drag'),
   dragMove: (x, y) => ipcRenderer.send('window-drag-move', x, y),
   focusWindow: () => ipcRenderer.send('window-focus'),
+  nativeAlert: (msg) => ipcRenderer.sendSync('app-alert', msg),
+  nativeConfirm: (msg) => ipcRenderer.sendSync('app-confirm', msg),
 
   // WhatsApp
   whatsappConnect: (zapId, phoneNumber, method) => ipcRenderer.invoke('whatsapp-connect', zapId, phoneNumber, method),

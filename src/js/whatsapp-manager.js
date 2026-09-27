@@ -32,6 +32,11 @@ class WhatsAppManager {
           const map = new Map();
           const entries = raw[zapId] || {};
           Object.keys(entries).forEach(chatId => {
+            // Limpa residuos gravados por versoes antigas: grupos/canais e
+            // chats de servico do WhatsApp (numero "0")
+            if (chatId.includes('@g.us') || chatId.includes('@newsletter') || chatId.includes('@broadcast')) return;
+            const c = entries[chatId] && entries[chatId].contact;
+            if (c && c.number !== undefined && c.number !== null && !/^\d{6,}$/.test(String(c.number))) return;
             map.set(chatId, entries[chatId]);
           });
           this.conversations.set(zapId, map);
@@ -77,11 +82,32 @@ class WhatsAppManager {
     }
 
     const sessionPath = path.join(this._baseDir, 'sessions', zapId);
+    // Sibling fora da sessao: sobrevive ao rmSync e guarda o cache HTTP
+    const cacheKeepPath = path.join(this._baseDir, 'sessions', `${zapId}.cache-keep`);
+    const profilePath = path.join(sessionPath, `session-${zapId}`, 'Default');
 
     // For pairing code, always start fresh (no old sessions)
     if (method === 'pairing' && fs.existsSync(sessionPath)) {
+      // Guarda o cache HTTP do Chromium (padrao ~28 MB de bundles do WA Web)
+      // antes de apagar: a autenticacao (IndexedDB/Local Storage/Session
+      // Storage/Cookies) some junto com a pasta, mas os arquivos baixados
+      // ficam e sao devolvidos depois - conexao muito mais rapida.
+      // Melhor esforco: se falhar, o pareamento segue normalmente.
       try {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
+        fs.rmSync(cacheKeepPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        if (fs.existsSync(profilePath)) {
+          fs.mkdirSync(cacheKeepPath, { recursive: true });
+          for (const d of ['Cache', 'Code Cache']) {
+            const src = path.join(profilePath, d);
+            if (fs.existsSync(src)) fs.renameSync(src, path.join(cacheKeepPath, d));
+          }
+        }
+      } catch (cacheErr) {
+        console.warn('[CACHE] Nao foi possivel preservar o cache HTTP:', cacheErr.message);
+        try { fs.rmSync(cacheKeepPath, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      }
+      try {
+        fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
         this.logToApp(zapId, 'info', 'Sessao antiga removida (pareamento)');
       } catch (e) {
         console.error('Erro ao remover sessao antiga:', e);
@@ -90,6 +116,26 @@ class WhatsAppManager {
 
     if (!fs.existsSync(sessionPath)) {
       fs.mkdirSync(sessionPath, { recursive: true });
+    }
+
+    // Devolve o cache HTTP preservado (o LocalAuth recria o perfil em session-<id>)
+    try {
+      if (fs.existsSync(cacheKeepPath)) {
+        fs.mkdirSync(profilePath, { recursive: true });
+        let restored = 0;
+        for (const d of fs.readdirSync(cacheKeepPath)) {
+          const dest = path.join(profilePath, d);
+          if (fs.existsSync(dest)) {
+            fs.rmSync(dest, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+          }
+          fs.renameSync(path.join(cacheKeepPath, d), dest);
+          restored++;
+        }
+        fs.rmSync(cacheKeepPath, { recursive: true, force: true });
+        if (restored) this.logToApp(zapId, 'info', `Cache HTTP do navegador preservado (${restored} pastas) - conexao mais rapida.`);
+      }
+    } catch (e) {
+      console.warn('[CACHE] Falha ao restaurar cache HTTP:', e.message);
     }
 
     const cleanPhone = phoneNumber.replace(/\D/g, '');
@@ -109,13 +155,39 @@ class WhatsAppManager {
           '--disable-accelerated-2d-canvas',
           '--no-first-run',
           '--disable-gpu',
-          '--disable-features=IsolateOrigins,site-per-process'
+          '--disable-features=IsolateOrigins,site-per-process,Translate,BackForwardCache,MediaRouter,OptimizationHints',
+          // Performance: evita trabalhos em background de atrair o carregamento
+          '--disable-background-networking',
+          '--disable-component-update',
+          '--disable-sync',
+          '--disable-background-timer-throttling',
+          '--disable-renderer-backgrounding',
+          '--disable-backgrounding-occluded-windows',
+          '--mute-audio'
         ],
         timeout: 120000,
         protocolTimeout: 180000
       },
-      webVersionCache: { type: 'none' }
+      // 'local' em vez de 'none': congela a versao do WA Web apos a primeira
+      // carga, evitando que atualizacoes do WhatsApp quebrem os scripts injetados
+      webVersionCache: { type: 'local', path: path.join(this._baseDir, '.wwebjs_cache') }
     };
+
+    // Se ja existe uma versao congelada no cache, usa ela (resolve intercepta
+    // as requisicoes e serve o HTML salvo em vez da versao mais nova)
+    try {
+      const cacheDir = clientOptions.webVersionCache.path;
+      if (fs.existsSync(cacheDir)) {
+        const htmls = fs.readdirSync(cacheDir).filter(f => f.endsWith('.html'));
+        if (htmls.length) {
+          const frozen = htmls[htmls.length - 1].replace(/\.html$/, '');
+          clientOptions.webVersion = frozen;
+          this.logToApp(zapId, 'info', `Versao do WhatsApp Web congelada no cache: ${frozen}`);
+        }
+      }
+    } catch (e) {
+      console.warn('[WWEB] Falha ao ler cache de versao:', e.message);
+    }
 
     // Pareamento robusto: nao usar pairWithPhoneNumber no construtor para controle total
     // Vamos chamar requestPairingCode explicitamente apos initialize
@@ -132,16 +204,24 @@ class WhatsAppManager {
       pairingCode: null,
       messages: new Map(),
       chats: new Map(),
-      startupTime: Math.floor(Date.now() / 1000)
+      startupTime: Math.floor(Date.now() / 1000),
+      // Autochat (mensagens para o proprio numero)
+      selfNumber: null,
+      // Numero pareado (fallback/segundo candidato do autochat)
+      selfNumberAlt: null,
+      // IDs de mensagens enviadas PELA IA - usados para evitar loop
+      aiSentIds: new Set(),
+      // Marcadores (corpo + timestamp) de envios em andamento da IA
+      pendingAiSends: []
     });
 
     client.on('qr', async (qr) => {
-      this.logToApp(zapId, 'info', 'QR Code gerado. Escaneie com o celular.');
       const data = this.clients.get(zapId);
-      if (data) {
-        data.qrCode = qr;
-        data.status = 'waiting_qr';
-      }
+      // Nunca rebaixa o status depois de autenticado/ready
+      if (!data || data.client !== client || data.status === 'ready' || data.status === 'authenticated') return;
+      this.logToApp(zapId, 'info', 'QR Code gerado. Escaneie com o celular.');
+      data.qrCode = qr;
+      data.status = 'waiting_qr';
       let dataUrl = null;
       if (QRCode) {
         try { dataUrl = await QRCode.toDataURL(qr, { width: 280, margin: 1 }); } catch (e) { console.warn('[QR] falha ao gerar dataUrl:', e.message); }
@@ -150,12 +230,13 @@ class WhatsAppManager {
     });
 
     client.on('code', (code) => {
-      this.logToApp(zapId, 'success', `Codigo de pareamento gerado: ${code}`);
       const data = this.clients.get(zapId);
-      if (data) {
-        data.pairingCode = code;
-        data.status = 'waiting_pairing';
-      }
+      // O renovador da pagina pode emitir 'code' depois de autenticar -
+      // nunca rebaixa o status de uma sessao ja conectada
+      if (!data || data.client !== client || data.status === 'ready' || data.status === 'authenticated') return;
+      this.logToApp(zapId, 'success', `Codigo de pareamento gerado: ${code}`);
+      data.pairingCode = code;
+      data.status = 'waiting_pairing';
       this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
     });
 
@@ -164,9 +245,15 @@ class WhatsAppManager {
     });
 
     client.on('change_state', (state) => {
+      const data = this.clients.get(zapId);
+      if (!data || data.client !== client) return;
+      // O wwebjs registra o listener da pagina de novo a cada navegacao, entao
+      // o MESMO estado chega varias vezes - loga apenas mudancas reais
+      if (data.lastState === state) return;
+      data.lastState = state;
       console.log(`[WHATSAPP] Zap ${zapId} state: ${state}`);
       this.logToApp(zapId, 'info', `Estado WhatsApp: ${state}`);
-      if (state === 'CONNECTED') {
+      if (state === 'CONNECTED' && data.status !== 'ready' && data.status !== 'authenticated') {
         this.logToApp(zapId, 'info', `WhatsApp conectado (estado CONNECTED) - aguardando autenticacao...`);
       }
     });
@@ -178,18 +265,42 @@ class WhatsAppManager {
     // Unified handlers - no double-remove hack needed
     const handleReady = () => {
       const data = this.clients.get(zapId);
-      if (data) {
-        data.status = 'ready';
-        data.qrCode = null;
-        data.pairingCode = null;
-        if (data.pairingInterval) { clearInterval(data.pairingInterval); data.pairingInterval = null; }
-        // readyAt = PC clock (seconds), readyWall = wall time for history window, historyBufferUntil = 90s after ready
-        // We use a hybrid check: for 90s after ready we filter by timestamp, after that we accept all (fixes PC clock skew)
-        data.readyAt = Math.floor(Date.now() / 1000);
-        data.readyWall = Date.now();
-        data.historyBufferUntil = Date.now() + 90 * 1000;
+      if (!data || data.client !== client) return;
+      // 'ready' chega duplicado (listeners de pagina acumulados pelo inject()):
+      // processa so o primeiro. Rezerar readyAt/historyBufferUntil faria o
+      // filtro de historico (REGRA 2) descartar mensagens reais.
+      if (data.readyAt) return;
+      data.status = 'ready';
+      data.qrCode = null;
+      data.pairingCode = null;
+      // readyAt = PC clock (seconds), readyWall = wall time for history window, historyBufferUntil = 90s after ready
+      // We use a hybrid check: for 90s after ready we filter by timestamp, after that we accept all (fixes PC clock skew)
+      data.readyAt = Math.floor(Date.now() / 1000);
+      data.readyWall = Date.now();
+      data.historyBufferUntil = Date.now() + 90 * 1000;
+      // Autochat: descobre o numero proprio para reconhecer mensagens enviadas a si mesmo
+      try {
+        const wid = client.info && client.info.wid;
+        const raw = wid ? (typeof wid === 'object' ? (wid._serialized || `${wid.user}@${wid.server || 'c.us'}`) : String(wid)) : '';
+        const widNum = raw ? raw.split('@')[0].replace(/:\d+$/, '') : '';
+        // O wid ja veio truncado em teste (553299344496 vs 5532999344496):
+        // guardamos os dois numeros e o autochat aceita qualquer um (ver _selfNums)
+        data.selfNumber = widNum || cleanPhone;
+        data.selfNumberAlt = cleanPhone;
+        const shown = [data.selfNumber, data.selfNumberAlt]
+          .filter((v, i, a) => v && a.indexOf(v) === i).join(' / ');
+        if (widNum && cleanPhone && widNum !== cleanPhone) {
+          this.logToApp(zapId, 'warning', `Autochat: numero no WhatsApp (${widNum}) difere do numero pareado (${cleanPhone}) - aceitando os dois.`);
+        }
+        this.logToApp(zapId, 'info', `Autochat ativo no numero ${shown} - mensagens enviadas para o proprio numero serao lidas pela IA.`);
+      } catch (e) {
+        console.warn('[AUTOCHAT] nao foi possivel obter o numero proprio:', e.message);
+        if (!data.selfNumberAlt) data.selfNumberAlt = cleanPhone;
       }
-      this.logToApp(zapId, 'success', `CONECTADO e pronto! Sistema ativo. readyAt=${this.clients.get(zapId)?.readyAt} (buffer 90s)`);
+      // Depois de autenticado o renovador de codigo da pagina so reinicia o
+      // vinculo e derruba a sessao - desliga ele
+      this._clearPagePairingInterval(client);
+      this.logToApp(zapId, 'success', `CONECTADO e pronto! Sistema ativo. readyAt=${data.readyAt} (buffer 90s)`);
       this.sendToRenderer('whatsapp-status', { zapId, status: 'ready' });
       this.fetchAllContacts(zapId).catch(e => {
         const msg = e && e.message ? e.message : String(e);
@@ -200,20 +311,19 @@ class WhatsAppManager {
     };
     const handleAuthenticated = () => {
       const data = this.clients.get(zapId);
-      if (data) {
-        data.status = 'authenticated';
-        if (data.pairingInterval) { clearInterval(data.pairingInterval); data.pairingInterval = null; }
-      }
+      if (!data || data.client !== client) return;
+      // Duplicado pelo mesmo motivo do ready - processa so o primeiro
+      if (data.status === 'authenticated' || data.status === 'ready') return;
+      data.status = 'authenticated';
+      this._clearPagePairingInterval(client);
       this.logToApp(zapId, 'success', 'Autenticado (sessao valida)');
       this.sendToRenderer('whatsapp-status', { zapId, status: 'authenticated' });
     };
     const handleAuthFailure = (msg) => {
       console.error(`Falha na autenticacao do Zap ${zapId}:`, msg);
       const data = this.clients.get(zapId);
-      if (data) {
-        data.status = 'auth_failure';
-        if (data.pairingInterval) { clearInterval(data.pairingInterval); data.pairingInterval = null; }
-      }
+      if (!data || data.client !== client) return;
+      data.status = 'auth_failure';
       let friendlyMsg = msg || 'Autenticacao negada';
       if (msg && (msg.includes('query_link') || msg.includes('not allowed') || msg.includes('linked'))) {
         friendlyMsg = 'Nao foi possivel vincular. Verifique se o numero esta correto e se o WhatsApp esta aberto no celular.';
@@ -223,11 +333,44 @@ class WhatsAppManager {
     };
     const handleDisconnected = (reason) => {
       const data = this.clients.get(zapId);
-      if (data) {
-        data.status = 'disconnected';
-        if (data.pairingInterval) { clearInterval(data.pairingInterval); data.pairingInterval = null; }
-      }
+      if (!data || data.client !== client) return;
+      // LOGOUT/queda chega 2x (varios frames com post_logout=1/lastLoggedOut)
+      if (data.status === 'disconnected') return;
+      data.status = 'disconnected';
+      // Janela de historico invalida - o proximo ready recria (readyAt null)
+      data.readyAt = null;
+      data.readyWall = null;
+      data.historyBufferUntil = null;
       this.logToApp(zapId, 'warning', `Zap DESCONECTADO (${reason}). Mensagens nao serao processadas ate reconectar.`);
+      if (reason === 'LOGOUT') {
+        this.logToApp(zapId, 'error', 'Sessao expirada no WhatsApp (LOGOUT). Reconecte pelo painel para gerar um novo pareamento.');
+        // O handler do wwebjs continua DEPOIS do emit (authStrategy.logout +
+        // inject). Fechar o browser dentro do evento faz o inject rodar numa
+        // pagina morta -> "detached Frame" -> unhandled rejection -> crash.
+        // Espera ele terminar, desliga os listeners da pagina, ai fecha e limpa.
+        (async () => {
+          await new Promise(r => setTimeout(r, 2000));
+          const stillSameClient = () => {
+            const d = this.clients.get(zapId);
+            return d && d.client === client;
+          };
+          // Usuario ja reconectou/desconectou: outro fluxo ja cuidou disto
+          if (!stillSameClient()) return;
+          this._detachPageListeners(client);
+          try { client.removeAllListeners(); } catch (_) { /* ignore */ }
+          try { await client.destroy(); } catch (_) { /* ja fechado */ }
+          for (let i = 0; i < 6; i++) {
+            await new Promise(r => setTimeout(r, 1500));
+            // Se o usuario ja reconectou, para fora - nao apaga a sessao nova
+            if (!stillSameClient()) return;
+            try {
+              fs.rmSync(path.join(this._baseDir, 'sessions', zapId), { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+              this.logToApp(zapId, 'info', 'Sessao expirada removida do disco.');
+              break;
+            } catch (_) { /* EBUSY - tenta de novo */ }
+          }
+        })();
+      }
       this.sendToRenderer('whatsapp-status', { zapId, status: 'disconnected', reason });
     };
 
@@ -241,14 +384,24 @@ class WhatsAppManager {
     // ============================================================
     client.on('message', async (msg) => {
       const data = this.clients.get(zapId);
-      if (!data) return;
+      if (!data || data.client !== client) return;
+
+      // GRUPOS/TRANSMISSAO/CANAIS: corte aqui, antes de qualquer coisa.
+      // Nao vai para a UI, nao baixa midia e nunca passa pela IA.
+      if (this._isGroupJid(msg.from) || this._isGroupJid(msg.to)) {
+        console.log(`[GRUPO] mensagem de grupo descartada (zap ${zapId}) - nao vai para a IA`);
+        return;
+      }
 
       // Armazena o objeto original para poder usar reply() depois
-      data.messages.set(msg.id._serialized, msg);
-      if (data.messages.size > 100) {
-        const keys = Array.from(data.messages.keys());
-        for (let i = 0; i < keys.length - 100; i++) {
-          data.messages.delete(keys[i]);
+      const msgKey = this._ensureMsgKey(msg);
+      if (msgKey) {
+        data.messages.set(msgKey, msg);
+        if (data.messages.size > 100) {
+          const keys = Array.from(data.messages.keys());
+          for (let i = 0; i < keys.length - 100; i++) {
+            data.messages.delete(keys[i]);
+          }
         }
       }
 
@@ -258,87 +411,140 @@ class WhatsAppManager {
 
     // ============================================================
     // EVENTO 'message_create': dispara para TODAS as mensagens,
-    // inclusive as que EU envio. Usamos para capturar mensagens
-    // enviadas para si mesmo (teste).
+    // inclusive as que EU envio. Usado para o AUTOCHAT (mensagens
+    // enviadas para o proprio numero) com protecao anti-loop.
     // ============================================================
     client.on('message_create', async (msg) => {
-      if (msg.fromMe) {
-        // Verifica se a mensagem foi enviada para mim mesmo
-        const fromNum = msg.from ? msg.from.split('@')[0] : '';
-        const toNum = msg.to ? msg.to.split('@')[0] : '';
-        if (fromNum && toNum && fromNum === toNum) {
-          // Mensagem para si mesmo - processa como se fosse recebida
-          const data = this.clients.get(zapId);
-          if (data) {
-            data.messages.set(msg.id._serialized, msg);
-            await this.handleMessage(zapId, msg);
+      try {
+        if (!msg.fromMe) return; // mensagens recebidas vêm pelo evento 'message'
+        const data = this.clients.get(zapId);
+        if (!data || data.client !== client) return;
+
+        // Chat da mensagem: para mensagens enviadas por mim, o chat e msg.to
+        const chatJid = msg.to || msg.from || '';
+        const chatNum = this._normNum(chatJid);
+
+        // GRUPOS: eu escrevendo num grupo tambem e descartado (a IA so
+        // conversa no autochat, chat 1:1 do proprio numero)
+        if (this._isGroupJid(chatJid) || this._isGroupJid(msg.from)) {
+          console.log(`[GRUPO] mensagem propria em grupo descartada (zap ${zapId}) - nao vai para a IA`);
+          return;
+        }
+
+        // Somente o chat do proprio numero (autochat). Outros chats saem aqui.
+        const selfNums = this._selfNums(data);
+        const fromNum = this._normNum(msg.from || '');
+        const isSelfChat = selfNums.length ? selfNums.includes(chatNum) : (fromNum && chatNum === fromNum);
+        if (!isSelfChat) return;
+
+        const msgId = this._ensureMsgKey(msg);
+        const bodyTxt = msg.body || '';
+        // deviceType 'web' = enviado pela mesma sessao web (a IA envia por aqui).
+        // Mensagens vindas do celular do usuario sao 'android'/'ios' - nunca sao da IA.
+        const isWebMsg = msg.deviceType === 'web';
+
+        // Anti-loop 1: id ja identificado como enviado pela IA (definitivo)
+        if (msgId && data.aiSentIds && data.aiSentIds.has(msgId)) {
+          this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop id): "${bodyTxt.substring(0, 60)}"`);
+          return;
+        }
+
+        // Anti-loop 2: envio da IA ainda em curso (o message_create do envio proprio
+        // chega antes do sendMessage resolver, entao o id ainda nao esta em aiSentIds).
+        // Nessa janela, mensagem 'web' = nossa sessao = resposta da IA.
+        // Apos resolver, o id cai em aiSentIds (anti-loop 1) e tambem casamos por corpo.
+        const aiSending = !!data.aiSending;
+        if (aiSending && isWebMsg && msgId) {
+          if (data.aiSentIds) data.aiSentIds.add(msgId); // fixa para nao depender da janela
+          this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop janela): "${bodyTxt.substring(0, 60)}"`);
+          return;
+        }
+        if (isWebMsg && data.pendingAiSends && data.pendingAiSends.length) {
+          const idx = data.pendingAiSends.findIndex(p => {
+            if ((Date.now() - p.t) >= 20000) return false;
+            if (p.midia) return msg.hasMedia;
+            return p.body === bodyTxt;
+          });
+          if (idx !== -1) {
+            data.pendingAiSends.splice(idx, 1);
+            this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop marca): "${bodyTxt.substring(0, 60)}"`);
+            return;
           }
         }
+
+        data.messages.set(msgId, msg);
+        if (data.messages.size > 100) {
+          const keys = Array.from(data.messages.keys());
+          for (let i = 0; i < keys.length - 100; i++) data.messages.delete(keys[i]);
+        }
+
+        this.logToApp(zapId, 'incoming',
+          `Autochat [${chatNum}]: mensagem sua para o proprio numero (${msg.type}): "${bodyTxt.substring(0, 120)}"`);
+
+        await this.handleMessage(zapId, msg);
+      } catch (e) {
+        console.error('[AUTOCHAT] Erro ao processar message_create:', e);
+        this.logToApp(zapId, 'error', `Autochat: erro ao processar mensagem: ${e.message}`);
       }
     });
 
-    // Pairing interval is stored in clientData.pairingInterval; cleanup handled in handleReady/handleAuthenticated/handleDisconnected
-    const clearPairingInterval = () => {
-      const d = this.clients.get(zapId);
-      if (d && d.pairingInterval) { clearInterval(d.pairingInterval); d.pairingInterval = null; }
-    };
-
     try {
       this.sendToRenderer('whatsapp-status', { zapId, status: 'connecting' });
-      await client.initialize();
+      const tInit = Date.now();
+      // Descobre quando o browser sobe (pupPage aparece antes do goto) para
+      // separar "launch do Chromium" de "carga da pagina" no log
+      let tBrowser = null;
+      const pollBrowser = setInterval(() => {
+        if (tBrowser === null && client.pupPage) tBrowser = Date.now();
+      }, 50);
+      try {
+        await client.initialize();
+      } finally {
+        clearInterval(pollBrowser);
+      }
+      await this._patchMediaMsgAttrs(client);
+      const sec = (a, b) => ((b - a) / 1000).toFixed(1);
+      if (tBrowser) {
+        this.logToApp(zapId, 'info', `Navegador e pagina prontos em ${sec(tInit, Date.now())}s (chromium ${sec(tInit, tBrowser)}s + pagina ${sec(tBrowser, Date.now())}s).`);
+      } else {
+        this.logToApp(zapId, 'info', `Navegador e pagina do WhatsApp prontos em ${sec(tInit, Date.now())}s.`);
+      }
 
       // Pareamento robusto: gerar codigo explicitamente apos initialize
       if (isPairing) {
         try {
           this.logToApp(zapId, 'info', `Solicitando codigo de pareamento para ${cleanPhone}...`);
           // Pequeno delay para garantir que a pagina carregou
-          await new Promise(r => setTimeout(r, 1500));
+          await new Promise(r => setTimeout(r, 250));
           let code;
           try {
-            code = await client.requestPairingCode(cleanPhone);
+            code = await this._withTimeout(client.requestPairingCode(cleanPhone), 20000, 'requestPairingCode');
           } catch (firstErr) {
             // Fallback: tentar com intervalo explicito
             this.logToApp(zapId, 'warning', `Primeira tentativa falhou (${firstErr.message}), tentando novamente...`);
-            await new Promise(r => setTimeout(r, 2000));
-            code = await client.requestPairingCode(cleanPhone, true, 60000);
+            await new Promise(r => setTimeout(r, 500));
+            code = await this._withTimeout(client.requestPairingCode(cleanPhone, true), 20000, 'requestPairingCode');
           }
-          this.logToApp(zapId, 'success', `Codigo de pareamento gerado: ${code}`);
           const data = this.clients.get(zapId);
+          // O evento 'code' (disparado pela propria pagina) ja registrou e
+          // enviou o codigo para a UI antes do evaluate resolver - so completamos
+          // com o tempo de conexao para diagnóstico
+          const alreadySent = data && data.pairingCode === code;
           if (data) {
             data.pairingCode = code;
             data.status = 'waiting_pairing';
           }
-          this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
-
-          // Regeneracao automatica a cada 60s se ainda nao conectado
-          let attempts = 0;
-          const regenInterval = setInterval(async () => {
-            const d = this.clients.get(zapId);
-            if (!d || d.status === 'ready' || d.status === 'authenticated') {
-              clearInterval(regenInterval);
-              if (d) d.pairingInterval = null;
-              return;
-            }
-            if (attempts >= 4) {
-              clearInterval(regenInterval);
-              if (d) d.pairingInterval = null;
-              this.logToApp(zapId, 'warning', 'Pareamento expirou apos 5 tentativas. Gere novo codigo clicando novamente.');
-              this.sendToRenderer('whatsapp-status', { zapId, status: 'pairing_timeout' });
-              return;
-            }
-            try {
-              const newCode = await client.requestPairingCode(cleanPhone, true, 60000);
-              this.logToApp(zapId, 'info', `Novo codigo gerado (tentativa ${attempts + 2}/5): ${newCode}`);
-              const dd = this.clients.get(zapId);
-              if (dd) { dd.pairingCode = newCode; dd.status = 'waiting_pairing'; }
-              this.sendToRenderer('whatsapp-pairing-code', { zapId, code: newCode });
-              attempts++;
-            } catch (e) {
-              this.logToApp(zapId, 'error', `Falha ao regenerar codigo: ${e.message}`);
-            }
-          }, 60000);
-          const cData = this.clients.get(zapId);
-          if (cData) cData.pairingInterval = regenInterval;
+          if (alreadySent) {
+            this.logToApp(zapId, 'info', `Codigo pronto em ${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio.`);
+          } else {
+            this.logToApp(zapId, 'success', `Codigo de pareamento gerado: ${code} (${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio)`);
+            this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
+          }
+          // Sem regeneracao daqui: o intervalo proprio da pagina (3 min, padrao
+          // do wwebjs) renova o codigo enquanto nao pareado e dispara o evento
+          // 'code' para a UI. Regenerar manualmente reiniciava o vinculo por
+          // cima do usuario digitando, travava 180s no protocolTimeout e
+          // acabava derrubando a sessao (LOGOUT).
         } catch (e) {
           this.logToApp(zapId, 'error', `Falha ao solicitar codigo de pareamento: ${e.message}`);
           // Nao joga erro fatal - deixa usuario tentar novamente ou usar QR
@@ -348,7 +554,6 @@ class WhatsAppManager {
 
       return { status: 'initializing', method };
     } catch (error) {
-      clearPairingInterval();
       console.error(`Erro ao inicializar Zap ${zapId}:`, error);
       this.logToApp(zapId, 'error', `Erro ao iniciar WhatsApp: ${error.message}`);
       this.clients.delete(zapId);
@@ -358,14 +563,24 @@ class WhatsAppManager {
 
   async handleMessage(zapId, msg) {
     try {
+      // Garante a chave da mensagem antes de qualquer uso (cache/IA/audio)
+      this._ensureMsgKey(msg);
       // Normalize chat/contact detection: handle @g.us (grupo), @lid (novo ID), @c.us/@s.whatsapp.net
-      const rawFrom = msg.from || '';
+      // Para mensagens enviadas por mim (fromMe), o chat de destino e msg.to (autochat usa isso)
+      const rawFrom = (msg.fromMe ? (msg.to || msg.from || '') : (msg.from || ''));
       let contactName = 'Desconhecido';
       let contactNumber = rawFrom.split('@')[0].replace(/:.*/, '');
       // fallback numeric extraction for @lid where id.user is lid hash
       let chatId = rawFrom;
       let chatName = contactNumber;
       let isGroup = rawFrom.includes('@g.us') || rawFrom.includes('@broadcast') || rawFrom.includes('@newsletter');
+
+      // Segunda barreira: JID ja indica grupo (checagem sem await, antes de
+      // getContact/getChat e antes de baixar qualquer midia)
+      if (isGroup || this._isGroupJid(rawFrom)) {
+        this._dropGroupMsg(zapId, msg);
+        return;
+      }
 
       try {
         const contact = await msg.getContact();
@@ -384,6 +599,16 @@ class WhatsAppManager {
         // also check serialized suffix as fallback
         if (chatId.includes('@g.us')) isGroup = true;
 
+        // Barreira autoritativa: chat.isGroup confirmado. Corta AQUI, antes de
+        // cachear o chat, antes de baixar audio e antes de mandar para a IA.
+        if (isGroup) {
+          const dg = this.clients.get(zapId);
+          if (dg && dg.chats) dg.chats.delete(chatId);
+          this._dropGroupMsg(zapId, msg);
+          console.log(`[GRUPO] mensagem de grupo descartada (zap ${zapId}) - nao vai para a IA`);
+          return;
+        }
+
         // Armazena o objeto Chat para reutilizar (sendStateTyping, clearState)
         const clientData = this.clients.get(zapId);
         if (clientData && clientData.chats) {
@@ -393,38 +618,39 @@ class WhatsAppManager {
         console.log('Aviso: nao foi possivel obter chat, usando dados basicos');
       }
 
+      // Autochat: este chat e do proprio numero? (aceita wid e numero pareado)
+      const cd = this.clients.get(zapId);
+      const isSelfChat = this._selfNums(cd).includes(this._normNum(chatId));
+      if (isSelfChat && !contactName.trim()) contactName = 'Eu (autochat)';
+
       // =============================================
       // DETECCAO E DOWNLOAD DE AUDIO
       // =============================================
       let audioInfo = null;
+      let audioFailed = false;
+      // msg.mimetype nao existe na classe Message - mimetype real esta em msg._data.mimetype
+      const rawMime = (msg._data && msg._data.mimetype) || '';
       const isAudioType = msg.type === 'ptt' || msg.type === 'audio' ||
-                          (msg.hasMedia && msg.mimetype && msg.mimetype.startsWith('audio'));
+                          (msg.hasMedia && rawMime && rawMime.startsWith('audio'));
 
-      if (isAudioType && msg.hasMedia) {
-        this.logToApp(zapId, 'info', `Audio detectado de ${contactName} (${msg.mimetype}). Baixando...`);
-        try {
-          const media = await msg.downloadMedia();
-          if (media && media.data) {
-            audioInfo = {
-              data: media.data,        // base64
-              mimetype: media.mimetype, // ex: audio/ogg; codecs=opus
-              size: media.filesize
-            };
-            this.logToApp(zapId, 'success', `Audio baixado (${media.filesize} bytes). Sera transcrito pela IA.`);
-          } else {
-            this.logToApp(zapId, 'warning', 'downloadMedia do audio retornou vazio.');
-          }
-        } catch (e) {
-          console.error(`[AUDIO] Erro ao baixar audio:`, e.message);
-          this.logToApp(zapId, 'error', `Erro ao baixar audio: ${e.message}`);
+      if (isAudioType) {
+        if (!msg.hasMedia) {
+          audioFailed = true;
+          this.logToApp(zapId, 'warning', `Audio de ${contactName} sem midia acessivel (hasMedia=false).`);
+        } else {
+          this.logToApp(zapId, 'info', `Audio detectado de ${contactName} (${rawMime || 'ptt'}). Baixando...`);
+          audioInfo = await this._downloadAudio(zapId, msg, rawMime);
+          if (!audioInfo) audioFailed = true;
         }
       }
 
       // Mensagem de texto normal
       let body = msg.body || '';
 
-      // Se for audio sem texto, marcar como pendente de transcricao
-      if (audioInfo && (!body || body.trim() === '')) {
+      // Se for audio sem texto, marcar como pendente de transcricao.
+      // Tambem quando o download FALHOU (audioFailed) - main.js responde
+      // pedindo para o usuario mandar como texto em vez de ignorar em silencio.
+      if (isAudioType && (!body || body.trim() === '')) {
         body = '[AUDIO]';
       }
 
@@ -433,13 +659,15 @@ class WhatsAppManager {
 
       const messageData = {
         zapId,
-        id: msg.id._serialized,
+        id: this._ensureMsgKey(msg),
         body: body,
-        from: msg.from,
+        from: msg.fromMe ? (msg.to || msg.from) : msg.from,
         to: msg.to,
         timestamp: msg.timestamp,
         fromMe: msg.fromMe,
+        selfChat: isSelfChat,
         audio: audioInfo,
+        audioFailed: audioFailed,
         contact: {
           id: `${contactNumber}@s.whatsapp.net`,
           name: contactName,
@@ -560,6 +788,340 @@ class WhatsAppManager {
     return num ? `${num}@c.us` : phoneOrId;
   }
 
+  // Extrai apenas os digitos de um JID/numero (ex: "5532999344496:12@c.us" -> "5532999344496")
+  _normNum(jidOrNum) {
+    if (!jidOrNum) return '';
+    return String(jidOrNum).split('@')[0].replace(/:/g, '').replace(/\D/g, '');
+  }
+
+  // JID que NAO e um contato normal (grupo, canal/newsletter, lista de
+  // transmissao). Nada disso pode chegar na IA - filtrado no evento, antes
+  // de getContact/getChat, antes de baixar midia e antes de ir pra UI.
+  // @lid e @c.us/@s.whatsapp.net sao contatos normais e NAO entram aqui.
+  _isGroupJid(jid) {
+    const s = String(jid || '');
+    return s.includes('@g.us') || s.includes('@newsletter') || s.includes('@broadcast');
+  }
+
+  // Remove a mensagem do cache interno quando ela e descartada por ser de
+  // grupo (o cache serve so para reply() de conversas 1:1)
+  _dropGroupMsg(zapId, msg) {
+    try {
+      const d = this.clients.get(zapId);
+      const k = this._ensureMsgKey(msg);
+      if (d && d.messages && k) d.messages.delete(k);
+    } catch (_) { /* ignore */ }
+  }
+
+  // Chave da mensagem no formato do WhatsApp (fromMe_remote_id).
+  // O MsgKey da pagina perde o getter `_serialized` no caminho pagina -> Node,
+  // entao msg.id._serialized chega undefined e quebrava: cache de mensagens,
+  // id salvo na conversa, anti-loop da IA e o Msg.get() do download de audio
+  // ("No key or key range specified"). Reconstruimos a partir das partes que
+  // sobrevivem (id, fromMe, remote - todas primitivas).
+  _ensureMsgKey(msg) {
+    try {
+      if (!msg || msg.id === undefined || msg.id === null) return '';
+      const id = msg.id;
+      if (typeof id === 'string') return id;
+      if (id._serialized) return id._serialized;
+      let remote = id.remote;
+      if (remote && typeof remote === 'object') remote = remote._serialized || String(remote);
+      if (id.id && remote && id.fromMe !== undefined && id.fromMe !== null) {
+        const built = `${id.fromMe}_${remote}_${id.id}`;
+        try { id._serialized = built; } catch (_) { /* id pode ser somente leitura */ }
+        return built;
+      }
+      return '';
+    } catch (_) { return ''; }
+  }
+
+  async _patchMediaMsgAttrs(client) {
+    const page = client && client.pupPage;
+    if (!page) return;
+    try {
+      await page.evaluate(() => {
+        const act = window.require('WAWebSendMsgChatAction');
+        if (act.__stripModelInternals) return;
+        const orig = act.addAndSendMsgToChat;
+        const skip = new Set([
+          'revisionNumber', '__fired', '__changes', '__initialized',
+          'parent', 'collection', '_uiObservers', 'mirror'
+        ]);
+        act.addAndSendMsgToChat = function (chat, message) {
+          if (message && typeof message === 'object') {
+            for (const k of Object.keys(message)) {
+              if (k.lastIndexOf('__x_', 0) === 0 || skip.has(k)) delete message[k];
+            }
+          }
+          return orig.call(this, chat, message);
+        };
+        act.__stripModelInternals = true;
+      });
+    } catch (e) {
+      console.error('[WHATSAPP] Falha ao aplicar patch de envio de midia:', e);
+    }
+  }
+
+  // Numeros considerados "o proprio numero" no autochat. O wid ja veio truncado
+  // em teste (553299344496) enquanto o pareado era 5532999344496 - guardamos os
+  // dois e aceitamos qualquer um.
+  _selfNums(clientData) {
+    if (!clientData) return [];
+    const out = [];
+    for (const n of [clientData.selfNumber, clientData.selfNumberAlt]) {
+      const v = this._normNum(n);
+      if (v && out.indexOf(v) === -1) out.push(v);
+    }
+    return out;
+  }
+
+  // Desliga os listeners que o wwebjs registra na pagina do puppeteer
+  // (framenavigated -> inject, request/response do webVersionCache). Se o
+  // browser for fechado com eles ativos, um evaluate na pagina morta vira
+  // "Attempted to use detached Frame" e derruba o processo inteiro.
+  _detachPageListeners(client) {
+    const page = client && client.pupPage;
+    if (!page || typeof page.removeAllListeners !== 'function') return;
+    for (const ev of ['framenavigated', 'request', 'response', 'load']) {
+      try { page.removeAllListeners(ev); } catch (_) { /* ignore */ }
+    }
+  }
+
+  // Desliga o window.codeInterval (renovador de codigo de pareamento da propria
+  // pagina). Depois de autenticado ele so reinicia o vinculo e causa LOGOUT.
+  _clearPagePairingInterval(client) {
+    try {
+      const page = client && client.pupPage;
+      if (!page) return;
+      page.evaluate(() => {
+        if (window.codeInterval) {
+          clearInterval(window.codeInterval);
+          window.codeInterval = undefined;
+        }
+      }).catch(() => { /* pagina ja fechada */ });
+    } catch (_) { /* ignore */ }
+  }
+
+  // Baixa a midia de um audio. O downloadMedia do wwebjs chama evaluate e o
+  // erro vindo de dentro da pagina chega aqui ja reduzido pelo puppeteer a uma
+  // string minificada (ex.: "r"), entao aqui fazemos o download com o proprio
+  // evaluate capturando DENTRO da pagina o passo exato + mensagem real.
+  // A busca da mensagem tenta varios caminhos (chave reconstruida, varredura
+  // do chat e getMessagesById) porque Msg.get(undefined) nao achava nada e
+  // derrubava o download inteiro.
+  async _downloadAudio(zapId, msg, rawMime) {
+    const clientData = this.clients.get(zapId);
+    const page = clientData && clientData.client ? clientData.client.pupPage : null;
+    if (!page) return null;
+
+    // Somente primitivos cruzam para a pagina (objeto cru perde getter).
+    const idObj = (msg.id && typeof msg.id === 'object') ? msg.id : {};
+    const chatIdFull = msg.fromMe ? (msg.to || msg.from || '') : (msg.from || '');
+    let remote = idObj.remote;
+    if (remote && typeof remote === 'object') remote = remote._serialized || String(remote);
+    const keyParts = {
+      serialized: this._ensureMsgKey(msg) || '',
+      idPart: typeof idObj.id === 'string' ? idObj.id : '',
+      fromMe: idObj.fromMe,
+      remote: remote,
+      chatId: String(chatIdFull || ''),
+    };
+
+    let diag = null;
+    try {
+      diag = await page.evaluate(async (p) => {
+        let realKey = '';
+        const fail = (step, e, stage) => ({
+          ok: false,
+          step,
+          error: String((e && (e.message || e.name)) || e || 'erro desconhecido'),
+          detail: String((e && e.stack) || '').split('\n').slice(0, 3).join(' | '),
+          stage: String(stage || ''),
+          key: realKey,
+        });
+        try {
+          const C = window.require('WAWebCollections');
+
+          // ---- BUSCA DA MENSAGEM (nunca chamar Msg.get sem chave valida) ----
+          const cands = [];
+          const push = (k) => { if (k && cands.indexOf(k) === -1) cands.push(k); };
+          push(p.serialized);
+          if (p.idPart && p.remote && p.fromMe !== undefined && p.fromMe !== null) {
+            push(`${p.fromMe}_${p.remote}_${p.idPart}`);
+          }
+          if (p.idPart && p.chatId && p.chatId !== p.remote && p.fromMe !== undefined && p.fromMe !== null) {
+            push(`${p.fromMe}_${p.chatId}_${p.idPart}`);
+          }
+
+          let m = null;
+          let via = '';
+          const matches = (x) => !!(x && (!p.idPart || !x.id || x.id.id === p.idPart));
+          for (let i = 0; i < cands.length && !m; i++) {
+            try {
+              const x = C.Msg.get(cands[i]);
+              if (matches(x)) { m = x; via = 'Msg.get'; }
+            } catch (e) { /* tenta a proxima chave */ }
+          }
+          if (!m) {
+            // Varre as mensagens ja carregadas do chat e casa pelo id curto.
+            // Dentro da pagina o getter do MsgKey funciona normalmente.
+            try {
+              const W = window.require('WAWebWidFactory');
+              const chat = p.chatId ? C.Chat.get(W.createWid(p.chatId)) : null;
+              let models = [];
+              if (chat && chat.msgs) {
+                if (typeof chat.msgs.getModels === 'function') models = chat.msgs.getModels() || [];
+                else if (Array.isArray(chat.msgs.models)) models = chat.msgs.models;
+                else if (Array.isArray(chat.msgs)) models = chat.msgs;
+              }
+              for (let i = 0; i < models.length && !m; i++) {
+                const x = models[i];
+                if (x && x.id && x.id.id && x.id.id === p.idPart) { m = x; via = 'chat-scan'; }
+              }
+            } catch (e) { /* ignora */ }
+          }
+          if (!m && cands.length) {
+            try {
+              const r = await C.Msg.getMessagesById(cands);
+              const arr = (r && r.messages) || [];
+              for (let i = 0; i < arr.length && !m; i++) {
+                if (matches(arr[i])) { m = arr[i]; via = 'getMessagesById'; }
+              }
+            } catch (e) { /* ignora */ }
+          }
+          if (!m) {
+            // Ultimo recurso: a chave real da ultima mensagem do chat (dentro
+            // da pagina o getter existe de verdade) - vale se o audio for o
+            // ultimo recebido, que e o caso normal.
+            try {
+              const W = window.require('WAWebWidFactory');
+              const chat = p.chatId ? C.Chat.get(W.createWid(p.chatId)) : null;
+              const lk = chat && chat.lastReceivedKey;
+              const k = lk ? (lk._serialized || (typeof lk === 'string' ? lk : '')) : '';
+              if (k) {
+                const x = C.Msg.get(k);
+                if (matches(x)) { m = x; via = 'lastReceivedKey'; }
+              }
+            } catch (e) { /* ignora */ }
+          }
+          if (!m) return fail('lookup', `mensagem nao encontrada (chaves: ${cands.join(' | ') || 'nenhuma'})`);
+          if (!m.mediaData) return fail('nomedia', 'mensagem sem mediaData');
+          // Chave exata revelada pela pagina (getter funciona la dentro)
+          try { realKey = (m.id && m.id._serialized) || ''; } catch (e) { realKey = ''; }
+
+          const st0 = m.mediaData.mediaStage;
+          if (st0 === 'REUPLOADING') return fail('reuploading', 'midia expirada, cliente pedindo reupload', st0);
+          if (m.mediaData.mediaStage !== 'RESOLVED') {
+            try {
+              await m.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+            } catch (e) {
+              const st = m.mediaData ? m.mediaData.mediaStage : '';
+              if (!st || String(st).indexOf('ERROR') >= 0 || st === 'FETCHING') {
+                return fail('resolve', e, st);
+              }
+              // senao segue: o download direto ainda pode funcionar
+            }
+          }
+          // se outro fluxo da pagina ja comecou o download, espera terminar
+          let st1 = m.mediaData ? m.mediaData.mediaStage : '';
+          for (let i = 0; i < 30 && st1 === 'FETCHING'; i++) {
+            await new Promise((r) => setTimeout(r, 200));
+            st1 = m.mediaData ? m.mediaData.mediaStage : '';
+          }
+          if (String(st1).indexOf('ERROR') >= 0 || st1 === 'FETCHING') {
+            return fail('stage', 'mediaStage = ' + st1, st1);
+          }
+
+          let buf;
+          try {
+            const D = window.require('WAWebDownloadManager');
+            if (!D || !D.downloadManager) return fail('module', 'WAWebDownloadManager indisponivel', st1);
+            buf = await D.downloadManager.downloadAndMaybeDecrypt({
+              directPath: m.directPath,
+              encFilehash: m.encFilehash,
+              filehash: m.filehash,
+              mediaKey: m.mediaKey,
+              mediaKeyTimestamp: m.mediaKeyTimestamp,
+              type: m.type,
+              signal: new AbortController().signal,
+              downloadQpl: { addAnnotations() { return this; }, addPoint() { return this; } },
+            });
+          } catch (e) {
+            return fail('decrypt', e, st1);
+          }
+
+          try {
+            const data = await window.WWebJS.arrayBufferToBase64Async(buf);
+            return { ok: true, data, mimetype: m.mimetype, size: m.size, via, key: realKey };
+          } catch (e) {
+            return fail('b64', e, st1);
+          }
+        } catch (e) {
+          return fail('outer', e, '');
+        }
+      }, keyParts);
+    } catch (e) {
+      diag = {
+        ok: false,
+        step: 'evaluate',
+        error: String(e && e.message ? e.message : e),
+        detail: String(e && e.stack ? e.stack : '').split('\n').slice(0, 3).join(' | '),
+        stage: '',
+      };
+    }
+
+    if (diag && diag.ok) {
+      // Se a pagina revelou a chave exata, guarda no objeto: o downloadMedia
+      // do wwebjs (fallback) usa msg.id._serialized por dentro.
+      const realKey = diag.key || '';
+      if (realKey && msg.id && typeof msg.id === 'object' && msg.id._serialized !== realKey) {
+        const oldKey = msg.id._serialized;
+        try { msg.id._serialized = realKey; } catch (_) { /* ignore */ }
+        const cd = this.clients.get(zapId);
+        if (cd && cd.messages) {
+          if (oldKey) cd.messages.delete(oldKey);
+          cd.messages.set(realKey, msg);
+        }
+      }
+      const viaTxt = diag.via ? ` via ${diag.via}` : '';
+      this.logToApp(zapId, 'success', `Audio baixado (${diag.size || 0} bytes${viaTxt}). Sera transcrito pela IA.`);
+      return { data: diag.data, mimetype: diag.mimetype || rawMime || 'audio/ogg', size: diag.size };
+    }
+
+    const dStep = diag ? diag.step : '?';
+    const dErr = diag ? diag.error : 'sem detalhe';
+    const dStage = diag && diag.stage ? ` stage=${diag.stage}` : '';
+    const dDet = diag && diag.detail ? ` | ${diag.detail}` : '';
+    console.error(`[AUDIO] Diagnostico: passo=${dStep} erro=${dErr}${dStage}`);
+    this.logToApp(zapId, 'warning', `Diagnostico download: passo=${dStep} erro=${dErr}${dStage}${dDet}`);
+
+    // Se a pagina ja achou a mensagem, adota a chave exata antes do fallback:
+    // o downloadMedia do wwebjs la dentro consulta Msg.get(this.id._serialized).
+    const learnedKey = (diag && diag.key) || '';
+    if (learnedKey && msg.id && typeof msg.id === 'object' && msg.id._serialized !== learnedKey) {
+      try { msg.id._serialized = learnedKey; } catch (_) { /* ignore */ }
+    }
+
+    // Fallback: downloadMedia do proprio wwebjs (retries)
+    const delays = [0, 1000, 2000, 3000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt]) await new Promise(r => setTimeout(r, delays[attempt]));
+      try {
+        const media = await msg.downloadMedia();
+        if (media && media.data) {
+          this.logToApp(zapId, 'success', `Audio baixado via wwebjs (${media.filesize} bytes, tentativa ${attempt + 1}). Sera transcrito pela IA.`);
+          return { data: media.data, mimetype: media.mimetype || rawMime || 'audio/ogg', size: media.filesize };
+        }
+        this.logToApp(zapId, 'warning', `downloadMedia do audio retornou vazio (tentativa ${attempt + 1}/${delays.length}).`);
+      } catch (e) {
+        const em = e && e.message ? e.message : String(e);
+        this.logToApp(zapId, 'error', `Fallback downloadMedia falhou (tentativa ${attempt + 1}/${delays.length}): ${em}`);
+      }
+    }
+    return null;
+  }
+
   async sendMessage(zapId, phone, text) {
     const clientData = this.clients.get(zapId);
     if (!clientData || clientData.status !== 'ready') {
@@ -570,21 +1132,50 @@ class WhatsAppManager {
     const targetId = this._normalizeChatId(phone);
     console.log(`[WHATSAPP] Enviando mensagem para ${targetId}: ${msgText.substring(0, 80)}`);
 
+    // Anti-loop: marca este envio como sendo da IA para que o message_create
+    // do autochat NAO volte a chamar a IA (a IA nao responde a si mesma)
+    const markAiSend = () => {
+      const d = this.clients.get(zapId);
+      if (d) {
+        if (!d.pendingAiSends) d.pendingAiSends = [];
+        d.pendingAiSends.push({ body: msgText, t: Date.now() });
+        if (d.pendingAiSends.length > 20) d.pendingAiSends.shift();
+      }
+    };
+    const markAiSentId = (sentMsg) => {
+      const d = this.clients.get(zapId);
+      const sid = this._ensureMsgKey(sentMsg);
+      if (d && sid) {
+        if (!d.aiSentIds) d.aiSentIds = new Set();
+        d.aiSentIds.add(sid);
+        if (d.aiSentIds.size > 500) {
+          const first = d.aiSentIds.values().next().value;
+          d.aiSentIds.delete(first);
+        }
+      }
+    };
+
+    markAiSend();
+    const setSending = (v) => { const d = this.clients.get(zapId); if (d) d.aiSending = v; };
+    setSending(true);
     try {
-      await clientData.client.sendMessage(targetId, msgText);
+      const sentMsg = await clientData.client.sendMessage(targetId, msgText);
+      markAiSentId(sentMsg);
       this.logToApp(zapId, 'success', `Mensagem enviada para ${targetId}`);
       return { success: true };
     } catch (e) {
       console.error(`[WHATSAPP] Erro ao enviar com client.sendMessage:`, e);
       this.logToApp(zapId, 'warning', `sendMessage direto falhou (${e.message}). Tentando reply...`);
       // Fallback: find most recent message from this chat (by timestamp)
+      // No autochat TODAS as mensagens sao fromMe - entao aceita fromMe tambem
+      const isSelfTarget = this._selfNums(clientData).includes(this._normNum(targetId));
       let lastMsg = null;
       let lastTs = 0;
       for (const [, msg] of clientData.messages) {
         // match by normalized number
-        const msgNum = (msg.from || '').split('@')[0];
-        const targetNum = targetId.split('@')[0];
-        if (msgNum === targetNum && !msg.fromMe && (msg.timestamp || 0) >= lastTs) {
+        const msgNum = this._normNum(msg.from || msg.to || '');
+        const targetNum = this._normNum(targetId);
+        if (msgNum === targetNum && (isSelfTarget || !msg.fromMe) && (msg.timestamp || 0) >= lastTs) {
           lastMsg = msg;
           lastTs = msg.timestamp || 0;
         }
@@ -592,7 +1183,8 @@ class WhatsAppManager {
 
       if (lastMsg) {
         try {
-          await lastMsg.reply(msgText);
+          const sentMsg = await lastMsg.reply(msgText);
+          markAiSentId(sentMsg);
           this.logToApp(zapId, 'success', `Mensagem enviada via reply para ${targetId}`);
           return { success: true };
         } catch (replyError) {
@@ -604,6 +1196,8 @@ class WhatsAppManager {
         this.logToApp(zapId, 'error', `Falha ao enviar mensagem e sem mensagem anterior para reply: ${e.message}`);
         throw e;
       }
+    } finally {
+      setSending(false);
     }
   }
 
@@ -626,18 +1220,47 @@ class WhatsAppManager {
     );
     console.log(`[WHATSAPP] Enviando midia para ${targetId}: ${mediaData.name}`);
 
+    // Anti-loop (autochat): marca envio de midia como sendo da IA
+    const dMark = this.clients.get(zapId);
+    if (dMark) {
+      if (!dMark.pendingAiSends) dMark.pendingAiSends = [];
+      dMark.pendingAiSends.push({ body: '', midia: true, t: Date.now() });
+      if (dMark.pendingAiSends.length > 20) dMark.pendingAiSends.shift();
+      dMark.aiSending = true;
+    }
     try {
-      await clientData.client.sendMessage(targetId, media);
+      let sentMsg = null;
+      let sendDone = false;
+      let lastSendErr = null;
+      for (let attempt = 1; attempt <= 3 && !sendDone; attempt++) {
+        try {
+          await this._patchMediaMsgAttrs(clientData.client);
+          sentMsg = await clientData.client.sendMessage(targetId, media);
+          sendDone = true;
+        } catch (err) {
+          lastSendErr = err;
+          this.logToApp(zapId, 'warning', `Falha ao enviar midia (tentativa ${attempt}/3): ${err.message}`);
+          if (attempt < 3) await new Promise(r => setTimeout(r, attempt === 1 ? 2000 : 5000));
+        }
+      }
+      if (!sendDone) throw lastSendErr || new Error('Falha ao enviar midia');
+      const sid = this._ensureMsgKey(sentMsg);
+      const d2 = this.clients.get(zapId);
+      if (d2 && sid) {
+        if (!d2.aiSentIds) d2.aiSentIds = new Set();
+        d2.aiSentIds.add(sid);
+      }
       this.logToApp(zapId, 'success', `Midia enviada para ${targetId}: ${mediaData.name}`);
       return { success: true };
     } catch (e) {
       console.error(`[WHATSAPP] Erro ao enviar midia:`, e);
+      const isSelfTarget = this._selfNums(clientData).includes(this._normNum(targetId));
       let lastMsg = null;
       let lastTs = 0;
       for (const [, msg] of clientData.messages) {
-        const msgNum = (msg.from || '').split('@')[0];
-        const targetNum = targetId.split('@')[0];
-        if (msgNum === targetNum && !msg.fromMe && (msg.timestamp || 0) >= lastTs) {
+        const msgNum = this._normNum(msg.from || msg.to || '');
+        const targetNum = this._normNum(targetId);
+        if (msgNum === targetNum && (isSelfTarget || !msg.fromMe) && (msg.timestamp || 0) >= lastTs) {
           lastMsg = msg; lastTs = msg.timestamp || 0;
         }
       }
@@ -648,6 +1271,9 @@ class WhatsAppManager {
       }
       this.logToApp(zapId, 'error', `Falha ao enviar midia: ${e.message}`);
       throw e;
+    } finally {
+      const dEnd = this.clients.get(zapId);
+      if (dEnd) dEnd.aiSending = false;
     }
   }
 
@@ -669,21 +1295,110 @@ class WhatsAppManager {
     return clientData.chats.get(chatId) || null;
   }
 
-  async fetchAllContacts(zapId) {
+  async fetchAllContacts(zapId, attempt = 0) {
     const clientData = this.clients.get(zapId);
     if (!clientData || clientData.status !== 'ready') return;
 
+    // 'ready' chega duplicado e disparava N buscas simultaneas, que derrubavam
+    // o execution context da pagina ("Execution context was destroyed")
+    if (attempt === 0) {
+      if (clientData.contactsFetching) return;
+      clientData.contactsFetching = true;
+    }
+
     console.log(`[CONTACTS] Buscando todos os contatos do Zap ${zapId}...`);
     try {
-      let chats;
-      try {
-        chats = await clientData.client.getChats();
-      } catch (getChatsErr) {
-        const m = getChatsErr && getChatsErr.message ? getChatsErr.message : String(getChatsErr);
-        const s = getChatsErr && getChatsErr.stack ? getChatsErr.stack.split('\n').slice(0,3).join(' | ') : '';
-        console.error('[CONTACTS] getChats falhou:', m, s);
-        throw new Error(`getChats: ${m} ${s}`.trim());
+      const page = clientData.client && clientData.client.pupPage;
+      if (!page) throw new Error('pagina do WhatsApp indisponivel');
+
+      // Busca feita NA PAGINA, chat a chat. O getChats do wwebjs usa
+      // Promise.all: UM chat quebrado derrubava tudo (erro "r" no log) e o
+      // fallback de antes ainda descartava @lid, escondendo quase todos os
+      // contatos. Aqui cada chat e isolado, os grupos/canais sao pulados e os
+      // contatos @lid (padrao atual do WhatsApp) entram normalmente, com o
+      // numero real resolvido pelo proprio cache do WhatsApp quando existe.
+      const res = await page.evaluate(async () => {
+        const out = { chats: [], errors: [], skip: { grupo: 0, canal: 0, transmissao: 0, semId: 0 } };
+        let list = [];
+        try {
+          list = window.require('WAWebCollections').Chat.getModelsArray() || [];
+        } catch (e) {
+          out.errors.push('getModelsArray: ' + (e && e.message ? e.message : String(e)));
+          return out;
+        }
+
+        const numFromWid = (v) => {
+          const s = (v && typeof v === 'object') ? (v._serialized || String(v)) : String(v || '');
+          return String(s).split('@')[0].replace(/:\d+$/, '');
+        };
+
+        for (const chat of list) {
+          try {
+            let chatId = '';
+            try { chatId = (chat.id && chat.id._serialized) || String(chat.id || ''); } catch (_) {}
+            if (!chatId) { out.skip.semId++; continue; }
+            if (chatId.includes('@g.us')) { out.skip.grupo++; continue; }
+            if (chatId.includes('@newsletter')) { out.skip.canal++; continue; }
+            if (chatId.includes('@broadcast')) { out.skip.transmissao++; continue; }
+            let isGrp = false;
+            try { isGrp = chat.isGroup === true || !!chat.groupMetadata; } catch (_) {}
+            if (isGrp) { out.skip.grupo++; continue; }
+
+            let name = '';
+            try { name = chat.formattedTitle || chat.name || ''; } catch (_) {}
+
+            const lidNum = chatId.split('@')[0].replace(/:\d+$/, '');
+            let number = lidNum;
+            const isLid = chatId.endsWith('@lid');
+
+            // Contato ja conhecido pelo WhatsApp: nome extra + numero real
+            try {
+              const WFB = window.require('WAWebWidFactory');
+              const c = window.require('WAWebCollections').Contact.get(WFB.createWid(chatId));
+              if (c) {
+                if (!name) name = c.name || c.pushname || c.shortName || '';
+                const pn = c.phoneNumber;
+                const pnSer = pn && typeof pn === 'object' ? pn._serialized : pn;
+                if (pnSer && !String(pnSer).endsWith('@lid')) number = numFromWid(pnSer);
+                else {
+                  const cid = c.id && typeof c.id === 'object' ? c.id._serialized : c.id;
+                  if (cid && !String(cid).endsWith('@lid')) number = numFromWid(cid);
+                }
+              }
+            } catch (_) { /* contato fora da agenda */ }
+
+            // Mapa LID -> PN do proprio WhatsApp (cache local, sem rede)
+            if (isLid && number === lidNum) {
+              try {
+                const pn = window.require('WAWebApiContact').getPhoneNumber(window.require('WAWebWidFactory').createWid(chatId));
+                const s = pn && typeof pn === 'object' ? pn._serialized : pn;
+                if (s && !String(s).endsWith('@lid')) number = numFromWid(s);
+              } catch (_) { /* sem mapeamento disponivel */ }
+            }
+
+            if (!name) name = number;
+            out.chats.push({ id: chatId, name: String(name), number: String(number) });
+          } catch (e) {
+            out.errors.push('chat: ' + (e && e.message ? e.message : String(e)));
+          }
+        }
+        return out;
+      });
+
+      if (res.errors && res.errors.length) {
+        console.warn('[CONTACTS] chats com erro no carregamento:', res.errors.slice(0, 10).join(' | '));
+        if (res.errors.length > 10) console.warn(`[CONTACTS] ...e mais ${res.errors.length - 10} erros.`);
       }
+      if (!res.chats || !res.chats.length) {
+        if (res.errors && res.errors.length) throw new Error(`busca de contatos vazia: ${res.errors[0]}`);
+      }
+
+      const chatList = res.chats || [];
+      const skipInfo = res.skip || {};
+      if (chatList.length) {
+        console.log(`[CONTACTS] ${chatList.length} chats 1:1 na memoria (pulados: ${skipInfo.grupo || 0} grupos, ${skipInfo.canal || 0} canais, ${skipInfo.transmissao || 0} transmissoes, ${skipInfo.semId || 0} sem id)`);
+      }
+
       if (!this.conversations.has(zapId)) {
         this.conversations.set(zapId, new Map());
       }
@@ -691,41 +1406,35 @@ class WhatsAppManager {
       let added = 0;
       let skipped = 0;
 
-      for (const chat of chats) {
+      for (const chat of chatList) {
         try {
           if (!chat || !chat.id) { skipped++; continue; }
-          const chatId = chat.id._serialized || '';
-          // Filtra grupos, newsletters, broadcasts e @lid (lid é hash, não número real - pular por enquanto)
-          if (chatId.includes('@g.us') || chatId.includes('@newsletter') || chatId.includes('@broadcast') || chatId.includes('@lid')) {
+          // A pagina ja deixou de fora grupos/canais/transmissoes; aqui fica
+          // so a defesa contra @g.us que porventura entre. @lid ENTRA (decisao:
+          // lid e contato normal, so @g.us/@newsletter/@broadcast sao bloqueados).
+          const chatId = String(chat.id);
+          if (!chatId || chatId.includes('@g.us') || chatId.includes('@newsletter') || chatId.includes('@broadcast')) {
             skipped++; continue;
           }
-          // also skip if isGroup flag true
-          if (chat.isGroup) { skipped++; continue; }
 
-        if (!zapConvs.has(chatId)) {
-          let contactName = chat.name || '';
-          let contactNumber = chat.id.user;
-          try {
-            if (!contactName && chat.getContact) {
-              const c = await chat.getContact();
-              contactName = c.name || c.pushname || c.id.user;
-              contactNumber = c.id.user || contactNumber;
-            }
-          } catch (e) { /* ignore */ }
-
-          zapConvs.set(chatId, {
-            contact: {
-              id: `${contactNumber}@s.whatsapp.net`,
-              name: contactName || contactNumber,
-              number: contactNumber
-            },
-            messages: [],
-            lastMessage: null
-          });
-          added++;
-        }
+          if (!zapConvs.has(chatId)) {
+            const contactNumber = String(chat.number || chatId.split('@')[0].replace(/:\d+$/, ''));
+            // Chat de servico do WhatsApp chega como "0" - nao e contato valido
+            if (!/^\d{6,}$/.test(contactNumber)) { skipped++; continue; }
+            const contactName = String(chat.name || '');
+            zapConvs.set(chatId, {
+              contact: {
+                id: `${contactNumber}@s.whatsapp.net`,
+                name: contactName || contactNumber,
+                number: contactNumber
+              },
+              messages: [],
+              lastMessage: null
+            });
+            added++;
+          }
         } catch (chatErr) {
-          console.warn(`[CONTACTS] skip chat ${chat?.id?._serialized || 'unknown'}:`, chatErr.message);
+          console.warn(`[CONTACTS] skip chat ${chat && chat.id ? chat.id : 'unknown'}:`, chatErr.message);
           skipped++;
           continue;
         }
@@ -736,10 +1445,21 @@ class WhatsAppManager {
       this.persistContacts();
       this.sendToRenderer('whatsapp-contacts-updated', { zapId });
     } catch (e) {
+      if (attempt === 0) {
+        // Contexto pode ter sido destruido por navegacao - tenta de novo
+        this.logToApp(zapId, 'info', 'Falha ao buscar contatos; nova tentativa em 1,5s...');
+        await new Promise(r => setTimeout(r, 1500));
+        return await this.fetchAllContacts(zapId, 1);
+      }
       const em = e && e.message ? e.message : String(e);
       const es = e && e.stack ? e.stack.split('\n').slice(0,4).join(' | ') : '';
       console.error(`[CONTACTS] Erro ao buscar contatos do Zap ${zapId}:`, em, es);
       this.logToApp(zapId, 'warning', `Erro ao buscar contatos: ${em} ${es}`);
+    } finally {
+      if (attempt === 0) {
+        const d = this.clients.get(zapId);
+        if (d) d.contactsFetching = false;
+      }
     }
   }
 
@@ -776,7 +1496,12 @@ class WhatsAppManager {
   async disconnectZap(zapId) {
     const clientData = this.clients.get(zapId);
     if (clientData) {
-      if (clientData.pairingInterval) { try { clearInterval(clientData.pairingInterval); } catch (_) {} clientData.pairingInterval = null; }
+      try {
+        // Remove os listeners ANTES do destroy: um evento tardio do cliente
+        // antigo (disconnected/ready) nao pode sobrescrever o status do novo
+        clientData.client.removeAllListeners();
+      } catch (_) { /* ignore */ }
+      this._detachPageListeners(clientData.client);
       try {
         await clientData.client.destroy();
       } catch (e) {
@@ -801,8 +1526,21 @@ class WhatsAppManager {
   }
 
   logToApp(zapId, type, msg) {
-    console.log(`[LOG][${type}] Zap ${zapId}: ${msg}`);
+    // Horario no arquivo de log (a UI ja exibe o hora do renderer) - essencial
+    // para diagnosticar sequencia de eventos/conexao no electron-run.log
+    const ts = new Date().toTimeString().slice(0, 8);
+    console.log(`[${ts}][LOG][${type}] Zap ${zapId}: ${msg}`);
     this.sendToRenderer('whatsapp-log', { zapId, type, msg });
+  }
+
+  // Aguarda uma promise com limite de tempo (evita evaluate travado por 180s
+  // no protocolTimeout do puppeteer, que segurava requestPairingCode pendurado)
+  _withTimeout(promise, ms, label) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} nao respondeu em ${ms / 1000}s`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
   }
 }
 
