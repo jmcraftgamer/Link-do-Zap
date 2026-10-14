@@ -5,6 +5,7 @@ const path = require('path');
 const root = path.join(__dirname, '..');
 const resolver = require(path.join(root, 'src', 'js', 'media-resolver'));
 const AIResponder = require(path.join(root, 'src', 'js', 'ai-responder'));
+const ConversationStore = require(path.join(root, 'src', 'js', 'conversation-store'));
 const WhatsAppManager = require(path.join(root, 'src', 'js', 'whatsapp-manager'));
 
 let passed = 0;
@@ -227,9 +228,10 @@ test('prompt final: excecao dos marcadores existe e vem depois da proibicao', ()
 
 test('fonte: sendMedia so da retry em excecao (bug das 4 imagens)', () => {
   const src = fs.readFileSync(path.join(root, 'src', 'js', 'whatsapp-manager.js'), 'utf8');
-  assert.ok(src.includes('let sendDone = false;'));
-  assert.ok(src.includes('attempt <= 3 && !sendDone'));
-  assert.ok(src.includes('sendDone = true;'));
+  // Envio robusto: sucesso RETORNA na hora (sem retry); so repete em excecao
+  assert.ok(src.includes('async _sendRobust('), '_sendRobust ausente');
+  assert.ok(src.includes('return await doSend(cd.client, id);'), 'sucesso deve retornar sem dar retry');
+  assert.ok(src.includes('const attempts = 3;'), 'limite de 3 tentativas ausente');
   assert.ok(!/for \(let attempt = 1; attempt <= 3 && !sentMsg;/.test(src));
 });
 
@@ -344,6 +346,302 @@ testAsync('sendMedia: falha total para em 3 tentativas (sem loop infinito)', asy
 testAsync('sendMedia: zap desconectado lanca erro sem chamar a pagina', async () => {
   const mgr = new WhatsAppManager(null);
   await assert.rejects(() => mgr.sendMedia('naoexiste', '5511999999999', MEDIA), /nao esta conectado/);
+});
+
+// ================= MEMORIA / HISTORICO DE CONVERSAS =================
+const os = require('os');
+const TMP_CONV_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'conv-store-'));
+
+function at(y, mo, d, h, mi) {
+  return new Date(y, mo - 1, d, h, mi, 0, 0).getTime();
+}
+
+function newStore(options) {
+  return new ConversationStore(null, options);
+}
+
+function convMsg(body) {
+  return {
+    zapId: 'z1',
+    body,
+    from: '551199999@c.us',
+    chat: { id: 'c1' },
+    contact: { name: 'Joao' }
+  };
+}
+
+function convConfig(conversationInfo) {
+  return {
+    aiName: '',
+    personality: 'padrao',
+    area: '',
+    customPrompt: '',
+    provider: { name: 'Teste' },
+    model: { id: 'm1' },
+    trainings: [],
+    conversationInfo: conversationInfo || null
+  };
+}
+
+test('MEMORIA: primeira mensagem abre uma conversa nova', () => {
+  const s = newStore();
+  const r = s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  assert.strictEqual(r.created, true);
+  assert.strictEqual(r.conversation.day, '2026-09-27');
+  assert.strictEqual(r.conversation.endedAt, null);
+  assert.strictEqual(r.conversation.messages.length, 0);
+});
+
+test('MEMORIA: mensagem seguinte no mesmo dia continua na MESMA conversa', () => {
+  const s = newStore();
+  const a = s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0)).conversation;
+  s.append('z1', 'c1', 'user', 'oi');
+  const b = s.ensure('z1', 'c1', at(2026, 9, 27, 23, 50)).conversation;
+  assert.strictEqual(b.id, a.id);
+  assert.strictEqual(b.messages.length, 1);
+  assert.strictEqual(s.history('z1', 'c1').length, 1);
+});
+
+test('MEMORIA: apos 00:00 a conversa anterior fecha e abre outra vazia', () => {
+  const s = newStore();
+  const a = s.ensure('z1', 'c1', at(2026, 9, 27, 23, 0)).conversation;
+  s.append('z1', 'c1', 'user', 'boa noite');
+  const r = s.ensure('z1', 'c1', at(2026, 9, 28, 0, 5));
+  assert.strictEqual(r.created, true);
+  assert.notStrictEqual(r.conversation.id, a.id);
+  assert.strictEqual(a.endedAt, at(2026, 9, 28, 0, 0), 'finalizada exatamente as 00:00');
+  assert.strictEqual(s.history('z1', 'c1').length, 0, 'conversa nova comeca sem historico');
+});
+
+test('MEMORIA: rollOver das 00:00 fecha conversa mesmo com o app desligado', () => {
+  const s = newStore();
+  const a = s.ensure('z1', 'c1', at(2026, 9, 27, 23, 30)).conversation;
+  assert.strictEqual(s.rollOver(at(2026, 9, 28, 0, 2)), true);
+  assert.strictEqual(a.endedAt, at(2026, 9, 28, 0, 0));
+  assert.strictEqual(s.rollOver(at(2026, 9, 28, 0, 3)), false, 'segunda chamada nao muda nada');
+  const b = s.ensure('z1', 'c1', at(2026, 9, 28, 8, 0));
+  assert.strictEqual(b.created, true);
+});
+
+test('MEMORIA: cada contato tem a sua propria conversa', () => {
+  const s = newStore();
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  s.ensure('z1', 'c2', at(2026, 9, 27, 10, 0));
+  s.append('z1', 'c1', 'user', 'fala do c1');
+  assert.strictEqual(s.history('z1', 'c1').length, 1);
+  assert.strictEqual(s.history('z1', 'c2').length, 0);
+  assert.strictEqual(s.countFor('z1', 'c1'), 1);
+  assert.strictEqual(s.countFor('z1', 'c2'), 1);
+});
+
+test('MEMORIA: historico persiste em disco e volta ao reiniciar o app', () => {
+  const file = path.join(TMP_CONV_DIR, `conv-${Date.now()}.json`);
+  const s1 = new ConversationStore(file);
+  s1.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  s1.append('z1', 'c1', 'user', 'quanto custa?');
+  s1.append('z1', 'c1', 'assistant', 'R$ 50');
+  s1.flush();
+  assert.ok(fs.existsSync(file));
+
+  const s2 = new ConversationStore(file);
+  assert.strictEqual(s2.history('z1', 'c1').length, 2);
+  assert.deepStrictEqual(s2.history('z1', 'c1')[1], { role: 'assistant', content: 'R$ 50' });
+  const r = s2.ensure('z1', 'c1', at(2026, 9, 27, 18, 0));
+  assert.strictEqual(r.created, false, 'no mesmo dia reaproveita a conversa');
+  const r2 = s2.ensure('z1', 'c1', at(2026, 9, 28, 18, 0));
+  assert.strictEqual(r2.created, true, 'no dia seguinte abre conversa nova');
+  fs.rmSync(file, { force: true });
+});
+
+test('MEMORIA: arquivo corrompido nao derruba o app', () => {
+  const file = path.join(TMP_CONV_DIR, `broken-${Date.now()}.json`);
+  fs.writeFileSync(file, 'nao e json {');
+  const s = new ConversationStore(file);
+  assert.strictEqual(s.conversations.length, 0);
+  assert.strictEqual(s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0)).created, true);
+  fs.rmSync(file, { force: true });
+});
+
+test('MEMORIA: historico do contato e cortado no limite configurado', () => {
+  const s = newStore({ maxMessagesPerConversation: 4 });
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  for (let i = 1; i <= 10; i++) s.append('z1', 'c1', i % 2 ? 'user' : 'assistant', `msg ${i}`);
+  const h = s.history('z1', 'c1');
+  assert.strictEqual(h.length, 4);
+  assert.strictEqual(h[3].content, 'msg 10');
+  assert.strictEqual(h[0].content, 'msg 7');
+});
+
+test('MEMORIA: limpar historico por contato e por zap', () => {
+  const s = newStore();
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  s.append('z1', 'c1', 'user', 'a');
+  s.ensure('z2', 'c1', at(2026, 9, 27, 10, 0));
+  s.append('z2', 'c1', 'user', 'b');
+  assert.strictEqual(s.clearForChat('z1', 'c1'), 1);
+  assert.strictEqual(s.history('z1', 'c1').length, 0);
+  assert.strictEqual(s.history('z2', 'c1').length, 1);
+  assert.strictEqual(s.clearForZap('z2'), 1);
+  assert.strictEqual(s.history('z2', 'c1').length, 0);
+});
+
+test('MEMORIA: conversas em excesso sao removidas (guarda so as mais novas)', () => {
+  const s = newStore({ maxConversationsPerChat: 2, maxAgeDays: 3650 });
+  const createdIds = [];
+  for (let d = 1; d <= 5; d++) {
+    const r = s.ensure('z1', 'c1', at(2026, 9, d, 10, 0));
+    createdIds.push(r.conversation.id);
+    s.append('z1', 'c1', 'user', `dia ${d}`);
+    r.conversation.endedAt = at(2026, 9, d + 1, 0, 0);
+  }
+  assert.strictEqual(s.countFor('z1', 'c1'), 2, 'so as 2 conversas mais novas ficam');
+  const kept = s.conversations.filter(c => c.key === 'z1|c1').map(c => c.id);
+  assert.ok(kept.includes(createdIds[4]));
+  assert.ok(kept.includes(createdIds[3]));
+  assert.ok(!kept.includes(createdIds[0]));
+});
+
+test('MEMORIA: endOfDay marca exatamente as 00:00 do dia seguinte', () => {
+  assert.strictEqual(ConversationStore.endOfDay('2026-09-27'), at(2026, 9, 28, 0, 0));
+  assert.strictEqual(ConversationStore.dayKey(at(2026, 9, 27, 23, 59)), '2026-09-27');
+  assert.strictEqual(ConversationStore.dayKey(at(2026, 9, 28, 0, 1)), '2026-09-28');
+});
+
+function makeStoreAiFixed(store, reply) {
+  const ai = new AIResponder();
+  ai.setHistoryStore(store);
+  const calls = [];
+  ai.callAI = async (provider, model, messages) => {
+    calls.push(messages.map(m => ({ role: m.role, content: m.content })));
+    return typeof reply === 'function' ? reply(calls.length) : (reply || 'Certo, ja anotei.');
+  };
+  return { ai, calls };
+}
+
+testAsync('MEMORIA IA: 1a resposta registra user + assistant no historico', async () => {
+  const s = newStore();
+  const { ai, calls } = makeStoreAiFixed(s);
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  const r = await ai.generateResponse(convMsg('oi'), convConfig(null), undefined);
+  assert.strictEqual(r, 'Certo, ja anotei.');
+  assert.deepStrictEqual(s.history('z1', 'c1'), [
+    { role: 'user', content: 'oi' },
+    { role: 'assistant', content: 'Certo, ja anotei.' }
+  ]);
+  assert.strictEqual(calls[0].length, 2, 'system + a mensagem atual');
+  assert.strictEqual(calls[0][0].role, 'system');
+  assert.strictEqual(calls[0][1].content, 'oi');
+});
+
+testAsync('MEMORIA IA: 2a mensagem leva o historico da 1a para o modelo', async () => {
+  const s = newStore();
+  const { ai, calls } = makeStoreAiFixed(s);
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  await ai.generateResponse(convMsg('oi'), convConfig(null), undefined);
+  await ai.generateResponse(convMsg('quanto custa?'), convConfig({ label: '10:00', count: 2 }), undefined);
+
+  assert.strictEqual(calls.length, 2);
+  const msgs = calls[1];
+  assert.strictEqual(msgs[msgs.length - 1].content, 'quanto custa?');
+  assert.deepStrictEqual(msgs.slice(1).map(m => m.content),
+    ['oi', 'Certo, ja anotei.', 'quanto custa?']);
+  assert.ok(msgs[0].content.includes('MEMORIA DA CONVERSA ATUAL'), 'prompt explica a memoria');
+  assert.strictEqual(s.history('z1', 'c1').length, 4);
+});
+
+testAsync('MEMORIA IA: falha total nao deixa mensagem pendurada no historico', async () => {
+  const s = newStore();
+  const { ai } = makeStoreAiFixed(s, () => { throw new Error('API fora do ar'); });
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  const r = await ai.generateResponse(convMsg('oi'), convConfig(null), undefined);
+  assert.strictEqual(r, null);
+  assert.strictEqual(s.history('z1', 'c1').length, 0, 'nada e memorizado sem resposta');
+});
+
+testAsync('MEMORIA IA: marcadores nao ficam gravados no historico', async () => {
+  const s = newStore();
+  const { ai } = makeStoreAiFixed(s, 'Aqui esta:[QUEBRA]Bom apetite! [SEND_IMAGE:img_1]');
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  await ai.generateResponse(convMsg('me mande o cardapio'), convConfig(null), undefined);
+  ai.updateLastAssistant('z1', 'c1', 'Aqui esta: Bom apetite!');
+  const h = s.history('z1', 'c1');
+  assert.strictEqual(h.length, 2);
+  assert.strictEqual(h[1].content, 'Aqui esta: Bom apetite!');
+  assert.strictEqual(h[1].content.includes('[SEND_IMAGE'), false);
+  assert.strictEqual(h[1].content.includes('[QUEBRA]'), false);
+});
+
+testAsync('MEMORIA IA: midia enviada vira registro legivel no historico', async () => {
+  const s = newStore();
+  const { ai } = makeStoreAiFixed(s, 'Aqui esta');
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  await ai.generateResponse(convMsg('me mande o cardapio'), convConfig(null), undefined);
+  ai.updateLastAssistant('z1', 'c1', 'Aqui esta');
+  s.append('z1', 'c1', 'assistant', '[enviou imagem: Cardapio salgados]');
+  const h = s.history('z1', 'c1');
+  assert.strictEqual(h.length, 3);
+  assert.ok(h[2].content.includes('Cardapio salgados'));
+  assert.strictEqual(s.info('z1', 'c1').count, 3);
+});
+
+test('MEMORIA IA: turnos cortados por quantidade mantem user/assistant', () => {
+  const ai = new AIResponder();
+  const hist = [];
+  for (let i = 1; i <= 60; i++) {
+    hist.push({ role: 'user', content: `u${i}` });
+    hist.push({ role: 'assistant', content: `a${i}` });
+  }
+  const turns = ai.buildHistoryTurns(hist);
+  assert.strictEqual(turns.length, ai.HISTORY_MAX_MESSAGES);
+  assert.strictEqual(turns[0].role, 'user');
+  assert.strictEqual(turns[turns.length - 1].content, 'a60');
+  assert.ok(turns[0].content.startsWith('u'));
+});
+
+test('MEMORIA IA: turnos tambem cortados por quantidade de caracteres', () => {
+  const ai = new AIResponder();
+  ai.HISTORY_MAX_CHARS = 50;
+  const turns = ai.buildHistoryTurns([
+    { role: 'user', content: 'x'.repeat(30) },
+    { role: 'assistant', content: 'y'.repeat(30) },
+    { role: 'user', content: 'z'.repeat(30) }
+  ]);
+  assert.strictEqual(turns.length, 1);
+  assert.strictEqual(turns[0].content, 'z'.repeat(30));
+});
+
+test('MEMORIA IA: historico nunca comeca com uma fala da IA', () => {
+  const ai = new AIResponder();
+  const turns = ai.buildHistoryTurns([
+    { role: 'assistant', content: 'perdida' },
+    { role: 'user', content: 'ola' },
+    { role: 'assistant', content: 'oi!' }
+  ]);
+  assert.strictEqual(turns.length, 2);
+  assert.strictEqual(turns[0].role, 'user');
+});
+
+test('MEMORIA IA: bloco de memoria so entra no prompt quando ja ha historico', () => {
+  const ai = new AIResponder();
+  const sem = ai.getSystemPrompt({ personality: 'padrao', trainings: [], conversationInfo: { label: '10:00', count: 0 } });
+  const com = ai.getSystemPrompt({ personality: 'padrao', trainings: [], conversationInfo: { label: '10:00', count: 4 } });
+  assert.strictEqual(sem.includes('MEMORIA DA CONVERSA ATUAL'), false);
+  assert.ok(com.includes('MEMORIA DA CONVERSA ATUAL'));
+  assert.ok(com.includes('4 mensagens'));
+  assert.ok(com.indexOf('MEMORIA DA CONVERSA ATUAL') < com.indexOf('FORMATO DA RESPOSTA'),
+    'memoria vem antes do formato, que continua por ultimo');
+});
+
+test('MEMORIA: main.js agenda a virada 00:00 e injeta a memoria no fluxo', () => {
+  const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  assert.ok(src.includes('function scheduleMidnightRollover()'), 'agenda a virada de dia');
+  assert.ok(src.includes('conversationStore.rollOver'), 'fecha conversas as 00:00');
+  assert.ok(src.includes('initConversationStore()'), 'inicializa o store');
+  assert.ok(/new AIResponder\(\);\s*\r?\n\s*initConversationStore\(\)/.test(src), 'inicializa depois de criar o AIResponder');
+  assert.ok(src.includes('conversationInfo'), 'passa o contexto de memoria para o prompt');
+  assert.ok(src.includes('setHistoryStore'), 'conecta o store ao AIResponder');
+  assert.ok(src.includes('conversations.json'), 'grava o historico em disco');
+  assert.ok(src.includes('conversationStore.flush()'), 'salva ao fechar o app');
 });
 
 async function runPending() {

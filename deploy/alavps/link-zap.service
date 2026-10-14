@@ -1,0 +1,21 @@
+[Unit]
+Description=Assistente do Zap - WhatsApp com IA (24h)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/link-zap
+Environment=HEADLESS=1
+Environment=LINK_HTTP_PORT=8123
+Environment=LINK_HTTP_HOST=127.0.0.1
+Environment=LINK_DATA_DIR=/opt/link-zap/data
+ExecStart=/opt/link-zap/deploy/alavps/start.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

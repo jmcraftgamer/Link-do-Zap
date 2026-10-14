@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    paths-ignore:
+      - "heartbeat.txt"
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "heartbeat.txt"
+      - "**.md"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+      - name: Testes
+        run: npm test

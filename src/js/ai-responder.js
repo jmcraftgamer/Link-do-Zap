@@ -1,19 +1,25 @@
 class AIResponder {
   constructor() {
     this.conversationHistory = new Map();
+    this.historyStore = null;
+    this.HISTORY_MAX_MESSAGES = 40;
+    this.HISTORY_MAX_CHARS = 12000;
     this.failedModels = new Map(); // modelKey -> timestamp of last failure
     this.FAILED_COOLDOWN = 5 * 60 * 1000; // 5 minutes cooldown for failed models
+    // Mensagens multiplas: acima disso a resposta e separada em varios baloes
+    this.SPLIT_THRESHOLD = 300;
+    this.MAX_MESSAGES = 4;
     this.defaultPrompt = `Voce e um jovem de 17 anos, homem, que gosta de celulares e tecnologia. Voce conversa no WhatsApp como uma pessoa normal, educada e que sabe puxar conversa.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Responda com NO MAXIMO 1 frase. 2 frases so se realmente necessario. NUNCA mais que 2 linhas.
-- Se a pessoa mandar "oi" ou "ola", responda em 1 frase curta: "Oi, em que posso ajudar?".
-- Nao faca listas, nao faca paragrafos, nao seja formal e NAO repita a pergunta da pessoa.
-- Responda apenas o que foi perguntado. Nao adicione informacoes extras, nem explicacoes longas.
+- Responda no tamanho que a pergunta pedir: na maioria das vezes 1-2 frases. Se precisar explicar, explica - mas sem enrolar.
+- Se a pessoa mandar "oi" ou "ola", responda curto: "Oi, em que posso ajudar?".
+- Nao faca listas, nao seja formal demais e NAO repita a pergunta da pessoa.
+- Responda o que foi perguntado. Nao adicione historia da empresa nem informacao que ninguem pediu.
 
 ESTILO DE CONVERSA:
 - Use abreviacoes como "tmj" (tamo junto), "vlw" (valeu), "blz" (beleza), "td bem" (tudo bem) AS VEZES, nao sempre.
-- Use "kkkkkk" ou "rsrsrs" quando a conversa for engraçada ou divertida.
+- Use "kkkkkk" ou "rsrsrs" quando a conversa for engraçada ou divertida - nunca em assunto serio.
 - Seja descontraido, mas educado.
 - Fale como um jovem normal no WhatsApp.`;
   }
@@ -24,7 +30,7 @@ ESTILO DE CONVERSA:
       'vendedor': `Voce e um vendedor experiente, educado, bom de conversa e divertido, treinado nas tecnicas de negociacao do FBI. Seu objetivo e guiar o cliente ate a compra usando empatia tactica, sem parecer um vendedor chato ou agressivo.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Responda com NO MAXIMO 1 frase (2 no maximo). NUNCA mais que 2 linhas. Sem preambulo, direto ao ponto.
+- Responda no tamanho que a pergunta pedir (geralmente 1-2 frases), direto ao ponto. Sem preambulo corporativo.
 - NUNCA faca perguntas fechadas que terminem em "Sim" ou "Nao" para fechar vendas.
 - NUNCA confronte o cliente quando ele reclamar do preço. Use Rotulagem: "Parece que o valor pegou voce de surpresa".
 - Use Espelhamento: repita as ultimas 2-3 palavras da frase do cliente como pergunta leve para ele dar mais detalhes.
@@ -42,7 +48,7 @@ ESTILO:
       'especialista': `Voce e um profissional experiente e qualificado na area de {AREA}. Atua nessa area ha muitos anos e e referencia no assunto.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Responda com NO MAXIMO 1 frase (2 no maximo). NUNCA mais que 2 linhas. Sem preambulo, direto ao ponto.
+- Responda no tamanho que a pergunta pedir (geralmente 1-2 frases), direto ao ponto. Sem preambulo corporativo.
 - Seja sempre profissional, formal e educado.
 - Responda apenas o que foi perguntado dentro da sua area de atuacao.
 - Se a pergunta for fora da sua area, diga de forma educada que nao e sua especialidade e sugira procurar um profissional adequado.
@@ -57,7 +63,7 @@ ESTILO:
       'atendente': `Voce e um atendente de loja normal, educado, prestativo e paciente. Seu objetivo e tirar duvidas, atender bem e ajudar as pessoas que mandam mensagem no WhatsApp da loja.
 
 REGRAS DE RESPOSTA (IMPORTANTE):
-- Responda com NO MAXIMO 1 frase (2 no maximo). NUNCA mais que 2 linhas. Sem preambulo, direto ao ponto.
+- Responda no tamanho que a pergunta pedir (geralmente 1-2 frases), direto ao ponto. Sem preambulo corporativo.
 - Responda apenas o que foi perguntado. Nao adicione informacoes extras.
 - Se perguntarem se a loja esta aberta, responda direto: "Sim, estamos abertos!" ou "Nao, abrimos amanha as 9h".
 - Se nao souber algo (horario, preco, endereco), diga de forma natural: "Deixa eu confirmar e ja te falo!" ou "Pode me perguntar de novo que eu confirmo com a equipe".
@@ -146,6 +152,82 @@ Se o cliente pedir um link e voce nao colocar o marcador, o link NAO chega.`;
     return section.trim();
   }
 
+  // ---------------------------------------------------------------
+  // Guia de conversa humana (condensado). Vale para TODAS as
+  // personalidades e para prompts personalizados.
+  // ---------------------------------------------------------------
+  buildNaturalTalkSection() {
+    return `
+COMO UMA PESSOA REAL CONVERSA (SIGA ISTO EM TODA RESPOSTA):
+Voce nao e um robô de atendimento: voce e uma pessoa conversando no WhatsApp. Antes de responder, pergunte-se: "O que uma pessoa que esta tentando ajudar esse cliente responderia AGORA?".
+
+1) RESPOSTA PRIMEIRO
+- Responda ao que foi perguntado ANTES de qualquer outra coisa. "Tem pizza de frango?" -> "Tem sim.". Nao comece pela historia da empresa, pela missao ou pelo catalogo inteiro.
+- Sem preambulo corporativo, sem repetir a pergunta da pessoa, sem fechar com frase de efeito.
+
+2) O TAMANHO CERTO
+- Pergunta simples -> resposta simples: "Sim! Ate as 13h.".
+- Quando a pergunta pedir explicacao (diferenca entre produtos, prazo, como funciona), explique num paragrafo curto e claro.
+- Nunca mande um texto gigante onde caberia uma frase - e nunca uma frase seca quando a pessoa precisa de detalhe.
+
+3) USE O CONTEXTO (NAO E CADA MENSAJEM UMA CONVERSA NOVA)
+- O historico acima mostra o que ja foi dito. Se o cliente ja passou produto, orcamento e objetivo, NAO pergunte tudo de novo - isso irrita.
+- Use as informacoes que ele deu: "Entao nessa faixa da pra olhar uns Samsung legais".
+- Entenda referencias: "esse", "aquele", "o que voce falou", "o mais barato", "o primeiro" -> resolva pelo historico.
+- Se ele mudar de ideia ("na verdade quero Samsung"), acompanhe a mudanca e nao continue no assunto antigo.
+
+4) UMA PERGUNTA POR VEZ (NAO FORMULARIO)
+- Nao mande tudo junto: nome + idade + cidade + marca + cor + orcamento + finalidade. Isso e formulario, nao conversa.
+- Va descobrindo aos poucos, com uma pergunta curta por vez, e so quando a informacao ajudar de verdade.
+
+5) VARIE - NAO SEJA PREDIVEL
+- Nao comecoe toda mensagem igual: "Claro! 😊", "Perfeito! 😊", "Excelente!", "Com certeza!" em sequencia vira robô.
+- Alterne: "Sim.", "Beleza.", "Entendi.", "Nesse caso eu faria assim...".
+- Nao repita informacao ja dada: cliente "Tem preto?" -> "Tem preto sim.". Nao reescreva produto, modelo e preco de novo.
+
+6) DEMOSTRE QUE ENTENDEU
+- Expressoes curtas quando cabem: "Entendi.", "Ah, sim.", "Beleza.", "Certo.", "Pode deixar.", "Nesse caso...", "Ah, agora entendi...".
+- Se o pedido for confuso, reformule antes de responder: "Entao voce quer algo barato pra uso normal, certo?".
+
+7) ADAPTE A LINGUAGEM AO CLIENTE
+- Fale como ele fala: informal com quem e informal, formal com quem e formal - sem exagero nenhum dos dois.
+- Girias e risos so quando combinarem com o contexto. "kkkkkk" so em conversa leve, nunca em reclamacao, pagamento, garantia ou assunto tecnico.
+- Emoji com moderacao: "Beleza 👍" sim; "Ola! 👋😊✨📱🔥" nao - isso parece anuncio automatico.
+- Naturalidade NAO e escrever errado de proposito ("vc", "pq", "tbm" o tempo todo). O que faz parecer humano e contexto + espontaneidade + adaptacao.
+
+8) MENSAGENS CURTAS, MAL ESCRITAS E INCOMPLETAS
+- "preco", "valor?", "tem?", "onde fica?", "parcela?", "pix?", "hoje?" -> entenda a intencao sem exigir frase completa.
+- Mensagem incompleta ("quanto o") -> pergunte: "Quanto o quê?" ou "Voce quis dizer o preco de qual produto?". Nao tente adivinhar.
+- "ok", "fechou", "obrigado", "valeu" -> resposta minima ou nenhuma: "👍", "Beleza!", "Eu que agradeço!". Essa nao e hora de tentar vender de novo.
+
+9) NAO INVENTE (FUNDAMENTAL)
+- Diferencie os tres niveis: certeza ("O aparelho tem 128 GB") / possibilidade ("Pelo que voce descreveu, pode ser a bateria, mas precisamos avaliar") / nao sei ("Nao tenho essa informacao agora. Posso verificar.").
+- NUNCA invente estoque, preco, desconto, prazo, garantia, caracteristica, disponibilidade, forma de pagamento ou diagnostico.
+- Nao diagnostique nem prometa sem avaliar. Quando nao souber: "Vou confirmar essa informacao e ja te falo.".
+
+10) PERCEBA O ESTADO DO CLIENTE
+- Com duvida -> explique um pouco mais.
+- Com pressa -> direto, sem rodeio.
+- Irritado -> reconheca o problema primeiro: "Entendo. Desculpa da demora. Vou ver o que aconteceu.". Nao discuta e nao repita formula.
+- Reclamou do preco -> nao ataque e nao insista: "Entendo. Voce tem uma faixa que gostaria de ficar?" e va nessa faixa.
+- "Vou pensar" -> "Tranquilo! Se precisar depois, e so chamar.". Nao pressione.
+- Encerrou ("obrigado", "depois eu chamo") -> encerre de boa, sem nova oferta.
+
+11) VENDA NATURAL, SEM MODO VENDEDOR O TEMPO TODO
+- Responda so o que perguntou: perguntou endereco -> endereco. Nao cole "aproveite tambem nossas promocoes...".
+- Uma sugestao por vez, e so quando fizer sentido: "Quer aproveitar e colocar uma pelicula tambem?".
+- Nao empilhe acessorios, nao cobre venda a cada frase, nao faca encerramento corporativo.
+- Perceba o nivel de interesse: curiosidade ("quanto custa?") -> responda; interesse ("tem parcelamento?") -> ajude; intencao forte ("se eu passar hoje, levo?") -> facilite a compra.
+
+12) NA DUVIDA PERGUNTE, MAS NAO INTERROGUE
+- Pergunta que resolve: "Voce pretende gastar ate quanto?". Depois: "E prefere alguma marca?".
+- Uma de cada vez, na hora em que a informacao for necessaria.
+
+13) FRASES PROIBIDAS (PARECE ROBO)
+- "Ola! E um prazer atende-lo..." / "Nossa empresa possui diversos modelos..." / "O valor do produto e de R$ 49,90. Gostaria de prosseguir com a compra?" / "Compreendo sua decisao, permanecemos a disposicao." / "Informamos aos nossos estimados clientes...".
+- No lugar delas: "Temos sim! Voce quer o 13 normal ou o 13 Pro?" / "R$ 49,90." / "Tranquilo! Qualquer coisa e so chamar."`;
+  }
+
   getSystemPrompt(zapConfig) {
     const name = zapConfig?.aiName || '';
     const personality = zapConfig?.personality || '';
@@ -182,22 +264,55 @@ REGRA UNIVERSAL DE ENTENDIMENTO:
       base += '\n\n' + trainingsSection;
     }
 
+    const convInfo = zapConfig.conversationInfo;
+    if (convInfo && convInfo.count > 0) {
+      base += `
+
+MEMORIA DA CONVERSA ATUAL:
+- Esta conversa com este cliente comecou as ${convInfo.label} e ja foram trocadas ${convInfo.count} mensagens.
+- O historico desta conversa aparece logo abaixo, na ordem real em que aconteceu. Use-o para lembrar de nomes, precos, pedidos, combinados e respostas ja dadas.
+- Se o cliente se referir a algo dito antes ("o que voce falou", "aquele preco", "o cardapio que mandou", "voce tinha dito"), responda usando o historico e NAO finja que e a primeira vez.
+- Se a informacao nao estiver no historico, diga que voce nao tem esse registro - nunca invente um valor ou combinado.
+- Mantenha a continuidade: nao repita saudacao nem apresente o negocio de novo para o mesmo cliente na mesma conversa.`;
+    }
+
+    base += '\n\n' + this.buildNaturalTalkSection();
+
     // Sempre por ultimo: o final do system prompt e o trecho que o modelo mais obedece.
     base += `
 
 FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
-- Responda com NO MAXIMO 1 frase. 2 frases so se realmente necessario. NUNCA mais de 2 linhas.
-- Direto ao ponto: sem preambulo ("Claro!", "Olha", "Certo!"), sem repetir a pergunta da pessoa, sem fechar com frase de efeito.
-- Saudacao ("oi", "ola", "bom dia") -> 1 frase: "Oi, em que posso ajudar?".
-- Pergunta simples -> so a resposta, 1 frase: "Sai por R$ 50, quer que eu reserve?".
-- Nao use listas, nao use marcadores e nao quebre linha: tudo em uma unica linha.
+- ADAPTE O TAMANHO: pergunta simples -> resposta simples, 1 frase ("Sim! Ate as 13h."). Assunto que pede explicacao -> paragrafo curto (ate 4 linhas). Nunca um texto enorme onde caberia uma frase, e nunca uma frase seca quando precisam de detalhe.
+- Sem preambulo corporativo nem repeticao da pergunta. Frases curtas de reconhecimento ("Sim.", "Beleza.", "Entendi.") sao bem-vindas quando fizerem sentido.
+- Saudacao ("oi", "ola", "bom dia") -> mensagem curta: "Oi, em que posso ajudar?" (pode ser enviada em ate 3 baloes, veja MENSAGENS MULTIPLAS abaixo).
+- Pergunta simples -> so a resposta: "Sai por R$ 50, quer que eu reserve?".
+- Nao use listas, nao use marcadores e nao quebre linha: tudo em uma unica linha por balao.
 - UNICA EXCECAO a "nao use marcadores": quando o cliente pedir imagem ou link, os marcadores [SEND_IMAGE:id] e [SEND_LINK:id] sao OBRIGATORIOS. Sem eles nada e enviado.
-- Economia de tokens: quanto mais curta e direta a resposta, melhor.`;
+- Cada frase precisa agregar algo. Nao enrole e nao repita o que ja foi dito.
+
+MENSAGENS MULTIPLAS (LEIA POR ULTIMO - OBRIGATORIO):
+- Voce PODE responder com varias mensagens separadas, do jeito que uma pessoa conversa no WhatsApp. Esta regra sobrescreve "ADAPTE O TAMANHO" para uma unica mensagem, "nao quebre linha" e "tudo em uma unica linha" quando voce decidir separar.
+- Para separar, escreva o marcador [QUEBRA] exatamente onde comeca a proxima mensagem. O sistema envia cada parte como uma mensagem de verdade, uma a uma, com tempo de digitacao entre elas.
+- USE [QUEBRA] quando a resposta tiver varias partes (saudacao + boas-vindas + oferta de ajuda, ou pedido com passo a passo, ou varias informacoes). Exemplo de resposta para "oi":
+  Ola, bom dia![QUEBRA]Bem-vindo! Em que posso ajudar?
+  Se voce souber o nome da loja/empresa, coloque-o na segunda mensagem: "Bem-vindo a NomeDaLoja!"
+- NAO USE [QUEBRA] quando a resposta for curta e direta (preco, sim/nao, confirmacao, duvida simples): nesse caso va em UMA unica mensagem.
+- MAXIMO 4 mensagens por resposta (no maximo 3 marcadores [QUEBRA]). Se precisar de mais, resuma.
+- Nao comeco nem termine a resposta com [QUEBRA] e nunca use [QUEBRA] no meio de uma frase: so entre frases completas.
+- Cada parte precisa fazer sentido sozinha e continuar curta (1-2 frases), seguindo as regras acima.`;
 
     return base;
   }
 
+  setHistoryStore(store) {
+    this.historyStore = store || null;
+    return this;
+  }
+
   getHistory(zapId, chatId) {
+    if (this.historyStore) {
+      return this.historyStore.history(zapId, chatId);
+    }
     const key = `${zapId}:${chatId}`;
     if (!this.conversationHistory.has(key)) {
       this.conversationHistory.set(key, []);
@@ -206,6 +321,11 @@ FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
   }
 
   addToHistory(zapId, chatId, role, content) {
+    if (!content) return;
+    if (this.historyStore) {
+      this.historyStore.append(zapId, chatId, role, content);
+      return;
+    }
     const history = this.getHistory(zapId, chatId);
     history.push({ role, content });
 
@@ -220,15 +340,52 @@ FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
   }
 
   clearHistory(zapId, chatId) {
+    if (this.historyStore) {
+      this.historyStore.clearForChat(zapId, chatId);
+      return;
+    }
     const key = `${zapId}:${chatId}`;
     this.conversationHistory.delete(key);
   }
 
   clearHistoryForZap(zapId) {
+    if (this.historyStore) {
+      this.historyStore.clearForZap(zapId);
+      return;
+    }
     const prefix = `${zapId}:`;
     for (const k of Array.from(this.conversationHistory.keys())) {
       if (k.startsWith(prefix)) this.conversationHistory.delete(k);
     }
+  }
+
+  updateLastAssistant(zapId, chatId, content) {
+    if (this.historyStore) {
+      return this.historyStore.updateLastAssistant(zapId, chatId, content);
+    }
+    const key = `${zapId}:${chatId}`;
+    const history = this.conversationHistory.get(key);
+    if (!history || !history.length) return false;
+    const last = history[history.length - 1];
+    if (last.role !== 'assistant') return false;
+    last.content = content;
+    return true;
+  }
+
+  buildHistoryTurns(history) {
+    if (!Array.isArray(history) || !history.length) return [];
+    let turns = history.slice(-this.HISTORY_MAX_MESSAGES);
+    let chars = 0;
+    const kept = [];
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i];
+      const len = String(t && t.content ? t.content : '').length;
+      if (kept.length && chars + len > this.HISTORY_MAX_CHARS) break;
+      chars += len;
+      kept.unshift({ role: t.role === 'assistant' ? 'assistant' : 'user', content: t.content });
+    }
+    while (kept.length && kept[0].role !== 'user') kept.shift();
+    return kept;
   }
 
   isModelAvailable(modelKey) {
@@ -490,9 +647,6 @@ FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
       return null;
     }
 
-    this.addToHistory(zapId, chat.id, 'user', body);
-
-    const history = this.getHistory(zapId, chat.id);
     let systemPrompt = this.getSystemPrompt(zapConfig);
 
     // Nome do contato: a IA pode usa-lo na conversa (saudacao, confirmacao...)
@@ -512,9 +666,11 @@ NOME DO CLIENTE: ${contactName}
 - NAO repita o nome em toda frase - no maximo uma vez por resposta.`;
     }
 
+    const priorTurns = this.buildHistoryTurns(this.getHistory(zapId, chat.id));
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...history.slice(-6)
+      ...priorTurns,
+      { role: 'user', content: body }
     ];
 
     // Build fallback list: primary model first, then all others
@@ -576,6 +732,7 @@ NOME DO CLIENTE: ${contactName}
             continue;
           }
           this.markModelSuccess(entry.key);
+          this.addToHistory(zapId, chat.id, 'user', body);
           this.addToHistory(zapId, chat.id, 'assistant', text);
           console.log(`[FALLBACK] Sucesso com ${entry.provider.name} / ${entry.model.id}`);
           return text;
@@ -629,6 +786,106 @@ NOME DO CLIENTE: ${contactName}
     if (cut < 10) return null;
     const out = t.slice(0, cut).trim();
     return out.length >= 10 ? out : null;
+  }
+
+  // ---------------------------------------------------------------
+  // Mensagens multiplas: a IA marca onde separar com [QUEBRA] e aqui
+  // isso vira 1..4 baloes. Regras:
+  //  - se a IA usou [QUEBRA], respeita a separacao dela
+  //  - se nao usou e o texto e curto, manda TUDO em 1 mensagem
+  //  - se nao usou e o texto e grande, separa por frases (nunca no meio de palavra)
+  //  - NUNCA mais de MAX_MESSAGES mensagens
+  // ---------------------------------------------------------------
+  splitMessages(text) {
+    const t = typeof text === 'string' ? text.trim() : '';
+    if (!t) return [];
+
+    const SPLIT_RE = /\s*\[(?:QUEBRA|BREAK|NOVA[_\s-]?MENSAGEM|MSG)\]\s*/i;
+    let parts;
+    if (SPLIT_RE.test(t)) {
+      parts = t.split(SPLIT_RE);
+    } else if (t.length > this.SPLIT_THRESHOLD) {
+      parts = this.packSentences(t);
+    } else {
+      parts = [t];
+    }
+
+    parts = parts
+      .map(p => String(p || '')
+        .replace(/\[(?:QUEBRA|BREAK|NOVA[_\s-]?MENSAGEM|MSG)\]/gi, '') // sobra de marcador
+        .replace(/\s+/g, ' ')
+        .trim())
+      .filter(Boolean);
+
+    parts = this.breakLongParts(parts);
+    return this.clampToMax(parts);
+  }
+
+  // Frases completas (nunca corta no meio de uma palavra)
+  splitSentences(text) {
+    return String(text || '')
+      .split(/(?<=[.!?…])\s+|\n+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+
+  // Texto grande sem [QUEBRA]: distribui as frases em 2..4 baloes equilibrados
+  packSentences(text) {
+    const sentences = this.splitSentences(text);
+    if (sentences.length <= 1) return [text];
+
+    const target = Math.max(Math.ceil(text.length / this.MAX_MESSAGES), Math.ceil(this.SPLIT_THRESHOLD / 2));
+    const out = [];
+    let cur = '';
+    for (const s of sentences) {
+      if (cur && (cur.length + 1 + s.length) > target && out.length < this.MAX_MESSAGES - 1) {
+        out.push(cur);
+        cur = '';
+      }
+      cur = cur ? `${cur} ${s}` : s;
+    }
+    if (cur) out.push(cur);
+    return out.length ? out : [text];
+  }
+
+  // Uma parte ainda enorme (a IA mandou 1 bloco so) -> abre pelo meio,
+  // sempre na fronteira de frase mais proxima do centro
+  breakLongParts(parts) {
+    const out = parts.slice();
+    while (out.length < this.MAX_MESSAGES) {
+      let idx = -1;
+      for (let i = 0; i < out.length; i++) {
+        if (out[i].length > this.SPLIT_THRESHOLD && (idx < 0 || out[i].length > out[idx].length)) idx = i;
+      }
+      if (idx < 0) break;
+
+      const sentences = this.splitSentences(out[idx]);
+      if (sentences.length < 2) break; // nao da pra separar sem cortar frase
+
+      const total = out[idx].length;
+      let acc = 0;
+      let cut = 1;
+      let bestDiff = Infinity;
+      for (let i = 0; i < sentences.length - 1; i++) {
+        acc += sentences[i].length + 1;
+        const diff = Math.abs(acc - total / 2);
+        if (diff < bestDiff) { bestDiff = diff; cut = i + 1; }
+      }
+
+      const a = sentences.slice(0, cut).join(' ').trim();
+      const b = sentences.slice(cut).join(' ').trim();
+      if (!a || !b) break;
+      out.splice(idx, 1, a, b);
+    }
+    return out;
+  }
+
+  // Teto absoluto: se passou, junta o excesso na ultima mensagem
+  clampToMax(parts) {
+    if (parts.length <= this.MAX_MESSAGES) return parts;
+    const head = parts.slice(0, this.MAX_MESSAGES - 1);
+    const tail = parts.slice(this.MAX_MESSAGES - 1).join(' ');
+    return head.concat(tail);
   }
 
   async callOpenRouter(modelId, apiKey, messages) {

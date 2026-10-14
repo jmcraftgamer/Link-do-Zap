@@ -104,11 +104,14 @@ function appendLogEntry(container, entry) {
   container.appendChild(div);
 }
 
+// Chaves de IA vem do ambiente (preload -> env), nunca hardcoded no repositorio
+const BOOTSTRAP_KEYS = (window.electronAPI && window.electronAPI.bootstrapKeys) || {};
+
 // Pre-configured OpenRouter provider
 const OPENROUTER_PRECONFIGURED = {
   id: 'openrouter-preconfig',
   name: 'OpenRouter',
-  apiKey: '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',
+  apiKey: BOOTSTRAP_KEYS.openrouter || '',
   models: [
     { id: 'openrouter/free', name: 'OpenRouter Free Models Router (Roteador automtico)', free: true },
     { id: 'qwen/qwen3.8-27b:free', name: 'Qwen3.8 27B', free: true },
@@ -147,7 +150,7 @@ if (!providersData.find(p => p.id === 'openrouter-preconfig')) {
 const GOOGLEAI_PRECONFIGURED = {
   id: 'googleai-preconfig',
   name: 'Google AI Studio',
-  apiKey: 'AQ.Ab8RN6IbhT9Czr8ReEDxIwKlOwWZCs6AflBuQNn4mk7mBthc8g',
+  apiKey: BOOTSTRAP_KEYS.googleai || '',
   models: [
     { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', free: true, limits: '10 RPM | 250k TPM | 250 RPD' },
     { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', free: true, limits: '15 RPM | 250k TPM | 1.000 RPD' },
@@ -161,6 +164,18 @@ if (!providersData.find(p => p.id === 'googleai-preconfig')) {
   providersData.unshift(GOOGLEAI_PRECONFIGURED);
   localStorage.setItem('linknozap_providers', JSON.stringify(providersData));
 }
+
+// Se o preconfig existe mas sem chave, preenche a partir do ambiente
+function fillEmptyBootstrapKey(providerId, envKey) {
+  if (!envKey) return;
+  const p = providersData.find(pp => pp.id === providerId);
+  if (p && !p.apiKey) {
+    p.apiKey = envKey;
+    localStorage.setItem('linknozap_providers', JSON.stringify(providersData));
+  }
+}
+fillEmptyBootstrapKey('openrouter-preconfig', BOOTSTRAP_KEYS.openrouter);
+fillEmptyBootstrapKey('googleai-preconfig', BOOTSTRAP_KEYS.googleai);
 
 // DOM Elements
 const menuItems = document.querySelectorAll('.menu-item');
@@ -244,6 +259,11 @@ async function refreshAllZapStatuses() {
     if (currentPanelZapId != null) {
       refreshPanelStatusUI(currentPanelZapId);
     }
+  }
+
+  if (autoMsgInitialized) {
+    renderAutoMsgAccounts();
+    updateAutoMsgConnectBtn();
   }
 }
 
@@ -656,6 +676,10 @@ function navigateTo(page) {
     closeTrainingEditor();
   }
 
+  if (page === 'mensagem-automatica') {
+    onAutoMsgPageOpen();
+  }
+
   // Close zap panel when leaving "adicionar-whatsapp" page
   if (page !== 'adicionar-whatsapp' && currentPanelZapId != null) {
     closeZapPanel();
@@ -682,6 +706,7 @@ const SEARCH_PLACEHOLDERS = {
   'provedores': 'Buscar provedores...',
   'relatorios': 'Buscar relatrios...',
   'configuracoes': 'Buscar configuraes...',
+  'mensagem-automatica': 'Buscar na conversa...',
   'ajuda': 'Buscar na ajuda...'
 };
 
@@ -729,6 +754,11 @@ function getSearchItemsForPage() {
   } else if (page === 'conversas') {
     zapsData.forEach(z => push(z.name));
     document.querySelectorAll('#conversationsList .conversation-name').forEach(el => push(el.textContent));
+  } else if (page === 'mensagem-automatica') {
+    const st = getAutoMsgStateSafe();
+    const chat = (st.chats || {})[autoMsgViewZap] || [];
+    chat.forEach(c => push(c.content));
+    (st.queue || []).forEach(q => push(q.phone));
   }
 
   return items;
@@ -869,6 +899,8 @@ function refreshPageList() {
     if (lastRenderedConversations != null) {
       renderConversations(lastRenderedConversations, lastRenderedConversationsZapId);
     }
+  } else if (page === 'mensagem-automatica') {
+    renderAutoMsgChat();
   }
 }
 
@@ -1055,6 +1087,47 @@ function openLogModal(zapId, zapName) {
 // ============================================
 let currentPanelZapId = null;
 
+// Renomeia o Zap com edicao inline (Enter salva, Esc cancela)
+function startRenameZap(zap, nameEl) {
+  if (!zap || !nameEl || nameEl.dataset.renaming) return;
+  nameEl.dataset.renaming = '1';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'zap-name-edit-input';
+  input.value = zap.name || '';
+  nameEl.style.display = 'none';
+  nameEl.parentNode.insertBefore(input, nameEl);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const commit = (save) => {
+    if (done) return;
+    done = true;
+    const novo = input.value.trim();
+    if (input.parentNode) input.parentNode.removeChild(input);
+    delete nameEl.dataset.renaming;
+    nameEl.style.display = '';
+    if (save && novo && novo !== zap.name) {
+      zap.name = novo;
+      saveZaps();
+      renderZaps(zapsData);
+      if (currentPanelZapId != null && String(currentPanelZapId) === String(zap.id)) {
+        document.getElementById('zapPanelName').textContent = novo;
+      }
+      renderAutoMsgAccounts();
+    } else {
+      nameEl.textContent = zap.name;
+    }
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+  });
+  input.addEventListener('blur', () => commit(true));
+}
+
 function openZapPanel(zapId) {
   const zap = zapsData.find(z => String(z.id) === String(zapId));
   if (!zap) return;
@@ -1070,6 +1143,10 @@ function openZapPanel(zapId) {
 
   document.getElementById('zapPanelName').textContent = zap.name;
   document.getElementById('zapPanelPhone').textContent = zap.phone;
+
+  // Editar nome do Zap (lapis)
+  const editNameBtn = document.getElementById('panelEditName');
+  editNameBtn.onclick = () => startRenameZap(zap, document.getElementById('zapPanelName'));
 
   // Copy phone
   const copyBtn = document.getElementById('copyZapPhone');
@@ -1116,6 +1193,17 @@ function openZapPanel(zapId) {
     }
   };
 
+  // Resposta instantanea (ignora o sorteio de 15/25/35s)
+  const instantCb = document.getElementById('panelInstantReply');
+  instantCb.checked = !!zap.instantReply;
+  instantCb.onchange = () => {
+    const z = zapsData.find(x => String(x.id) === String(zapId));
+    if (z) {
+      z.instantReply = instantCb.checked;
+      saveZaps();
+    }
+  };
+
   // Personality
   const personalitySelect = document.getElementById('panelPersonality');
   const areaRow = document.getElementById('panelAreaRow');
@@ -1141,11 +1229,23 @@ function openZapPanel(zapId) {
   };
   updatePersonalityBadge();
 
+  // Salva na hora (persiste mesmo se fechar o app sem clicar em Salvar)
+  const persistPersonality = () => {
+    const z = zapsData.find(x => String(x.id) === String(zapId));
+    if (!z) return;
+    z.personality = personalitySelect.value;
+    z.area = areaInput.value.trim();
+    saveZaps();
+    renderZaps(zapsData);
+  };
+
   personalitySelect.onchange = () => {
     areaRow.style.display = personalitySelect.value === 'especialista' ? 'flex' : 'none';
     updatePersonalityBadge();
+    persistPersonality();
   };
   areaInput.oninput = updatePersonalityBadge;
+  areaInput.onchange = persistPersonality;
 
   // Connect/Disconnect button
   refreshPanelStatusUI(zapId);
@@ -1334,6 +1434,28 @@ function getHourlyActivity(data, numBuckets) {
   return buckets;
 }
 
+// Curva suave (Catmull-Rom -> Bezier) com clamp para nao passar dos limites
+function smoothLinePath(ctx, pts, minY, maxY) {
+  if (!pts.length) return;
+  const clampY = (y) => Math.min(Math.max(y, minY), maxY);
+  ctx.moveTo(pts[0].x, clampY(pts[0].y));
+  if (pts.length === 1) return;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2] || p2;
+    ctx.bezierCurveTo(
+      p1.x + (p2.x - p0.x) / 6,
+      clampY(p1.y + (p2.y - p0.y) / 6),
+      p2.x - (p3.x - p1.x) / 6,
+      clampY(p2.y - (p3.y - p1.y) / 6),
+      p2.x,
+      clampY(p2.y)
+    );
+  }
+}
+
 function drawActivityChart(canvasId, tooltipId, data) {
   const canvas = document.getElementById(canvasId);
   const tooltip = document.getElementById(tooltipId);
@@ -1351,7 +1473,7 @@ function drawActivityChart(canvasId, tooltipId, data) {
   const w = rect.width;
   const h = rect.height;
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#0B0B0B';
+  ctx.fillStyle = '#000000';
   ctx.fillRect(0, 0, w, h);
 
   const pad = { l: 10, r: 10, t: 16, b: 22 };
@@ -1360,17 +1482,6 @@ function drawActivityChart(canvasId, tooltipId, data) {
 
   const buckets = getHourlyActivity(data, 12);
   const hasData = buckets.some(b => b.value > 0);
-
-  // Grid lines
-  ctx.strokeStyle = '#1E1E1E';
-  ctx.lineWidth = 1;
-  for (let g = 0; g <= 3; g++) {
-    const gy = Math.round(pad.t + (innerH * g) / 3) + 0.5;
-    ctx.beginPath();
-    ctx.moveTo(pad.l, gy);
-    ctx.lineTo(w - pad.r, gy);
-    ctx.stroke();
-  }
 
   const baseY = pad.t + innerH;
 
@@ -1402,38 +1513,14 @@ function drawActivityChart(canvasId, tooltipId, data) {
     bucket
   }));
 
-  // Area under the line
-  const grad = ctx.createLinearGradient(0, pad.t, 0, baseY);
-  grad.addColorStop(0, 'rgba(255,255,255,0.32)');
-  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  // Linha suave e limpa: sem grade, sem pontos e sem brilho
   ctx.beginPath();
-  ctx.moveTo(points[0].x, baseY);
-  points.forEach(p => ctx.lineTo(p.x, p.y));
-  ctx.lineTo(points[points.length - 1].x, baseY);
-  ctx.closePath();
-  ctx.fillStyle = grad;
-  ctx.fill();
-
-  // Spike line (sharp peaks, hour by hour)
-  ctx.beginPath();
-  points.forEach((p, i) => {
-    if (i === 0) ctx.moveTo(p.x, p.y);
-    else ctx.lineTo(p.x, p.y);
-  });
+  smoothLinePath(ctx, points, pad.t, baseY);
   ctx.strokeStyle = '#FFFFFF';
-  ctx.lineWidth = 2;
-  ctx.lineJoin = 'miter';
+  ctx.lineWidth = 2.4;
+  ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  ctx.miterLimit = 4;
   ctx.stroke();
-
-  // Points
-  points.forEach(p => {
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.bucket.value > 0 ? 3 : 2, 0, Math.PI * 2);
-    ctx.fillStyle = p.bucket.value > 0 ? '#FFFFFF' : '#4A4A4A';
-    ctx.fill();
-  });
 
   // Hour labels
   ctx.fillStyle = '#6B6B6B';
@@ -3046,6 +3133,7 @@ function initWhatsApp() {
 
   if (window.electronAPI.onWhatsAppContactsUpdated) {
     window.electronAPI.onWhatsAppContactsUpdated((data) => {
+      agentContactsCache = null;
       if (currentPanelZapId != null && String(data.zapId) === String(currentPanelZapId)) {
         loadPanelContacts(currentPanelZapId);
       }
@@ -3054,6 +3142,8 @@ function initWhatsApp() {
 
   initConnectModal();
   initConversationsPage();
+  try { initAutoMsgPage(); } catch (e) { console.error('Erro em initAutoMsgPage:', e); }
+  try { initDashboardChat(); } catch (e) { console.error('Erro em initDashboardChat:', e); }
 }
 
 // ============================================
@@ -4222,6 +4312,880 @@ function setupTrainingListeners() {
 
   document.getElementById('trainingContent')?.addEventListener('input', updateTrainingCharCount);
   document.getElementById('trainingsList')?.addEventListener('click', handleTrainingListAction);
+}
+
+// ============================================
+// Mensagem Automática (somente ChatBox)
+// ============================================
+let autoMsgState = null;
+let autoMsgViewZap = '';
+let autoMsgAttachments = [];
+let autoMsgBusy = false;
+let autoMsgRecorder = null;
+let autoMsgRecChunks = [];
+let autoMsgInitialized = false;
+
+function getAutoMsgStateSafe() {
+  return autoMsgState || { zapId: null, status: 'idle', chats: {}, log: [], queue: [], recipients: [], counts: {} };
+}
+
+function autoMsgTime(t) {
+  try {
+    return new Date(t || Date.now()).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  } catch (_) { return ''; }
+}
+
+function getAutoMsgSelectedZap() {
+  if (!autoMsgViewZap) return null;
+  return zapsData.find(z => String(z.id) === String(autoMsgViewZap)) || null;
+}
+
+function initAutoMsgPage() {
+  if (autoMsgInitialized) return;
+  autoMsgInitialized = true;
+
+  const input = document.getElementById('autoMsgInput');
+  const sendBtn = document.getElementById('autoMsgSendBtn');
+  const stopBtn = document.getElementById('autoMsgStopBtn');
+  const connectBtn = document.getElementById('autoMsgConnectBtn');
+  const accountsBtn = document.getElementById('autoMsgAccountsBtn');
+  const addZapBtn = document.getElementById('autoMsgAddZapBtn');
+  const micBtn = document.getElementById('autoMsgMicBtn');
+  const fileBtn = document.getElementById('autoMsgFileBtn');
+  const fileInput = document.getElementById('autoMsgFileInput');
+
+  if (sendBtn) sendBtn.addEventListener('click', autoMsgSend);
+  if (stopBtn) stopBtn.addEventListener('click', autoMsgStop);
+  if (connectBtn) connectBtn.addEventListener('click', autoMsgConnect);
+  if (addZapBtn) addZapBtn.addEventListener('click', () => openModal());
+  if (micBtn) micBtn.addEventListener('click', autoMsgToggleMic);
+  if (fileBtn && fileInput) {
+    fileBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      autoMsgOnFiles(e.target.files);
+      e.target.value = '';
+    });
+  }
+  if (accountsBtn) {
+    accountsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      autoMsgToggleAccounts();
+    });
+  }
+
+  // Fecha a lista de contas ao clicar fora
+  document.addEventListener('click', (e) => {
+    const panel = document.getElementById('autoMsgAccountsPanel');
+    const btn = document.getElementById('autoMsgAccountsBtn');
+    if (!panel || panel.style.display === 'none') return;
+    if (panel.contains(e.target) || (btn && btn.contains(e.target))) return;
+    autoMsgCloseAccounts();
+  });
+
+  if (input) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        autoMsgSend();
+      }
+    });
+  }
+
+  if (window.electronAPI) {
+    if (window.electronAPI.onAutoMsgUpdate) {
+      window.electronAPI.onAutoMsgUpdate((s) => renderAutoMsgState(s));
+    }
+    if (window.electronAPI.onWhatsAppStatus) {
+      window.electronAPI.onWhatsAppStatus(() => {
+        updateAutoMsgConnectBtn();
+        renderAutoMsgAccounts();
+      });
+    }
+    if (window.electronAPI.onWhatsAppMessage) {
+      window.electronAPI.onWhatsAppMessage((data) => autoMsgOnIncoming(data));
+    }
+    if (window.electronAPI.autoMsgState) {
+      window.electronAPI.autoMsgState()
+        .then(s => { if (s) renderAutoMsgState(s); })
+        .catch(() => {});
+    }
+  }
+
+  // Contagem regressiva do proximo envio (5 min)
+  setInterval(() => {
+    if (getActivePageId() === 'mensagem-automatica') updateAutoMsgCampaign();
+  }, 1000);
+}
+
+function onAutoMsgPageOpen() {
+  if (!autoMsgViewZap) {
+    try { autoMsgViewZap = localStorage.getItem('linknozap_autoMsgViewZap') || ''; } catch (_) {}
+  }
+  const st = getAutoMsgStateSafe();
+  const valid = (id) => id && zapsData.some(z => String(z.id) === String(id));
+  if (!valid(autoMsgViewZap)) {
+    autoMsgViewZap = valid(st.zapId) ? String(st.zapId) : (zapsData[0] ? String(zapsData[0].id) : '');
+  }
+  renderAutoMsgAccounts();
+  updateAutoMsgConnectBtn();
+  renderAutoMsgChat();
+  updateAutoMsgCampaign();
+  if (window.electronAPI && window.electronAPI.autoMsgState) {
+    window.electronAPI.autoMsgState()
+      .then(s => { if (s) renderAutoMsgState(s); })
+      .catch(() => {});
+  }
+  const input = document.getElementById('autoMsgInput');
+  if (input) input.focus();
+}
+
+// --- Lista de contas (botao >) ---
+function autoMsgToggleAccounts() {
+  const panel = document.getElementById('autoMsgAccountsPanel');
+  const btn = document.getElementById('autoMsgAccountsBtn');
+  if (!panel) return;
+  if (panel.style.display === 'none') {
+    renderAutoMsgAccounts();
+    panel.style.display = 'block';
+    if (btn) btn.classList.add('open');
+  } else {
+    autoMsgCloseAccounts();
+  }
+}
+
+function autoMsgCloseAccounts() {
+  const panel = document.getElementById('autoMsgAccountsPanel');
+  const btn = document.getElementById('autoMsgAccountsBtn');
+  if (panel) panel.style.display = 'none';
+  if (btn) btn.classList.remove('open');
+}
+
+function renderAutoMsgAccounts() {
+  const list = document.getElementById('autoMsgAccountsList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!zapsData.length) {
+    const div = document.createElement('div');
+    div.className = 'am-account-row';
+    div.style.cursor = 'default';
+    div.textContent = 'Nenhuma conta cadastrada';
+    list.appendChild(div);
+    return;
+  }
+  zapsData.forEach(z => {
+    const info = getZapStatusInfo(z);
+    const row = document.createElement('div');
+    row.className = 'am-account-row'
+      + (info.online ? ' online' : '')
+      + (String(z.id) === String(autoMsgViewZap) ? ' active' : '');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const name = document.createElement('span');
+    name.className = 'am-account-name';
+    name.textContent = z.name;
+    const phone = document.createElement('span');
+    phone.className = 'am-account-phone';
+    phone.textContent = z.phone || '';
+    const infoBox = document.createElement('span');
+    infoBox.className = 'am-account-info';
+    infoBox.appendChild(name);
+    infoBox.appendChild(phone);
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'am-account-edit';
+    edit.title = 'Editar nome do Zap';
+    edit.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
+    edit.addEventListener('click', (e) => {
+      e.stopPropagation();
+      startRenameZap(z, name);
+    });
+    row.appendChild(dot);
+    row.appendChild(infoBox);
+    row.appendChild(edit);
+    row.addEventListener('click', () => autoMsgSelectAccount(z.id));
+    list.appendChild(row);
+  });
+}
+
+function autoMsgSelectAccount(id) {
+  autoMsgViewZap = String(id);
+  try { localStorage.setItem('linknozap_autoMsgViewZap', autoMsgViewZap); } catch (_) {}
+  renderAutoMsgAccounts();
+  updateAutoMsgConnectBtn();
+  renderAutoMsgChat();
+  autoMsgCloseAccounts();
+}
+
+function updateAutoMsgConnectBtn() {
+  const btn = document.getElementById('autoMsgConnectBtn');
+  if (!btn) return;
+  const zap = getAutoMsgSelectedZap();
+  if (zap && getZapStatusInfo(zap).online) {
+    btn.textContent = 'Conectado';
+    btn.classList.add('connected');
+  } else {
+    btn.textContent = 'Conectar';
+    btn.classList.remove('connected');
+  }
+}
+
+function autoMsgConnect() {
+  const zap = getAutoMsgSelectedZap();
+  if (!zap) { alert('Escolha uma conta no botao > (canto inferior esquerdo).'); return; }
+  if (getZapStatusInfo(zap).online) { alert('Esta conta ja esta conectada.'); return; }
+  openConnectModal(zap.id, zap.name, zap.phone);
+  connectZapWithMethod(zap.id, (zap.phone || '').replace(/\D/g, ''), 'qrcode');
+}
+
+// --- Historico da conversa ---
+function autoMsgAppendMsg(role, content, t, pending) {
+  const box = document.getElementById('autoMsgMessages');
+  const empty = document.getElementById('autoMsgEmpty');
+  if (!box) return;
+  if (empty) empty.style.display = 'none';
+
+  const div = document.createElement('div');
+  const cls = role === 'agent' ? 'agent' : (role === 'system' ? 'system' : 'user');
+  div.className = 'am-msg ' + cls + (pending ? ' pending' : '');
+  div.textContent = String(content || '');
+  const time = document.createElement('span');
+  time.className = 'am-msg-time';
+  time.textContent = autoMsgTime(t);
+  div.appendChild(time);
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderAutoMsgChat() {
+  const box = document.getElementById('autoMsgMessages');
+  const empty = document.getElementById('autoMsgEmpty');
+  if (!box) return;
+  [...box.querySelectorAll('.am-msg')].forEach(el => el.remove());
+
+  const st = getAutoMsgStateSafe();
+  const all = (st.chats && st.chats[autoMsgViewZap]) || [];
+  const q = (getActivePageId() === 'mensagem-automatica' ? globalSearchQuery : '') || '';
+  const entries = q ? all.filter(c => searchMatches(c.content, q)) : all;
+
+  if (!entries.length) {
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  entries.forEach(c => autoMsgAppendMsg(c.role, c.content, c.t, false));
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderAutoMsgState(s) {
+  if (!s) return;
+  autoMsgState = s;
+  renderAutoMsgChat();
+  renderAutoMsgAccounts();
+  updateAutoMsgConnectBtn();
+  updateAutoMsgCampaign();
+}
+
+// --- Status da campanha (dentro do painel de contas) ---
+function updateAutoMsgCampaign() {
+  const wrap = document.getElementById('autoMsgCampaign');
+  const text = document.getElementById('autoMsgCampaignText');
+  const stopBtn = document.getElementById('autoMsgStopBtn');
+  if (!wrap || !text) return;
+
+  const s = getAutoMsgStateSafe();
+  const c = s.counts || null;
+  if (!c || (!c.total && s.status === 'idle')) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'flex';
+
+  let label = '';
+  if (s.status === 'running') {
+    let countdown = '';
+    if (s.nextAt && s.nextAt > Date.now()) {
+      const d = Math.max(0, Math.round((s.nextAt - Date.now()) / 1000));
+      countdown = ` - proxima em ${Math.floor(d / 60)}:${String(d % 60).padStart(2, '0')}`;
+    }
+    label = `Enviando... ${c.sent}/${c.total}${countdown}`;
+  } else if (s.status === 'done') {
+    label = `Concluida: ${c.sent}/${c.total}`;
+  } else if (s.status === 'stopped') {
+    label = `Parada: ${c.sent}/${c.total}`;
+  } else {
+    label = `${c.sent}/${c.total} enviadas`;
+  }
+  if (c.failed) label += `, ${c.failed} falha(s)`;
+  text.textContent = label;
+  if (stopBtn) stopBtn.style.display = s.status === 'running' ? '' : 'none';
+}
+
+// --- Anexos ---
+function autoMsgRenderChips() {
+  const row = document.getElementById('autoMsgFiles');
+  if (!row) return;
+  row.innerHTML = '';
+  row.style.display = autoMsgAttachments.length ? 'flex' : 'none';
+  autoMsgAttachments.forEach((f, i) => {
+    const chip = document.createElement('span');
+    chip.className = 'am-chip';
+    const name = document.createElement('span');
+    name.className = 'am-chip-name';
+    name.textContent = f.name;
+    name.title = f.name;
+    const btn = document.createElement('button');
+    btn.className = 'am-chip-remove';
+    btn.textContent = '×';
+    btn.title = 'Remover anexo';
+    btn.addEventListener('click', () => {
+      autoMsgAttachments.splice(i, 1);
+      autoMsgRenderChips();
+    });
+    chip.appendChild(name);
+    chip.appendChild(btn);
+    row.appendChild(chip);
+  });
+}
+
+function autoMsgOnFiles(fileList) {
+  const MAX = 15 * 1024 * 1024;
+  const files = Array.from(fileList || []);
+  for (const f of files) {
+    if (f.size > MAX) {
+      alert(`Arquivo grande demais (maximo 15MB): ${f.name}`);
+      continue;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const raw = String(reader.result || '');
+      const data = raw.includes(',') ? raw.slice(raw.indexOf(',') + 1) : raw;
+      autoMsgAttachments.push({
+        name: f.name,
+        mimeType: f.type || 'application/octet-stream',
+        data
+      });
+      autoMsgRenderChips();
+    };
+    reader.onerror = () => alert(`Nao foi possivel ler o arquivo: ${f.name}`);
+    reader.readAsDataURL(f);
+  }
+}
+
+// --- Ditado por voz ---
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || '').split(',').pop());
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+async function autoMsgToggleMic() {
+  const btn = document.getElementById('autoMsgMicBtn');
+  if (!btn) return;
+  if (autoMsgRecorder) {
+    try { autoMsgRecorder.stop(); } catch (_) {}
+    return;
+  }
+  if (!navigator.mediaDevices || typeof MediaRecorder === 'undefined') {
+    alert('Ditado indisponivel nesta versao do sistema.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const rec = new MediaRecorder(stream);
+    autoMsgRecChunks = [];
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) autoMsgRecChunks.push(e.data); };
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      btn.classList.remove('recording');
+      btn.textContent = 'Ditar';
+      btn.title = 'Ditar mensagem (voz)';
+      autoMsgRecorder = null;
+      const blob = new Blob(autoMsgRecChunks, { type: (autoMsgRecChunks[0] && autoMsgRecChunks[0].type) || 'audio/webm' });
+      if (blob.size < 400) return;
+      btn.textContent = 'Transcrevendo...';
+      btn.title = 'Transcrevendo...';
+      try {
+        const b64 = await blobToBase64(blob);
+        const text = await window.electronAPI.autoMsgTranscribe({
+          data: b64, mimetype: blob.type, size: blob.size
+        }, autoMsgViewZap);
+        const input = document.getElementById('autoMsgInput');
+        if (text && String(text).trim() && input) {
+          input.value = (input.value ? input.value.replace(/\s+$/, '') + ' ' : '') + String(text).trim();
+          input.focus();
+        } else {
+          alert('Nao consegui transcrever o audio. Tente falar mais perto do microfone.');
+        }
+      } catch (e) {
+        alert('Erro ao transcrever: ' + (e && e.message ? e.message : e));
+      } finally {
+        btn.textContent = 'Ditar';
+        btn.title = 'Ditar mensagem (voz)';
+      }
+    };
+    rec.start();
+    autoMsgRecorder = rec;
+    btn.classList.add('recording');
+    btn.textContent = 'Gravando...';
+    btn.title = 'Clique para parar a gravacao';
+  } catch (e) {
+    alert('Microfone indisponivel: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// --- Envio do pedido para a IA ---
+async function autoMsgSend() {
+  if (autoMsgBusy) return;
+  const input = document.getElementById('autoMsgInput');
+  const sendBtn = document.getElementById('autoMsgSendBtn');
+  const zap = getAutoMsgSelectedZap();
+
+  const text = input ? input.value.trim() : '';
+  const attachments = autoMsgAttachments.slice();
+
+  if (!zap) {
+    alert('Escolha a conta no botao > (canto inferior esquerdo) antes de enviar.');
+    return;
+  }
+  if (!text && !attachments.length) return;
+
+  autoMsgBusy = true;
+  if (sendBtn) sendBtn.disabled = true;
+
+  const names = attachments.map(a => a.name).join(', ');
+  autoMsgAppendMsg('user', text || `(anexos: ${names})`, Date.now());
+  if (input) input.value = '';
+  autoMsgAttachments = [];
+  autoMsgRenderChips();
+
+  try {
+    const res = await window.electronAPI.autoMsgChat({
+      zapId: String(zap.id),
+      text,
+      attachments
+    });
+    const s = await window.electronAPI.autoMsgState();
+    if (s) renderAutoMsgState(s);
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    autoMsgAppendMsg('agent', 'Erro: ' + msg, Date.now());
+  } finally {
+    autoMsgBusy = false;
+    if (sendBtn) sendBtn.disabled = false;
+    if (input) input.focus();
+  }
+}
+
+async function autoMsgStop() {
+  const s = autoMsgState;
+  if (!s || s.status !== 'running') {
+    alert('Nenhuma campanha em andamento.');
+    return;
+  }
+  if (!confirm('Parar a campanha? A fila sera mantida e pode continuar depois.')) return;
+  try {
+    const next = await window.electronAPI.autoMsgStop();
+    if (next) renderAutoMsgState(next);
+  } catch (e) {
+    alert('Erro ao parar: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// Respostas recebidas entram no historico da conta selecionada
+function autoMsgOnIncoming(data) {
+  if (!data || !autoMsgViewZap) return;
+  if (String(data.zapId) !== String(autoMsgViewZap)) return;
+  if (data.fromMe) return;
+
+  const raw = String(data.from || (data.chat && data.chat.id) || '').split('@')[0].replace(/\D/g, '');
+  if (!raw) return;
+  const phone = (raw.startsWith('55') && (raw.length === 12 || raw.length === 13))
+    ? raw
+    : (raw.length >= 10 && raw.length <= 11 ? '55' + raw : raw);
+
+  const st = getAutoMsgStateSafe();
+  const known = (st.recipients || []).some(r => String(r.phone) === phone);
+  if (!known) return;
+
+  const body = String(data.body || '').trim() || '[midia/audio]';
+  const previewMsg = body.length > 120 ? body.substring(0, 120) + '...' : body;
+  if (window.electronAPI && window.electronAPI.autoMsgNote) {
+    window.electronAPI.autoMsgNote(String(autoMsgViewZap), `Resposta de +${phone}: "${previewMsg}"`)
+      .then(s => { if (s) renderAutoMsgState(s); })
+      .catch(() => {});
+  }
+}
+// ============================================
+// Dashboard - Agente IA (ChatBox funcional)
+// ============================================
+let agentHistory = [];
+let agentBusy = false;
+let agentContactsCache = null;
+let agentMentions = {};
+let agentDictating = false;
+let agentRecorder = null;
+let agentRecChunks = [];
+
+function initDashboardChat() {
+  const input = document.getElementById('dashChatInput');
+  if (!input) return;
+  const sendBtn = document.getElementById('dashChatSend');
+  const micBtn = document.getElementById('dashChatMic');
+  const filesBtn = document.getElementById('dashChatFiles');
+
+  if (sendBtn) sendBtn.addEventListener('click', sendAgentMessage);
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendAgentMessage();
+    }
+  });
+
+  input.addEventListener('input', () => {
+    autosizeDashInput(input);
+    handleDashMention(input);
+  });
+
+  input.addEventListener('blur', () => {
+    setTimeout(hideDashMentionDropdown, 150);
+  });
+
+  if (micBtn) micBtn.addEventListener('click', toggleDashDictation);
+  if (filesBtn) filesBtn.addEventListener('click', attachDashFile);
+}
+
+function autosizeDashInput(input) {
+  input.style.height = 'auto';
+  input.style.height = Math.min(132, input.scrollHeight) + 'px';
+}
+
+function setDashBusy(busy) {
+  agentBusy = busy;
+  const sendBtn = document.getElementById('dashChatSend');
+  const input = document.getElementById('dashChatInput');
+  if (sendBtn) sendBtn.disabled = busy;
+  if (input) input.disabled = busy;
+}
+
+function appendDashBubble(role, text) {
+  const box = document.getElementById('dashChatMessages');
+  if (!box) return null;
+  const div = document.createElement('div');
+  div.className = 'dash-msg ' + (role === 'user' ? 'dash-msg-user' : 'dash-msg-agent');
+  div.textContent = String(text || '');
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div;
+}
+
+function appendDashToolLine(step) {
+  const box = document.getElementById('dashChatMessages');
+  if (!box || !step) return;
+  const div = document.createElement('div');
+  div.className = 'dash-msg-tool';
+  const mark = step.ok ? '✓' : '✕';
+  div.textContent = `${mark} ${step.tool}${step.info ? ' — ' + step.info : ''}`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function showDashTyping() {
+  const box = document.getElementById('dashChatMessages');
+  if (!box) return null;
+  const div = document.createElement('div');
+  div.className = 'dash-msg dash-msg-agent dash-typing';
+  div.innerHTML = '<span class="dash-dot"></span><span class="dash-dot"></span><span class="dash-dot"></span>';
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div;
+}
+
+async function sendAgentMessage() {
+  const input = document.getElementById('dashChatInput');
+  if (!input || agentBusy) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  const mentions = collectDashMentions(text);
+  input.value = '';
+  autosizeDashInput(input);
+  hideDashMentionDropdown();
+  agentMentions = {};
+
+  appendDashBubble('user', text);
+  setDashBusy(true);
+  const typing = showDashTyping();
+
+  try {
+    const res = await window.electronAPI.agentChat({
+      message: text,
+      history: agentHistory.slice(-16),
+      mentions
+    });
+    if (typing && typing.parentNode) typing.parentNode.removeChild(typing);
+    agentHistory.push({ role: 'user', content: text });
+    const steps = (res && res.steps) || [];
+    steps.forEach(appendDashToolLine);
+    const reply = (res && res.reply) || 'Sem resposta.';
+    appendDashBubble('agent', reply);
+    agentHistory.push({ role: 'assistant', content: reply });
+    if (steps.some(s => s.ok)) await syncDataAfterAgent();
+  } catch (e) {
+    if (typing && typing.parentNode) typing.parentNode.removeChild(typing);
+    appendDashBubble('agent', 'Erro ao conversar com o agente: ' + (e && e.message ? e.message : e));
+  } finally {
+    setDashBusy(false);
+    input.focus();
+  }
+}
+
+// Recarrega dados locais apos o agente mexer no app (zaps/treinamentos)
+async function syncDataAfterAgent() {
+  try {
+    const zaps = await window.electronAPI.loadZaps();
+    if (Array.isArray(zaps)) {
+      zapsData = zaps;
+      localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData));
+      zapsData.forEach(z => {
+        if (z.enabled === undefined) z.enabled = true;
+        try { applyRuntimeStatus(z, z.runtimeStatus || 'disconnected'); } catch (_) {}
+      });
+      renderZaps(zapsData);
+      updateZapSelector();
+      if (currentPanelZapId != null) {
+        const open = zapsData.find(x => String(x.id) === String(currentPanelZapId));
+        if (open) {
+          const nameEl = document.getElementById('zapPanelName');
+          if (nameEl) nameEl.textContent = open.name;
+          try { refreshPanelStatusUI(currentPanelZapId); } catch (_) {}
+        } else {
+          const panel = document.getElementById('zapPanelView');
+          const list = document.getElementById('zapsListView');
+          if (panel && list) { panel.style.display = 'none'; list.style.display = 'block'; currentPanelZapId = null; }
+        }
+      }
+      try { renderAutoMsgAccounts(); } catch (_) {}
+      try { updateAutoMsgConnectBtn(); } catch (_) {}
+    }
+    const tr = await window.electronAPI.loadTrainings();
+    trainingsData = tr || {};
+    renderTrainingZapsList();
+    if (currentTrainingZapId != null) renderTrainingsList();
+    agentContactsCache = null;
+  } catch (e) {
+    console.error('syncDataAfterAgent:', e);
+  }
+}
+
+// --------------------------- Contatos @ ---------------------------
+async function loadDashContacts() {
+  if (agentContactsCache) return agentContactsCache;
+  const list = [];
+  try {
+    for (const z of zapsData) {
+      const convs = await window.electronAPI.whatsappConversations(String(z.id));
+      (convs || []).forEach(c => {
+        const contact = c.contact || {};
+        const number = String(contact.number || contact.id || '').replace(/@.*/, '').replace(/\D/g, '');
+        const name = String(contact.name || contact.pushname || contact.shortName || number || 'Sem nome');
+        if (number && !list.some(x => x.number === number)) {
+          list.push({ name, number, zapId: z.id, zapName: z.name });
+        }
+      });
+    }
+  } catch (e) {}
+  agentContactsCache = list;
+  return list;
+}
+
+function ensureDashMentionDropdown() {
+  let dd = document.getElementById('dashMentionDd');
+  if (dd) return dd;
+  const host = document.querySelector('.dash-chat');
+  if (!host) return null;
+  dd = document.createElement('div');
+  dd.id = 'dashMentionDd';
+  dd.className = 'dash-mention-dd';
+  host.appendChild(dd);
+  return dd;
+}
+
+function hideDashMentionDropdown() {
+  const dd = document.getElementById('dashMentionDd');
+  if (dd) dd.style.display = 'none';
+}
+
+function handleDashMention(input) {
+  const pos = input.selectionStart != null ? input.selectionStart : input.value.length;
+  const upto = input.value.slice(0, pos);
+  const m = upto.match(/@([^\s@]{0,25})$/);
+  if (!m || !m[1]) {
+    hideDashMentionDropdown();
+    return;
+  }
+  const query = m[1].toLowerCase();
+  const dd = ensureDashMentionDropdown();
+  if (!dd) return;
+
+  loadDashContacts().then(list => {
+    const hits = list.filter(c =>
+      c.name.toLowerCase().includes(query) || c.number.includes(query)
+    ).slice(0, 8);
+    if (!hits.length) {
+      dd.style.display = 'none';
+      return;
+    }
+    dd.innerHTML = '';
+    hits.forEach(c => {
+      const item = document.createElement('div');
+      item.className = 'dash-mention-item';
+      const nm = document.createElement('span');
+      nm.className = 'dash-mention-name';
+      nm.textContent = c.name;
+      const nu = document.createElement('span');
+      nu.className = 'dash-mention-num';
+      nu.textContent = '+' + c.number;
+      item.appendChild(nm);
+      item.appendChild(nu);
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        pickDashMention(input, c);
+      });
+      dd.appendChild(item);
+    });
+    dd.style.display = 'block';
+  });
+}
+
+function pickDashMention(input, contact) {
+  const pos = input.selectionStart != null ? input.selectionStart : input.value.length;
+  const before = input.value.slice(0, pos);
+  const after = input.value.slice(pos);
+  const firstName = String(contact.name || contact.number).split(/\s+/)[0].replace(/[^\wÀ-ÿ]/g, '') || contact.number;
+  const token = '@' + firstName;
+  agentMentions[token.toLowerCase()] = contact.number;
+  agentMentions[token.toLowerCase() + '_name'] = contact.name;
+  const replaced = before.replace(/@[^\s@]{0,25}$/, token + ' ');
+  input.value = replaced + after;
+  input.focus();
+  input.selectionStart = input.selectionEnd = replaced.length;
+  hideDashMentionDropdown();
+}
+
+function collectDashMentions(text) {
+  const out = [];
+  const seen = {};
+  const tokens = String(text).match(/@[^\s@,.;:!?()]{1,30}/g) || [];
+  for (const tok of tokens) {
+    const key = tok.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    let number = agentMentions[key] || null;
+    let name = agentMentions[key + '_name'] || tok.slice(1);
+    if (!number && agentContactsCache) {
+      const q = tok.slice(1).toLowerCase();
+      const hit = agentContactsCache.find(c =>
+        c.name.toLowerCase().startsWith(q) || c.number.includes(q.replace(/\D/g, ''))
+      );
+      if (hit) { number = hit.number; name = hit.name; }
+    }
+    out.push({ token: tok, name, number });
+  }
+  return out;
+}
+
+// --------------------------- Dictado (voz) ---------------------------
+function toggleDashDictation() {
+  const btn = document.getElementById('dashChatMic');
+  if (!btn) return;
+  if (agentDictating && agentRecorder) {
+    try { agentRecorder.stop(); } catch (_) {}
+    return;
+  }
+  if (!navigator.mediaDevices || typeof MediaRecorder === 'undefined') {
+    alert('Ditado indisponivel nesta versao do sistema.');
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+    const rec = new MediaRecorder(stream);
+    agentRecChunks = [];
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) agentRecChunks.push(e.data); };
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      agentDictating = false;
+      agentRecorder = null;
+      btn.classList.remove('recording');
+      btn.title = 'Ditar mensagem (voz)';
+      const blob = new Blob(agentRecChunks, { type: (agentRecChunks[0] && agentRecChunks[0].type) || 'audio/webm' });
+      if (blob.size < 400) return;
+      btn.title = 'Transcrevendo...';
+      try {
+        const b64 = await blobToBase64(blob);
+        const voiceZap = (zapsData.find(z => String(z.id) === String(autoMsgViewZap)) || zapsData[0] || {});
+        const text = await window.electronAPI.autoMsgTranscribe(
+          { data: b64, mimetype: blob.type, size: blob.size },
+          voiceZap.id
+        );
+        const input = document.getElementById('dashChatInput');
+        if (text && String(text).trim() && input) {
+          input.value = (input.value ? input.value.replace(/\s+$/, '') + ' ' : '') + String(text).trim();
+          autosizeDashInput(input);
+          input.focus();
+        } else {
+          alert('Nao consegui transcrever o audio. Tente falar mais perto do microfone.');
+        }
+      } catch (e) {
+        alert('Erro ao transcrever: ' + (e && e.message ? e.message : e));
+      } finally {
+        btn.title = 'Ditar mensagem (voz)';
+      }
+    };
+    rec.start();
+    agentRecorder = rec;
+    agentDictating = true;
+    btn.classList.add('recording');
+    btn.title = 'Parar gravacao';
+  }).catch(() => {
+    alert('Nao consegui acessar o microfone.');
+  });
+}
+
+// --------------------------- Arquivos ---------------------------
+function attachDashFile() {
+  const picker = document.createElement('input');
+  picker.type = 'file';
+  picker.onchange = async () => {
+    const f = picker.files && picker.files[0];
+    if (!f) return;
+    const input = document.getElementById('dashChatInput');
+    if (!input) return;
+    const isText = (f.type && f.type.startsWith('text/')) ||
+      /\.(txt|md|csv|json|log|xml|html|css|js|ts|jsx|tsx|py|java|c|cpp|cs|php|yml|yaml|ini|cfg|sql)$/i.test(f.name);
+    let note;
+    if (isText && f.size <= 200 * 1024) {
+      try {
+        const content = await f.text();
+        input.value = (input.value ? input.value.trim() + '\n\n' : '') +
+          `[Arquivo: ${f.name}]\n` + content.slice(0, 15000);
+        note = f.name + ' (conteudo anexado)';
+      } catch (_) {
+        input.value = (input.value ? input.value.trim() + '\n\n' : '') + `[Arquivo anexado: ${f.name}]`;
+        note = f.name;
+      }
+    } else {
+      input.value = (input.value ? input.value.trim() + '\n\n' : '') +
+        `[Arquivo anexado: ${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB) - conteudo nao lido]`;
+      note = f.name;
+    }
+    autosizeDashInput(input);
+    appendDashToolLine({ ok: true, tool: 'anexo', info: note });
+    input.focus();
+  };
+  picker.click();
 }
 
 // ============================================

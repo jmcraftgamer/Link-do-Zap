@@ -215,6 +215,138 @@ testAsync('junk: todos os modelos lixo -> devolve null (main envia erro padrao)'
   assert.strictEqual(r, null);
 });
 
+// ---------------------------------------------------------------
+// 7) mensagens multiplas (separador [QUEBRA], teto de 4)
+// ---------------------------------------------------------------
+test('multiplas: resposta curta sem marcador vira UMA mensagem so', () => {
+  const ai = new AIResponder();
+  assert.deepStrictEqual(ai.splitMessages('Sai por R$ 50, quer que eu reserve?'), ['Sai por R$ 50, quer que eu reserve?']);
+  assert.deepStrictEqual(ai.splitMessages('Oi, em que posso ajudar?'), ['Oi, em que posso ajudar?']);
+});
+
+test('multiplas: o exemplo do pedido (oi -> 3 baloes) funciona', () => {
+  const r = new AIResponder().splitMessages('Ola, bom dia![QUEBRA]Bem-vindo a Dikassa![QUEBRA]Em que posso ajudar?');
+  assert.deepStrictEqual(r, ['Ola, bom dia!', 'Bem-vindo a Dikassa!', 'Em que posso ajudar?']);
+});
+
+test('multiplas: NUNCA passa de 4 - excesso vira 4a mensagem', () => {
+  const raw = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6'].join('[QUEBRA]');
+  const r = new AIResponder().splitMessages(raw);
+  assert.strictEqual(r.length, 4, `esperava 4, veio ${r.length}`);
+  assert.ok(r[3].includes('m4') && r[3].includes('m6'), 'excesso nao foi juntado na 4a mensagem');
+});
+
+test('multiplas: marcador com espaco/minusculo/variacoes e reconhecido', () => {
+  const ai = new AIResponder();
+  assert.deepStrictEqual(ai.splitMessages('Oi [quebra] Tudo bem?[BREAK]Sim!'), ['Oi', 'Tudo bem?', 'Sim!']);
+  assert.deepStrictEqual(ai.splitMessages('Oi [MSG] Sim'), ['Oi', 'Sim']);
+});
+
+test('multiplas: marcador no comeco/fim nao cria balao vazio', () => {
+  assert.deepStrictEqual(new AIResponder().splitMessages('[QUEBRA]Ola![QUEBRA]'), ['Ola!']);
+  assert.deepStrictEqual(new AIResponder().splitMessages(''), []);
+  assert.deepStrictEqual(new AIResponder().splitMessages('   '), []);
+});
+
+test('multiplas: texto GRANDE sem marcador separa por frases, sem perder nada', () => {
+  const text = [
+    'Hoje temos promocao em todos os acais da casa, com desconto direto no balcao.',
+    'O combo de dois copos sai por apenas R$ 25 e ainda ganha um adicionador.',
+    'Aceitamos pix, cartao de credito e dinheiro na entrega.',
+    'A loja abre as 8h da manha e fecha as 22h da noite, todos os dias.',
+    'Fazemos entrega em toda a regiao com taxa fixa de R$ 5.',
+    'Para pedir e so chamar aqui que ja anotamos tudo.'
+  ].join(' ');
+  assert.ok(text.length > 300, 'texto do teste precisa passar do limiar');
+  const r = new AIResponder().splitMessages(text);
+  assert.ok(r.length >= 2 && r.length <= 4, `esperava 2..4 baloes, veio ${r.length}`);
+  assert.strictEqual(r.join(' '), text, 'texto se perdeu na separacao');
+  for (const p of r) assert.ok(!/^[a-z]/.test(p), `balao comeca no meio de uma frase: "${p}"`);
+});
+
+test('multiplas: texto grande SEM pontuacao nao e cortado no meio da palavra', () => {
+  const r = new AIResponder().splitMessages('x'.repeat(420));
+  assert.strictEqual(r.length, 1, 'nao da pra separar sem cortar frase');
+});
+
+test('multiplas: parte gigante unica da IA e aberta na fronteira de frase', () => {
+  const s1 = 'Nosso cardapio tem acai pura, acai com granola, acai com frutas frescas e acai com leite condensado.';
+  const s2 = 'Todos os tamanhos vem com calda extra por conta da casa e voce escolhe entre morango, banana e leite.';
+  const s3 = 'O tamanho P sai por R$ 12, o M por R$ 18 e o G por R$ 24, com desconto de 10% no pix e entrega gratis acima de R$ 30.';
+  const text = `${s1} ${s2} ${s3}`;
+  assert.ok(text.length > 300, `texto do teste precisa passar do limiar (${text.length})`);
+  const r = new AIResponder().splitMessages(text);
+  assert.ok(r.length >= 2 && r.length <= 4, `esperava separacao, veio ${r.length} balao`);
+  assert.strictEqual(r.join(' '), text);
+  assert.ok(r[0].includes('granola'), 'quebrou fora da fronteira de frase');
+});
+
+test('prompt: instrucao de mensagens multiplas existe e e o ultimo bloco', () => {
+  const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
+  assert.ok(s.includes('[QUEBRA]'), 'instrucao do marcador ausente');
+  assert.ok(s.includes('MAXIMO 4 mensagens'), 'teto de 4 mensagens ausente');
+  assert.ok(s.indexOf('MENSAGENS MULTIPLAS (LEIA POR ULTIMO') > s.indexOf('FORMATO DA RESPOSTA'), 'bloco deve vir depois de FORMATO DA RESPOSTA');
+  assert.strictEqual(s.split('MENSAGENS MULTIPLAS (LEIA POR ULTIMO').length - 1, 1, 'bloco duplicado');
+});
+
+test('prompt: saudacao permite divisao (caso do pedido)', () => {
+  const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
+  assert.ok(/Saudacao[^]*?ate 3 baloes/.test(s), 'regra de saudacao sem a permissao de dividir');
+});
+
+// ---------------------------------------------------------------
+// 8) conversa natural (guia anti-robo)
+// ---------------------------------------------------------------
+test('natural: guia de conversa humana existe e vem antes do FORMATO', () => {
+  const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
+  assert.ok(s.includes('COMO UMA PESSOA REAL CONVERSA'), 'guia natural ausente');
+  assert.ok(s.indexOf('COMO UMA PESSOA REAL CONVERSA') > s.indexOf('REGRA UNIVERSAL'), 'guia antes da regra universal');
+  assert.ok(s.indexOf('COMO UMA PESSOA REAL CONVERSA') < s.indexOf('FORMATO DA RESPOSTA'), 'guia depois do FORMATO');
+});
+
+test('natural: regras essenciais do guia estao todas presentes', () => {
+  const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
+  const must = [
+    'RESPOSTA PRIMEIRO',
+    'O TAMANHO CERTO',
+    'USE O CONTEXTO',
+    'UMA PERGUNTA POR VEZ',
+    'VARIE - NAO SEJA PREDIVEL',
+    'ADAPTE A LINGUAGEM AO CLIENTE',
+    'NAO INVENTE (FUNDAMENTAL)',
+    'PERCEBA O ESTADO DO CLIENTE',
+    'VENDA NATURAL',
+    'FRASES PROIBIDAS'
+  ];
+  for (const m of must) assert.ok(s.includes(m), `regra ausente: ${m}`);
+});
+
+test('natural: exemplos robótico vs natural estao no prompt', () => {
+  const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
+  assert.ok(s.includes('Temos sim! Voce quer o 13 normal ou o 13 Pro?'), 'exemplo natural ausente');
+  assert.ok(s.includes('Gostaria de prosseguir com a compra?'), 'exemplo robotico ausente');
+  assert.ok(s.includes('Tranquilo! Qualquer coisa e so chamar.'), 'exemplo de encerramento natural ausente');
+  assert.ok(s.toLowerCase().includes('nao e escrever errado de proposito'), 'anti-erro-artificial ausente');
+});
+
+test('natural: vale para TODAS as personalidades e para prompt personalizado', () => {
+  const ai = new AIResponder();
+  for (const p of ['padrao', 'vendedor', 'especialista', 'atendente']) {
+    const s = ai.getSystemPrompt({ personality: p, trainings: [] });
+    assert.ok(s.includes('COMO UMA PESSOA REAL CONVERSA'), `personalidade ${p} sem o guia`);
+  }
+  const custom = ai.getSystemPrompt({ customPrompt: 'Prompt custom da loja.', trainings: [] });
+  assert.ok(custom.includes('COMO UMA PESSOA REAL CONVERSA'), 'prompt personalizado sem o guia');
+  assert.ok(custom.includes('Prompt custom da loja.'), 'o prompt custom foi perdido');
+});
+
+test('natural: regra rigida de "1 frase" foi substituida por tamanho adaptativo', () => {
+  const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
+  assert.ok(!s.includes('NO MAXIMO 1 frase'), 'regra rigida continua no prompt');
+  assert.ok(s.includes('ADAPTE O TAMANHO'), 'nova regra de tamanho ausente');
+  assert.ok(s.includes('paragrafo curto'), 'regra de explicacao maior ausente');
+});
+
 async function runPending() {
   for (const p of pending) {
     try {

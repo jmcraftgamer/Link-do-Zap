@@ -45,8 +45,13 @@ fs.writeFileSync(path.join(dataDir, 'trainings.json'), JSON.stringify({ [ZAP_ID]
 let vnow = Date.now();
 Date.now = () => vnow;
 const realSetTimeout = global.setTimeout;
+const HOURLY = 3600000;
 global.setTimeout = (fn, ms, ...args) => {
-  vnow += Number(ms) || 0;
+  const d = Number(ms) || 0;
+  // Timers de fundo (virada de dia 00:00 etc) ficam fora do teste: se fossem
+  // avancados aqui o relógio virtual pularia horas e reagendariam para sempre.
+  if (d > HOURLY) return { unref() {}, ref() {} };
+  vnow += d;
   return realSetTimeout(fn, 0, ...args);
 };
 
@@ -186,6 +191,10 @@ function newLogs(s) { return logs.slice(s.logs).join('\n'); }
 // ---------------------------------------------------------------
 // carrega o main.js real com os stubs
 // ---------------------------------------------------------------
+// O ConversationStore agenda um save (400ms) a cada gravacao; aqui esse timer
+// so poluiria o relógio virtual, entao vira no-op (o teste so usa memoria).
+const ConversationStore = require(path.join(root, 'src', 'js', 'conversation-store'));
+ConversationStore.prototype.scheduleSave = function () {};
 require(path.join(root, 'main.js'));
 
 async function run() {
@@ -335,6 +344,173 @@ async function run() {
   });
 
   // ---------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // H) multiplas mensagens: 3 baloes com digitando entre cada um
+  // ---------------------------------------------------------------
+  testAsync('fluxo: resposta em 3 baloes com digitacao entre cada um', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = () => googleOk('Ola, bom dia![QUEBRA]Bem-vindo a Dikassa![QUEBRA]Em que posso ajudar?');
+    await fakeMgr.cb(mkMsg(person('5566555555555', 'Rita')));
+
+    const sent = sentMessages.slice(s.sent);
+    assert.deepStrictEqual(sent.map(m => m.text),
+      ['Ola, bom dia!', 'Bem-vindo a Dikassa!', 'Em que posso ajudar?'],
+      'baloes fora de ordem ou marcador vazou');
+
+    assert.ok(logs.slice(s.logs).some(l => l.includes('Resposta separada em 3 mensagens')),
+      'log de separacao ausente');
+    assert.ok(!logs.slice(s.logs).some(l => /\[QUEBRA\]/.test(l) && l.includes('Enviando')),
+      'marcador [QUEBRA] vazou para o envio');
+
+    const ev = typingEvents.slice(s.typing);
+    const comp = ev.filter(e => e.state === 'composing');
+    const pause = ev.filter(e => e.state === 'paused');
+    assert.ok(comp.length >= 3, `esperava composing em cada balao, veio ${comp.length}`);
+    assert.ok(pause.length >= 3, `esperava paused em cada balao, veio ${pause.length}`);
+
+    for (let i = 0; i < sent.length; i++) {
+      assert.ok(comp[i].t <= pause[i].t, `balao ${i + 1}: paused antes do composing`);
+      assert.ok(pause[i].t <= sent[i].t, `balao ${i + 1}: enviado antes de desligar o digitando`);
+      assert.ok(sent[i].t - comp[i].t >= 5000, `balao ${i + 1}: digitando menos de 5s`);
+      if (i > 0) {
+        assert.ok(comp[i].t >= sent[i - 1].t, `balao ${i + 1}: comecou a digitar antes do balao ${i} sair`);
+        assert.ok(sent[i].t - sent[i - 1].t >= 5000, `balao ${i + 1}: gap menor que 5s entre baloes`);
+      }
+    }
+
+    // 1o balao espera o sorteio (15/25/35s) + digitacao humana
+    const human = Math.max(5000, Math.round((sent[0].text.length / 2.5) * 1000));
+    const preDelay = (sent[0].t - s.t) - human;
+    assert.ok([15000, 25000, 35000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
+  });
+
+  // ---------------------------------------------------------------
+  // I) teto absoluto: 6 marcadores da IA viram 4 baloes
+  // ---------------------------------------------------------------
+  testAsync('fluxo: IA exagerou no [QUEBRA] - envia no maximo 4 mensagens', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = () => googleOk(['m1', 'm2', 'm3', 'm4', 'm5', 'm6'].join('[QUEBRA]'));
+    await fakeMgr.cb(mkMsg(person('5577444444444', 'Tiago')));
+
+    const sent = sentMessages.slice(s.sent);
+    assert.strictEqual(sent.length, 4, `esperava 4 mensagens, enviou ${sent.length}`);
+    assert.strictEqual(sent[3].text, 'm4 m5 m6', 'excesso nao foi juntado na ultima mensagem');
+    assert.strictEqual(fetchCalls.slice(s.fetch).length, 1);
+  });
+
+  // ---------------------------------------------------------------
+  // J) resposta curta continua em UMA mensagem so
+  // ---------------------------------------------------------------
+  testAsync('fluxo: resposta curta NAO e separada', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = () => googleOk('Sai por R$ 50, quer que eu reserve?');
+    await fakeMgr.cb(mkMsg(person('5588333333333', 'Lia')));
+
+    const sent = sentMessages.slice(s.sent);
+    assert.strictEqual(sent.length, 1, `esperava 1 mensagem, enviou ${sent.length}`);
+    assert.ok(!logs.slice(s.logs).some(l => l.includes('Resposta separada em')));
+  });
+
+  // ---------------------------------------------------------------
+  // K) MEMORIA: historico por conversa (zerada as 00:00)
+  // ---------------------------------------------------------------
+  function lastAiBody() {
+    const req = fetchCalls[fetchCalls.length - 1];
+    return (req && req.body) || null;
+  }
+  function sysText(body) {
+    const si = body && body.systemInstruction;
+    return ((si && si.parts) || []).map(p => p.text).join('\n');
+  }
+  function contentsText(body) {
+    return JSON.stringify((body && body.contents) || []);
+  }
+
+  testAsync('fluxo: 2a mensagem leva o historico da 1a para o modelo', async () => {
+    clearCooldown();
+    const s = snapshot();
+    const p = person('5510101010101', 'Carla');
+
+    fetchHandler = () => googleOk('Oi Carla, bem-vinda!');
+    await fakeMgr.cb(mkMsg(Object.assign({ body: 'oi' }, p)));
+
+    fetchHandler = () => googleOk('Voce se chama Carla.');
+    await fakeMgr.cb(mkMsg(Object.assign({ body: 'como eu me chamo?' }, p)));
+
+    const body = lastAiBody();
+    assert.ok(body, 'segunda chamada a IA nao aconteceu');
+    const contents = contentsText(body);
+    assert.ok(contents.includes('oi'), 'mensagem 1 ausente do historico');
+    assert.ok(contents.includes('bem-vinda'), 'resposta 1 ausente do historico');
+    assert.ok(contents.includes('como eu me chamo?'), 'mensagem atual ausente do pedido');
+    assert.ok(sysText(body).includes('MEMORIA DA CONVERSA ATUAL'), 'bloco de memoria ausente no prompt');
+    assert.ok(logs.slice(s.logs).some(l => l.includes('Nova conversa iniciada')), 'log de nova conversa ausente');
+  });
+
+  testAsync('fluxo: outro contato nao herda o historico do primeiro', async () => {
+    clearCooldown();
+    fetchHandler = () => googleOk('Certo.');
+    await fakeMgr.cb(mkMsg(Object.assign({ body: 'oi' }, person('5520202020202', 'Bruno'))));
+
+    const body = lastAiBody();
+    assert.ok(!contentsText(body).includes('Carla'), 'historico de outro contato vazou');
+    assert.ok(!sysText(body).includes('MEMORIA DA CONVERSA ATUAL'),
+      'conversa nova nao deveria receber o bloco de memoria');
+  });
+
+  testAsync('fluxo: apos 00:00 o contato abre conversa nova e perde a memoria antiga', async () => {
+    const s = snapshot();
+    const d = new Date(vnow);
+    vnow = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 5, 0, 0).getTime();
+    clearCooldown();
+
+    fetchHandler = () => googleOk('Bom dia!');
+    await fakeMgr.cb(mkMsg(Object.assign({ body: 'bom dia' }, person('5510101010101', 'Carla'))));
+
+    const body = lastAiBody();
+    assert.ok(!contentsText(body).includes('bem-vinda'), 'historico de ontem vazou para a conversa nova');
+    assert.ok(!sysText(body).includes('MEMORIA DA CONVERSA ATUAL'),
+      'conversa do dia seguinte nao pode ver a memoria de ontem');
+    assert.ok(logs.slice(s.logs).some(l => l.includes('Nova conversa iniciada')),
+      'log de nova conversa apos a virada ausente');
+  });
+
+  // ---------------------------------------------------------------
+  // L) RESPOSTA INSTANTANEA: zap.instantReply ignora o sorteio
+  // ---------------------------------------------------------------
+  testAsync('fluxo: zap com instantReply responde sem o sorteio de tempo', async () => {
+    clearCooldown();
+    const zapsPath = path.join(dataDir, 'zaps.json');
+    const original = fs.readFileSync(zapsPath, 'utf8');
+    fs.writeFileSync(zapsPath, JSON.stringify([
+      { id: ZAP_ID, name: 'Teste', enabled: true, autoReply: true, personality: 'padrao',
+        instantReply: true, providers: ['g1', 'o1'], selectedModels: [], model: 'auto', blockedContacts: [] }
+    ], null, 2));
+
+    const s = snapshot();
+    fetchHandler = () => googleOk('Resposta rapida!');
+    await fakeMgr.cb(mkMsg(person('5566778899000', 'Rita')));
+
+    fs.writeFileSync(zapsPath, original);
+
+    const text = newLogs(s);
+    assert.ok(text.includes('Resposta instantanea ativada'), 'log de resposta instantanea ausente');
+    assert.ok(!/Sorteio de tempo de resposta/.test(text), 'sorteio nao deveria ter acontecido');
+
+    const sent = lastSent();
+    assert.strictEqual(sent.text, 'Resposta rapida!');
+    const human = Math.max(5000, Math.round((sent.text.length / 2.5) * 1000));
+    const preDelay = (sent.t - s.t) - human;
+    assert.ok(preDelay < 1000, `preDelay deveria ser ~0, veio ${preDelay}ms`);
+
+    // zaps.json de volta ao normal: os demais testes continuam com o sorteio
+    const back = JSON.parse(fs.readFileSync(zapsPath, 'utf8'));
+    assert.strictEqual(back[0].instantReply, undefined, 'restauracao do zaps.json falhou');
+  });
+
   for (const p of pending) {
     try {
       await p.fn();

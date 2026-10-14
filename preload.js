@@ -1,6 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // Chaves de IA fora do codigo (env do sistema / secrets do GitHub Actions)
+  bootstrapKeys: {
+    openrouter: process.env.OPENROUTER_API_KEY || '',
+    googleai: process.env.GOOGLE_AI_KEY || ''
+  },
+
   // Window controls
   minimize: () => ipcRenderer.send('window-minimize'),
   maximize: () => ipcRenderer.send('window-maximize'),
@@ -17,8 +23,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsappDisconnect: (zapId) => ipcRenderer.invoke('whatsapp-disconnect', zapId),
   whatsappStatus: (zapId) => ipcRenderer.invoke('whatsapp-status', zapId),
   whatsappSend: (zapId, phone, text) => ipcRenderer.invoke('whatsapp-send', zapId, phone, text),
+  whatsappSendMedia: (zapId, phone, media) => ipcRenderer.invoke('whatsapp-send-media', zapId, phone, media),
   whatsappConversations: (zapId) => ipcRenderer.invoke('whatsapp-conversations', zapId),
   whatsappMessages: (zapId, chatId) => ipcRenderer.invoke('whatsapp-messages', zapId, chatId),
+
+  // Mensagem Automatica
+  autoMsgState: () => ipcRenderer.invoke('auto-msg-state'),
+  autoMsgChat: (payload) => ipcRenderer.invoke('auto-msg-chat', payload),
+  autoMsgStop: () => ipcRenderer.invoke('auto-msg-stop'),
+  autoMsgNote: (zapId, text) => ipcRenderer.invoke('auto-msg-note', { zapId, text }),
+  autoMsgTranscribe: (audio, zapId) => ipcRenderer.invoke('auto-msg-transcribe', audio, zapId),
+  onAutoMsgLog: (callback) => ipcRenderer.on('auto-msg-log', (e, data) => callback(data)),
+  onAutoMsgUpdate: (callback) => ipcRenderer.on('auto-msg-update', (e, data) => callback(data)),
+
+  // Agente IA do Dashboard
+  agentChat: (payload) => ipcRenderer.invoke('agent-chat', payload),
 
   // WhatsApp events
   onWhatsAppQR: (callback) => ipcRenderer.on('whatsapp-qr', (e, data) => callback(data)),

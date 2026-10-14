@@ -4,10 +4,16 @@ const fs = require('fs');
 const WhatsAppManager = require('./src/js/whatsapp-manager');
 const AIResponder = require('./src/js/ai-responder');
 const { resolveReplyMedia } = require('./src/js/media-resolver');
+const ConversationStore = require('./src/js/conversation-store');
+const AutoMessageManager = require('./src/js/auto-message');
+const AppAgent = require('./src/js/app-agent');
 
 let mainWindow;
 let whatsappManager;
 let aiResponder;
+let conversationStore = null;
+let autoMessage = null;
+let appAgent = null;
 let rendererDragging = false;
 
 // Um evaluate do wwebjs numa pagina morta (teardown de LOGOUT) rejeita sem
@@ -17,10 +23,42 @@ process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED] Promessa rejeitada sem tratamento:', msg);
 });
 
+const MAX_LOG_LINES = 500;
+const logRing = [];
+function pushLogLine(line) {
+  logRing.push(line);
+  if (logRing.length > MAX_LOG_LINES) logRing.splice(0, logRing.length - MAX_LOG_LINES);
+}
+function formatLogArgs(args) {
+  return args.map((a) => {
+    if (typeof a === 'string') return a;
+    if (a && a.stack) return String(a.stack);
+    try { return JSON.stringify(a); } catch (_) { return String(a); }
+  }).join(' ');
+}
+const _log = console.log.bind(console);
+const _err = console.error.bind(console);
+const _warn = console.warn.bind(console);
+console.log = (...a) => { pushLogLine(`${new Date().toISOString()} ${formatLogArgs(a)}`); _log(...a); };
+console.error = (...a) => { pushLogLine(`${new Date().toISOString()} ${formatLogArgs(a)}`); _err(...a); };
+console.warn = (...a) => { pushLogLine(`${new Date().toISOString()} ${formatLogArgs(a)}`); _warn(...a); };
+
+function isHeadless() {
+  const v = String(process.env.HEADLESS || '').toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+function getLogRing() {
+  return logRing;
+}
+
 // ------------------------------------------------------------
 // Helpers - paths
 // ------------------------------------------------------------
 function getDataDir() {
+  try {
+    if (process.env.LINK_DATA_DIR) return path.resolve(process.env.LINK_DATA_DIR);
+  } catch (_) {}
   try {
     if (app && app.getPath) return path.join(app.getPath('userData'), 'link-no-whatsapp');
   } catch (_) {}
@@ -40,7 +78,29 @@ function loadJsonFile(filename, fallback) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return fallback; }
 }
 function loadZapsData() { return loadJsonFile('zaps.json', []); }
-function loadProvidersData() { return loadJsonFile('providers.json', []); }
+function loadProvidersData() {
+  const list = loadJsonFile('providers.json', []);
+  // Chaves podem vir do ambiente (secrets do GitHub Actions / env local)
+  // quando o providers.json chega sem chave nos preconfigs
+  try {
+    const envSpecs = [
+      { id: 'openrouter-preconfig', name: 'OpenRouter', env: process.env.OPENROUTER_API_KEY },
+      { id: 'googleai-preconfig', name: 'Google AI Studio', env: process.env.GOOGLE_AI_KEY }
+    ];
+    for (const spec of envSpecs) {
+      const key = spec.env && String(spec.env).trim();
+      if (!key) continue;
+      for (const p of list) {
+        if (!p || (p.id !== spec.id && String(p.name || '') !== spec.name)) continue;
+        const hasKey = (p.apiKey && String(p.apiKey).trim()) ||
+          (Array.isArray(p.apiKeys) && p.apiKeys.some(k => k && String(k).trim())) ||
+          (Array.isArray(p.keys) && p.keys.some(k => k && String(k).trim()));
+        if (!hasKey) p.apiKey = key;
+      }
+    }
+  } catch (_) {}
+  return list;
+}
 function loadTrainingsData() {
   return loadJsonFile('trainings.json', {});
 }
@@ -52,6 +112,38 @@ function resolveDataPath(rel) {
   // Windows case-insensitive check
   if (abs.toLowerCase().indexOf(base.toLowerCase()) !== 0) return null;
   return abs;
+}
+
+// ------------------------------------------------------------
+// Memoria: conversas finalizadas toda 00:00
+// ------------------------------------------------------------
+function initConversationStore() {
+  if (!conversationStore) {
+    conversationStore = new ConversationStore(getFilePath('conversations.json'));
+  }
+  if (aiResponder && typeof aiResponder.setHistoryStore === 'function') {
+    aiResponder.setHistoryStore(conversationStore);
+  }
+  try { conversationStore.rollOver(Date.now()); } catch (e) {
+    console.error('[CONV] rollOver inicial falhou:', e.message);
+  }
+  scheduleMidnightRollover();
+  return conversationStore;
+}
+
+let rolloverTimer = null;
+
+function scheduleMidnightRollover() {
+  if (rolloverTimer) return;
+  rolloverTimer = setInterval(() => {
+    try {
+      const changed = conversationStore ? conversationStore.rollOver(Date.now()) : false;
+      if (changed) console.log('[CONV] virada de dia as 00:00 - conversas finalizadas');
+    } catch (e) {
+      console.error('[CONV] rollOver das 00:00 falhou:', e.message);
+    }
+  }, 60 * 1000);
+  if (rolloverTimer && typeof rolloverTimer.unref === 'function') rolloverTimer.unref();
 }
 
 // ------------------------------------------------------------
@@ -163,6 +255,33 @@ async function clearTypingIndicator(zapId, chatId) {
   } catch (_) {}
 }
 
+// Espera o tempo que uma pessoa levaria digitando essa mensagem
+// (2,5 caracteres por segundo = 2s a cada 5 digitos, minimo 5s visivel).
+// Renova o indicador a cada 20s porque o WhatsApp expira "digitando" em ~25s.
+async function waitRealisticTyping(zapId, chatId, typingStart, text) {
+  const CARACTERES_POR_SEGUNDO = 5 / 2;
+  const chars = String(text || '').length;
+  const humanTypingMs = Math.round((chars / CARACTERES_POR_SEGUNDO) * 1000);
+  const targetTypingMs = Math.max(5000, humanTypingMs);
+  const typingElapsed = Date.now() - typingStart;
+  const remainingMs = targetTypingMs - typingElapsed;
+
+  sendLog(zapId, 'info',
+    `Digitacao realista: ${chars} caracteres = ~${(humanTypingMs / 1000).toFixed(1)}s de pessoa digitando; ` +
+    `indicador ligado ha ${(typingElapsed / 1000).toFixed(1)}s (alvo ${(targetTypingMs / 1000).toFixed(1)}s).`);
+
+  if (remainingMs > 0) {
+    sendLog(zapId, 'info', `Faltam ${(remainingMs / 1000).toFixed(1)}s com "digitando..." antes de enviar...`);
+    const deadline = Date.now() + remainingMs;
+    while (Date.now() < deadline) {
+      const left = deadline - Date.now();
+      await new Promise(resolve => setTimeout(resolve, Math.min(20000, left)));
+      // O WhatsApp expira o estado "digitando" em ~25s - renova ate o fim
+      if (Date.now() < deadline) await sendTypingIndicator(zapId, chatId, true);
+    }
+  }
+}
+
 // ------------------------------------------------------------
 // Audio transcription helper
 // ------------------------------------------------------------
@@ -269,6 +388,23 @@ async function processMessage(messageData) {
   const enabledTrainings = zapTrainings.filter(t => t && t.enabled !== false);
   sendLog(zapId, 'info', `Config: modelo=${zap.model || 'auto'}, personalidade=${zap.personality || 'padrao'}, treinos=${enabledTrainings.length}`);
 
+  let convResult = null;
+  if (conversationStore) {
+    try {
+      convResult = conversationStore.ensure(zapId, chatId, Date.now());
+      if (convResult.created) {
+        sendLog(zapId, 'info', `Nova conversa iniciada com ${contactName} (historico anterior: ${conversationStore.countFor(zapId, chatId) - 1} conversa(s))`);
+      }
+    } catch (e) {
+      sendLog(zapId, 'warning', `Memoria indisponivel: ${e.message}`);
+      convResult = null;
+    }
+  }
+  const conversationInfo = convResult ? {
+    label: new Date(convResult.conversation.startedAt).toTimeString().substring(0, 5),
+    count: convResult.conversation.messages.length
+  } : null;
+
   let finalBody = body;
 
   // Audio detectado mas download falhou (mesmo apos retries): em vez de
@@ -346,10 +482,14 @@ async function processMessage(messageData) {
   // ---- 1) SORTEIO DO TEMPO ANTES DE COMECAR A RESPONDER (15s, 25s ou 35s) ----
   // Simula uma pessoa lendo a mensagem / pensando na resposta. Nesse periodo
   // NADA aparece para o contato (sem "digitando").
-  const delayOptions = [15000, 25000, 35000];
-  const preDelay = delayOptions[Math.floor(Math.random() * delayOptions.length)];
-  sendLog(zapId, 'info', `Sorteio de tempo de resposta: ${(preDelay / 1000)}s antes de comecar a digitar...`);
-  await new Promise(resolve => setTimeout(resolve, preDelay));
+  if (zap.instantReply) {
+    sendLog(zapId, 'info', 'Resposta instantanea ativada - sorteio de tempo ignorado.');
+  } else {
+    const delayOptions = [15000, 25000, 35000];
+    const preDelay = delayOptions[Math.floor(Math.random() * delayOptions.length)];
+    sendLog(zapId, 'info', `Sorteio de tempo de resposta: ${(preDelay / 1000)}s antes de comecar a digitar...`);
+    await new Promise(resolve => setTimeout(resolve, preDelay));
+  }
 
   // ---- 2) INDICADOR "DIGITANDO" LIGA AQUI ----
   const typingStart = Date.now();
@@ -373,7 +513,8 @@ async function processMessage(messageData) {
       customPrompt: zap.customPrompt || '',
       provider: resolveProviderKey(entry.provider),
       model: entry.model,
-      trainings: enabledTrainings
+      trainings: enabledTrainings,
+      conversationInfo
     };
 
     try {
@@ -417,44 +558,48 @@ async function processMessage(messageData) {
   const media = resolveReplyMedia(response, finalBody, enabledTrainings, (type, msg) => sendLog(zapId, type, msg));
   const resolvedImages = media.images;
   const resolvedLinks = media.links;
-  const textToSend = media.text;
 
-  // ---- 3) TEMPO REALISTA DE DIGITACAO ----
-  // Pessoa comum: em media 2s para digitar 5 caracteres => 0,4s por caractere
-  // (2,5 caracteres por segundo). O indicador so desliga e a mensagem so sai
-  // quando esse tempo passar (minimo 5s de "digitando" visivel).
-  const CARACTERES_POR_SEGUNDO = 5 / 2;
-  const chars = String(textToSend || '').length;
-  const humanTypingMs = Math.round((chars / CARACTERES_POR_SEGUNDO) * 1000);
-  const minTypingMs = 5000;
-  const targetTypingMs = Math.max(minTypingMs, humanTypingMs);
-  const typingElapsed = Date.now() - typingStart;
-  const remainingMs = targetTypingMs - typingElapsed;
+  // ---- 3) MENSAGENS MULTIPLAS ----
+  // A IA separa com [QUEBRA] (ou, se nao marcou e o texto e grande, separamos
+  // por frases). Curto = 1 mensagem. No maximo 4 baloes.
+  const parts = (aiResponder && typeof aiResponder.splitMessages === 'function')
+    ? aiResponder.splitMessages(media.text)
+    : (String(media.text || '').trim() ? [String(media.text || '').trim()] : []);
 
-  sendLog(zapId, 'info',
-    `Digitacao realista: ${chars} caracteres = ~${(humanTypingMs / 1000).toFixed(1)}s de pessoa digitando; ` +
-    `indicador ligado ha ${(typingElapsed / 1000).toFixed(1)}s (alvo ${(targetTypingMs / 1000).toFixed(1)}s).`);
-
-  if (remainingMs > 0) {
-    sendLog(zapId, 'info', `Faltam ${(remainingMs / 1000).toFixed(1)}s com "digitando..." antes de enviar...`);
-    const deadline = Date.now() + remainingMs;
-    while (Date.now() < deadline) {
-      const left = deadline - Date.now();
-      await new Promise(resolve => setTimeout(resolve, Math.min(20000, left)));
-      // O WhatsApp expira o estado "digitando" em ~25s - renova ate o fim
-      if (Date.now() < deadline) await sendTypingIndicator(zapId, chatId, true);
-    }
+  if (aiResponder && typeof aiResponder.updateLastAssistant === 'function') {
+    const delivered = parts.length ? parts.join(' ') : (String(media.text || '').trim() || '(mensagem sem texto)');
+    try { aiResponder.updateLastAssistant(zapId, chatId, delivered); } catch (_) {}
   }
 
-  // ---- 4) DESLIGA O INDICADOR E ENVIA ----
-  await clearTypingIndicator(zapId, chatId);
+  if (parts.length > 1) {
+    sendLog(zapId, 'info', `Resposta separada em ${parts.length} mensagens (maximo 4).`);
+  }
 
-  if (textToSend) {
-    const preview = textToSend.substring(0, 80);
-    sendLog(zapId, 'outgoing', `Enviando: "${preview}..."`);
+  if (parts.length === 0) {
+    // Sobe imagem/link sem texto: garante que o "digitando" nao fica preso
+    await clearTypingIndicator(zapId, chatId);
+  }
+
+  // ---- 4) ENTREGA: DIGITACAO REALISTA ENTRE CADA MENSAGEM ----
+  for (let i = 0; i < parts.length; i++) {
+    const text = parts[i];
+
+    // 1a mensagem: o indicador ja esta ligado desde a geracao da IA (typingStart).
+    // Demais mensagens: religa agora - a pausa entre baloes e o tempo digitando.
+    const partTypingStart = i === 0 ? typingStart : Date.now();
+    if (i > 0) await sendTypingIndicator(zapId, chatId);
+
+    await waitRealisticTyping(zapId, chatId, partTypingStart, text);
+    await clearTypingIndicator(zapId, chatId);
+
+    const preview = text.substring(0, 80);
+    const label = parts.length > 1 ? `[${i + 1}/${parts.length}] ` : '';
+    sendLog(zapId, 'outgoing', `Enviando ${label}: "${preview}..."`);
     try {
-      await whatsappManager.sendMessage(String(zapId), chatId, textToSend);
-      sendLog(zapId, 'success', 'Mensagem enviada com sucesso!');
+      await whatsappManager.sendMessage(String(zapId), chatId, text);
+      sendLog(zapId, 'success', parts.length > 1
+        ? `Mensagem ${i + 1}/${parts.length} enviada!`
+        : 'Mensagem enviada com sucesso!');
     } catch (error) {
       sendLog(zapId, 'error', `ERRO ao enviar: ${error.message}`);
       throw error;
@@ -462,6 +607,7 @@ async function processMessage(messageData) {
   }
 
   // Send training images resolved from [SEND_IMAGE:id] (or intent fallback)
+  const sentImageLabels = [];
   for (const found of resolvedImages) {
     const imgId = found.id;
     const label = found.name || found.filename || imgId;
@@ -471,6 +617,7 @@ async function processMessage(messageData) {
         try {
           await whatsappManager.sendMedia(String(zapId), chatId, { data: found.data, mimeType: found.mimeType || 'image/jpeg', name: found.filename || `${imgId}.jpg` });
           sendLog(zapId, 'success', `Imagem enviada: ${label}`);
+          sentImageLabels.push(label);
         } catch (e) {
           sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
         }
@@ -488,6 +635,7 @@ async function processMessage(messageData) {
       const b64 = fs.readFileSync(abs).toString('base64');
       await whatsappManager.sendMedia(String(zapId), chatId, { data: b64, mimeType: found.mimeType || 'image/jpeg', name: found.filename || path.basename(abs) });
       sendLog(zapId, 'success', `Imagem enviada: ${label}`);
+      sentImageLabels.push(label);
     } catch (e) {
       sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
     }
@@ -497,7 +645,18 @@ async function processMessage(messageData) {
     sendLog(zapId, 'success', `Link(s) enviado(s): ${resolvedLinks.map(l => l.name || l.description || l.url).join(', ')}`);
   }
 
-  if (!textToSend && resolvedImages.length === 0 && resolvedLinks.length === 0) {
+  const sentNotes = [];
+  if (sentImageLabels.length) sentNotes.push(`imagem: ${sentImageLabels.join(', ')}`);
+  if (resolvedLinks.length) sentNotes.push(`link: ${resolvedLinks.map(l => l.name || l.description || l.url).join(', ')}`);
+  if (sentNotes.length && conversationStore) {
+    try {
+      conversationStore.append(zapId, chatId, 'assistant', `[enviou ${sentNotes.join(' | ')}]`);
+    } catch (e) {
+      console.error('[CONV] falha ao registrar midia no historico:', e.message);
+    }
+  }
+
+  if (parts.length === 0 && resolvedImages.length === 0 && resolvedLinks.length === 0) {
     sendLog(zapId, 'warning', 'Resposta vazia apos remocao de marcadores de imagem');
   }
 }
@@ -529,26 +688,491 @@ function createWindow() {
 }
 
 // ------------------------------------------------------------
+// Servidor HTTP de status/QR (headless / tunel SSH)
+// ------------------------------------------------------------
+function buildStatusState() {
+  const zaps = loadZapsData().map((z) => {
+    let st = { status: 'disconnected' };
+    try {
+      if (whatsappManager && whatsappManager.getStatus) st = whatsappManager.getStatus(String(z.id)) || st;
+    } catch (_) {}
+    return {
+      id: String(z.id),
+      name: z.name || '',
+      enabled: z.enabled !== false,
+      autoReply: !!z.autoReply,
+      status: st.status || 'disconnected',
+      qrPending: !!st.qrCode,
+      method: st.method || null
+    };
+  });
+  return {
+    ok: true,
+    headless: isHeadless(),
+    uptime: Math.floor(process.uptime()),
+    platform: process.platform,
+    dataDir: getDataDir(),
+    zaps
+  };
+}
+
+let statusServer = null;
+
+function startStatusServer() {
+  if (statusServer) return statusServer;
+  const headless = isHeadless();
+  const portEnv = process.env.LINK_HTTP_PORT;
+  if (!headless && !portEnv) return null;
+  const port = Number(portEnv) || 8123;
+  const host = process.env.LINK_HTTP_HOST || '127.0.0.1';
+  const token = process.env.LINK_HTTP_TOKEN || '';
+  try {
+    const { createStatusServer } = require('./src/js/status-server');
+    statusServer = createStatusServer({
+      host,
+      port,
+      token,
+      getState: buildStatusState,
+      getQr: (zapId) => {
+        if (whatsappManager && whatsappManager.getQrString) return whatsappManager.getQrString(zapId);
+        return null;
+      },
+      getLogs: () => logRing,
+      onConnect: (zapId, opts) => {
+        const zap = loadZapsData().find((z) => String(z.id) === String(zapId));
+        if (!zap) return { status: 404, ok: false, error: 'zap nao configurado (nao consta no zaps.json)' };
+        if (!whatsappManager) return { status: 503, ok: false, error: 'gerenciador do WhatsApp indisponivel' };
+        const method = opts && opts.method === 'pairing' ? 'pairing' : 'qrcode';
+        const phone = opts && opts.phone ? opts.phone : '';
+        if (method === 'pairing' && !phone) return { status: 400, ok: false, error: 'metodo pairing exige o campo "phone"' };
+        Promise.resolve(whatsappManager.connectZap(String(zapId), phone, method))
+          .catch((e) => console.error(`[HTTP] connectZap(${zapId}) falhou: ${e.message}`));
+        return { status: 202, ok: true, message: 'conexao solicitada - acompanhe o status da pagina' };
+      },
+      onDisconnect: async (zapId) => {
+        if (!whatsappManager) return { status: 503, ok: false, error: 'gerenciador do WhatsApp indisponivel' };
+        await whatsappManager.disconnectZap(String(zapId));
+        return { status: 200, ok: true };
+      }
+    });
+    statusServer.on('error', (e) => {
+      console.error(`[HTTP] Servidor de status em ${host}:${port} falhou: ${e.message}`);
+      statusServer = null;
+    });
+    statusServer.listen(port, host, () => {
+      const addr = statusServer.address();
+      const shownPort = addr && addr.port ? addr.port : port;
+      console.log(`[HTTP] Servidor de status em http://${host}:${shownPort}${token ? ' (com token)' : ''}`);
+    });
+  } catch (e) {
+    console.error('[HTTP] Falha ao iniciar servidor de status:', e.message);
+    statusServer = null;
+  }
+  return statusServer;
+}
+
+function getStatusServer() {
+  return statusServer;
+}
+
+function autoConnectSavedSessions(staggerMs = 2000) {
+  if (!whatsappManager || typeof whatsappManager.connectZap !== 'function') return 0;
+  let count = 0;
+  loadZapsData().forEach((z, i) => {
+    const zapId = String(z.id);
+    const sessionDir = path.join(getDataDir(), 'sessions', zapId);
+    if (!fs.existsSync(sessionDir)) return;
+    count++;
+    setTimeout(() => {
+      console.log(`[AUTO] Reconectando zap ${zapId} (${z.name || ''}) com sessao salva...`);
+      Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
+        .catch((e) => console.error(`[AUTO] Falha ao reconectar ${zapId}: ${e.message}`));
+    }, i * staggerMs);
+  });
+  if (!count) console.log('[AUTO] Nenhuma sessao salva para reconectar.');
+  else console.log(`[AUTO] ${count} zap(s) com sessao salva marcado(s) para reconexao automatica.`);
+  return count;
+}
+
+// Pareamento automatico no boot (GitHub Actions / servidor): com
+// LINK_AUTO_PAIR=1, zaps SEM sessao salva e com telefone no zaps.json
+// recebem connectZap(pairing) sem interface grafica. O codigo e gravado em
+// $LINK_CODE_FILE pelo whatsapp-manager e o monitor envia ao repo de dados.
+function autoPairMissingSessions() {
+  try {
+    const flag = String(process.env.LINK_AUTO_PAIR || '').toLowerCase();
+    if (flag !== '1' && flag !== 'true' && flag !== 'yes') return 0;
+  } catch (_) { return 0; }
+  if (!whatsappManager || typeof whatsappManager.connectZap !== 'function') return 0;
+  let count = 0;
+  loadZapsData().forEach((z, i) => {
+    const zapId = String(z.id);
+    const phone = String(z.phone || '').replace(/\D/g, '');
+    if (!phone) return;
+    const sessionDir = path.join(getDataDir(), 'sessions', zapId);
+    if (fs.existsSync(sessionDir)) return;
+    count++;
+    setTimeout(() => {
+      console.log(`[AUTO-PAIR] Zap ${zapId} sem sessao salva - gerando codigo de pareamento...`);
+      Promise.resolve(whatsappManager.connectZap(zapId, phone, 'pairing'))
+        .catch((e) => console.error(`[AUTO-PAIR] Falha no pareamento do zap ${zapId}: ${e.message}`));
+    }, 5000 + i * 3000);
+  });
+  if (count) console.log(`[AUTO-PAIR] ${count} zap(s) aguardando pareamento (codigo em $LINK_CODE_FILE).`);
+  else console.log('[AUTO-PAIR] Nenhum zap precisa de pareamento agora.');
+  return count;
+}
+
+// ------------------------------------------------------------
+// Mensagem Automatica - agente de campanha (ChatBox)
+// ------------------------------------------------------------
+async function deleteSentMessage(zapId, msgId) {
+  if (!msgId) throw new Error('mensagem sem identificador registrado');
+  const clientData = whatsappManager && whatsappManager.clients.get(String(zapId));
+  if (!clientData || !clientData.client || clientData.status !== 'ready') {
+    throw new Error('zap desconectado');
+  }
+  const msg = await clientData.client.getMessageById(msgId);
+  if (!msg) throw new Error('mensagem nao encontrada no historico');
+  try {
+    await msg.delete(true);
+    return 'everyone';
+  } catch (e) {
+    // Janela de "apagar para todos" expirou (ou nao permitido): apaga so pra voce
+    await msg.delete(false);
+    return 'mine';
+  }
+}
+
+function parseAgentJson(text) {
+  const t0 = String(text || '').trim();
+  if (!t0) return null;
+  let t = t0;
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  const start = t.indexOf('{');
+  const end = t.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  try {
+    const obj = JSON.parse(t.slice(start, end + 1));
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) return obj;
+  } catch (_) {}
+  return null;
+}
+
+function buildAutoMsgPrompt(zap, attachments) {
+  const s = autoMessage.state;
+  const recipients = Object.keys(s.recipients);
+  const pending = s.queue.filter(q => q.status === 'pending' || q.status === 'sending');
+  const sentCount = s.queue.filter(q => q.status === 'sent').length;
+  const failed = s.queue.filter(q => q.status === 'failed').length;
+
+  const fmtNums = (list, max) => list.slice(0, max).map(n => '+' + n).join(', ') +
+    (list.length > max ? ` (+${list.length - max})` : '');
+
+  const attachmentsInfo = (attachments || []).length
+    ? (attachments || []).map(a => `- ${a.name} (${a.mimeType || 'arquivo'}, ${(String(a.data || '').length * 0.75 / 1024).toFixed(0)} KB)`).join('\n')
+    : '(nenhum anexo nesta mensagem)';
+
+  return `Voce e o operador de uma campanha de mensagens de WhatsApp dentro de um app. O usuario conversa com voce por aqui (ChatBox) e da ordens: para quem enviar, o que enviar, quando apagar, etc. Voce tem UMA funcao so: disparar mensagens de WhatsApp conforme o pedido.
+
+O HISTORICO da conversa esta nas mensagens abaixo - use-o para lembrar do que ja foi feito, o que o usuario ja pediu e o que deu certo.
+
+SEMPRE responda com UM unico objeto JSON, sem texto antes ou depois:
+{
+  "reply": "resposta imediata ao usuario, curta (ex: 'Ok, vou enviar agora' ou a resposta a uma pergunta)",  "actions": [
+    { "type": "send", "numbers": ["5532999999999"], "text": "texto exato da mensagem", "repeat": 1, "files": [] },
+    { "type": "delete", "numbers": ["5532999999999"] },
+    { "type": "add", "numbers": ["5532999999999"] }
+  ],
+  "followup": "mensagem enviada DEPOIS das acoes executadas, citando o resultado (ex: 'Acabei de enviar a mensagem para +5532999999999, mais alguma coisa?')"
+}
+
+REGRAS:
+- "reply": e o que voce diz ANTES de agir (entendimento/confirmacao/resposta). Sempre preencha.
+- "followup": descreva o resultado das acoes (exclusoes, numeros registrados, fila). Para ENVIOS o SISTEMA mostra o resultado real ao usuario automaticamente - NUNCA prometa "ja enviei" antes de saber; prefira "Coloquei na fila". Quando "actions" for [], omita.
+- "send": use somente quando o usuario pedir para enviar/disparar/mandar mensagens.
+  - "numbers": lista de numeros normalizados com DDI (Brasil = 55 + DDD + numero), ou "all" para TODOS os numeros da agenda.
+  - "text": a mensagem exata que deve ser enviada (use o texto do usuario; reescreva somente se ele pedir).
+  - "repeat": quantas vezes enviar para cada numero (2 = "envie duas vezes"). Padrao 1.
+  - "files": nomes dos anexos DESTA mensagem que devem ir junto. [] = nenhum.
+- Identifique no texto do usuario o que e NUMERO DE TELEFONE e o que e MENSAGEM a enviar, e monte as acoes conforme.
+- "delete": use quando o usuario pedir para apagar alguma mensagem ja enviada.
+- "add": apenas registrar um numero na agenda sem enviar nada.
+- NUNCA invente numeros: use apenas numeros que o usuario informou ou que estao na agenda.
+- Se o usuario so conversar (pergunta, duvida, feedback), responda com "reply" e "actions": [].
+- O intervalo de 5 minutos entre contatos e automatico - nao e um problema, so informe quando perguntarem.
+- Arquivos/anexos: decida conforme o pedido do usuario:
+  (a) "use a imagem como exemplo" => use como referencia e escreva o texto; "files": [].
+  (b) "envie junto com a mensagem" => "files": [nome do arquivo].
+  (c) "envie so para o numero X" => "files": [nome] e "numbers": [numero].
+
+CONTEXTO DA CAMPANHA AGORA:
+- Conta WhatsApp usada para disparar: ${zap ? (zap.name || '') : ''} (id ${autoMessage.state.zapId || 'nenhum'})
+- Status da campanha: ${s.status}
+- Agenda de numeros (${recipients.length}): ${recipients.length ? fmtNums(recipients, 40) : '(vazia)'}
+- Fila: ${pending.length} pendente(s), ${sentCount} enviada(s), ${failed} falha(s)
+- Proximos pendentes: ${pending.length ? fmtNums(pending.map(p => p.phone), 15) : '(nenhum)'}
+
+ANEXOS DESTA MENSAGEM DO USUARIO:
+${attachmentsInfo}`;
+
+}
+
+async function autoMsgChat(payload) {
+  payload = payload || {};
+  const zapId = String(payload.zapId || '');
+  const text = String(payload.text || '').trim();
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+
+  if (!autoMessage) throw new Error('Mensagem automatica indisponivel');
+  if (!zapId) throw new Error('Selecione uma conta WhatsApp antes de conversar');
+  if (!text && attachments.length === 0) throw new Error('Escreva uma mensagem para a IA');
+
+  const zapsData = loadZapsData();
+  const providersData = loadProvidersData();
+  const zap = zapsData.find(z => String(z.id) === String(zapId));
+  if (!zap) throw new Error('Conta WhatsApp nao encontrada');
+
+  if (!autoMessage.setZap(zapId)) {
+    throw new Error('Ha uma campanha pendente para outra conta. Pare a campanha antes de trocar de Zap.');
+  }
+
+  const mentioned = autoMessage.extractNumbers(text);
+  const added = mentioned.filter(n => autoMessage.addRecipient(n));
+  if (added.length) {
+    autoMessage.addLog('info', `Numeros adicionados a agenda: ${added.map(n => '+' + n).join(', ')}`);
+  }
+
+  autoMessage.pushChat('user', text + (attachments.length ? `\n[anexos: ${attachments.map(a => a.name).join(', ')}]` : ''));
+  autoMessage.addLog('info', `Pedido no ChatBox: "${text.substring(0, 140)}${text.length > 140 ? '...' : ''}"`);
+
+  const systemPrompt = buildAutoMsgPrompt(zap, attachments);
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...autoMessage.historyTurns(zapId),
+    { role: 'user', content: text || `(o usuario enviou ${attachments.length} arquivo(s): ${attachments.map(a => a.name).join(', ')})` }
+  ];
+
+  const modelsToTry = aiResponder && typeof aiResponder.getModelsToTry === 'function'
+    ? aiResponder.getModelsToTry(zap, providersData)
+    : [];
+
+  if (!modelsToTry.length) {
+    const reply = 'Nenhum provedor de IA configurado. Configure em Provedores antes de usar a Mensagem Automatica.';
+    autoMessage.addLog('error', reply);
+    autoMessage.pushChat('agent', reply);
+    autoMessage.save();
+    autoMessage.emitUpdate();
+    return { ok: false, reply, actions: [] };
+  }
+
+  let parsed = null;
+  let raw = null;
+  let lastErr = null;
+
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const entry = modelsToTry[i];
+    if (!entry.provider || !entry.provider.apiKey) continue;
+    try {
+      autoMessage.addLog('ai', `[${i + 1}/${modelsToTry.length}] Consultando ${entry.provider.name} / ${entry.model.id}...`);
+      const r = await aiResponder.callAI(entry.provider, entry.model, messages);
+      const txt = typeof r === 'string' ? r.trim() : '';
+      if (!txt) { lastErr = 'resposta vazia'; continue; }
+      if (typeof aiResponder.isJunkResponse === 'function' && aiResponder.isJunkResponse(txt)) {
+        lastErr = 'resposta invalida (texto de sistema)';
+        continue;
+      }
+      parsed = parseAgentJson(txt);
+      if (parsed) { raw = txt; break; }
+
+      // Uma unica tentativa pedindo so o JSON
+      const retryMsgs = messages.concat([
+        { role: 'assistant', content: txt },
+        { role: 'user', content: 'Responda SOMENTE com o objeto JSON valido, com "reply", "actions" e (se houver acoes) "followup". Nada fora do JSON.' }
+      ]);
+      const r2 = await aiResponder.callAI(entry.provider, entry.model, retryMsgs);
+      const txt2 = typeof r2 === 'string' ? r2.trim() : '';
+      parsed = parseAgentJson(txt2);
+      if (parsed) { raw = txt2; break; }
+      lastErr = 'modelo nao retornou JSON valido';
+    } catch (e) {
+      lastErr = e.message;
+      autoMessage.addLog('warning', `${entry.provider.name} / ${entry.model.id} falhou: ${e.message}`);
+    }
+  }
+
+  let reply = '';
+  let actions = [];
+  let followup = '';
+  if (parsed) {
+    reply = String(parsed.reply || '').trim();
+    actions = Array.isArray(parsed.actions) ? parsed.actions : [];
+    followup = String(parsed.followup || '').trim();
+    if (!reply) reply = 'Pedido entendido.';
+  } else {
+    autoMessage.addLog('warning', `IA nao respondeu em JSON valido (${lastErr || 'desconhecido'}) - pedido NAO executado`);
+    reply = (raw || '').trim() || 'Nao consegui processar seu pedido. Pode reformular?';
+  }
+
+  autoMessage.addLog('ai', `IA: ${previewText(reply)}`);
+  autoMessage.pushChat('agent', reply);
+  autoMessage.save();
+  autoMessage.emitUpdate();
+
+  const countsBefore = autoMessage.getState().counts;
+  const result = await autoMessage.runActions(actions, attachments);
+  if (result.scheduled > 0) {
+    autoMessage.addLog('info', `Acoes: ${result.notes.join(' | ')} - proximo envio em 5:00`);
+    // espera o primeiro envio concluir para o followup refletir o resultado real
+    await autoMessage.waitForFirstOutcome(15000);
+  } else if (actions.length) {
+    autoMessage.addLog('info', `Acoes: ${result.notes.join(' | ')}`);
+  }
+  autoMessage.save();
+  autoMessage.emitUpdate();
+
+  if (actions.length) {
+    const after = autoMessage.getState().counts;
+    const sentDelta = Math.max(0, (after.sent || 0) - (countsBefore.sent || 0));
+    const failedDelta = Math.max(0, (after.failed || 0) - (countsBefore.failed || 0));
+    // O resultado REAL manda: a IA nao pode prometer "enviei" sem ter enviado
+    if (failedDelta && !sentDelta) {
+      followup = `Tentei enviar mas ${failedDelta} mensagem(ns) falharam (detalhes no historico). Quer que eu tente de novo?`;
+    } else if (sentDelta && failedDelta) {
+      followup = `Acabei de enviar ${sentDelta} mensagem(ns), com ${failedDelta} falha(s). Mais alguma coisa?`;
+    } else if (sentDelta) {
+      followup = `Acabei de enviar ${sentDelta === 1 ? 'a mensagem' : sentDelta + ' mensagens'}. Mais alguma coisa?`;
+    } else if (result.scheduled > 0) {
+      followup = `Coloquei ${result.scheduled} mensagem(ns) na fila com intervalo de 5 minutos - o primeiro resultado aparece aqui em instantes.`;
+    } else if (!followup) {
+      followup = autoMsgFollowup(result, countsBefore, after);
+    }
+    if (followup) {
+      autoMessage.pushChat('agent', followup);
+      autoMessage.save();
+      autoMessage.emitUpdate();
+    }
+  }
+
+  return { ok: true, reply, followup, actions: result, raw: parsed ? null : raw };
+}
+
+// Followup automatico quando a IA nao informou o resultado
+function autoMsgFollowup(result, before, after) {
+  const sent = Math.max(0, (after && after.sent || 0) - (before && before.sent || 0));
+  const failed = Math.max(0, (after && after.failed || 0) - (before && before.failed || 0));
+  if (failed && !sent) return `Tentei enviar mas ${failed} mensagem(ns) falharam. Quer que eu tente de novo?`;
+  if (sent && failed) return `Acabei de enviar ${sent} mensagem(ns), com ${failed} falha(s). Mais alguma coisa?`;
+  if (sent) return `Acabei de enviar ${sent === 1 ? 'a mensagem' : sent + ' mensagens'}. Mais alguma coisa?`;
+  if (result && result.scheduled > 0) return `Deixei ${result.scheduled} mensagem(ns) na fila com intervalo de 5 minutos. Mais alguma coisa?`;
+  return 'Pedido executado. Mais alguma coisa?';
+}
+
+function previewText(text) {
+  const t = String(text || '');
+  return t.length > 160 ? t.substring(0, 160) + '...' : t;
+}
+
+function initAutoMessage() {
+  autoMessage = new AutoMessageManager();
+  autoMessage.configure({
+    filePath: getFilePath('auto-msg-state.json'),
+    getStatus: (zapId) => {
+      try { return whatsappManager.getStatus(String(zapId)); } catch (_) { return { status: 'disconnected' }; }
+    },
+    sendMessage: (zapId, phone, txt) => whatsappManager.sendMessage(String(zapId), phone, txt),
+    sendMedia: (zapId, phone, media) => whatsappManager.sendMedia(String(zapId), phone, media),
+    deleteMessage: deleteSentMessage,
+    getContactName: (zapId, phone) => {
+      try { return whatsappManager.getContactName(String(zapId), String(phone)); } catch (_) { return ''; }
+    },
+    onLog: (entry) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('auto-msg-log', entry);
+    },
+    onUpdate: () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('auto-msg-update', autoMessage.getState());
+    },
+    logger: console.log
+  });
+  autoMessage.load();
+  const resumed = autoMessage.resumeOnBoot();
+  if (resumed) ensureCampaignZapConnected();
+  return autoMessage;
+}
+
+// Reconnecta a conta da campanha se ela caiu junto com o app
+function ensureCampaignZapConnected() {
+  if (!autoMessage || !whatsappManager) return;
+  const zapId = autoMessage.state.zapId;
+  if (!zapId) return;
+  try {
+    const st = (whatsappManager.getStatus(zapId) || {}).status;
+    if (st === 'ready' || st === 'connecting' || st === 'waiting_qr' || st === 'waiting_pairing') return;
+    const sessionDir = path.join(getDataDir(), 'sessions', zapId);
+    if (!fs.existsSync(sessionDir)) {
+      autoMessage.addLog('warning', `Sem sessao salva para a conta ${zapId} - conecte manualmente para a campanha continuar`);
+      autoMessage.emitUpdate();
+      return;
+    }
+    autoMessage.addLog('info', `Reconectando a conta ${zapId} para continuar a campanha...`);
+    Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
+      .catch((e) => console.error(`[AUTOMSG] Falha ao reconectar conta da campanha ${zapId}: ${e.message}`));
+  } catch (e) {
+    console.error('[AUTOMSG] ensureCampaignZapConnected falhou:', e.message);
+  }
+}
+
+// ------------------------------------------------------------
 // App lifecycle
 // ------------------------------------------------------------
 app.whenReady().then(() => {
   ensureDataDir();
-  createWindow();
+  if (!isHeadless()) createWindow();
   whatsappManager = new WhatsAppManager(mainWindow);
   aiResponder = new AIResponder();
+  initConversationStore();
+  appAgent = new AppAgent({
+    aiResponder,
+    getProviders: loadProvidersData,
+    resolveProviderKey,
+    loadZaps: loadZapsData,
+    saveZaps: (zaps) => {
+      ensureDataDir();
+      const p = getFilePath('zaps.json');
+      const tmp = p + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(zaps, null, 2));
+      fs.renameSync(tmp, p);
+    },
+    loadTrainings: loadTrainingsData,
+    saveTrainings: (data) => {
+      ensureDataDir();
+      fs.writeFileSync(getFilePath('trainings.json'), JSON.stringify(data, null, 2));
+    },
+    getConversationStore: () => conversationStore || initConversationStore(),
+    whatsapp: whatsappManager,
+    log: (type, msg) => console.log(`[AGENTE][${type}] ${msg}`)
+  });
+  try { initAutoMessage(); } catch (e) { console.error('[AUTOMSG] Falha ao iniciar mensagem automatica:', e.message); }
   whatsappManager.setOnMessageCallback(async (messageData) => {
     try { await handleIncomingMessage(messageData); } catch (e) { console.error('handleIncomingMessage erro:', e); }
   });
+  startStatusServer();
+  if (isHeadless()) autoConnectSavedSessions();
+  if (isHeadless()) autoPairMissingSessions();
 });
 
 app.on('window-all-closed', async () => {
+  if (isHeadless()) return;
   if (whatsappManager) { try { await whatsappManager.disconnectAll(); } catch (_) {} }
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('activate', () => {
+  if (isHeadless()) return;
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 app.on('before-quit', async () => {
+  if (conversationStore) { try { conversationStore.flush(); } catch (_) {} }
   if (whatsappManager) { try { await whatsappManager.disconnectAll(); } catch (_) {} }
 });
 
@@ -591,6 +1215,50 @@ ipcMain.handle('whatsapp-status', (e, zapId) => whatsappManager.getStatus(String
 ipcMain.handle('whatsapp-send', (e, zapId, phone, text) => whatsappManager.sendMessage(String(zapId), phone, text));
 ipcMain.handle('whatsapp-conversations', (e, zapId) => whatsappManager.getConversations(String(zapId)));
 ipcMain.handle('whatsapp-messages', (e, zapId, chatId) => whatsappManager.getMessages(String(zapId), chatId));
+ipcMain.handle('whatsapp-send-media', (e, zapId, phone, media) => whatsappManager.sendMedia(String(zapId), phone, media || {}));
+
+// ------------------------------------------------------------
+// IPC - Mensagem Automatica
+// ------------------------------------------------------------
+ipcMain.handle('auto-msg-state', () => (autoMessage ? autoMessage.getState() : null));
+ipcMain.handle('auto-msg-chat', (e, payload) => autoMsgChat(payload));
+ipcMain.handle('auto-msg-stop', () => {
+  if (autoMessage) autoMessage.stop();
+  return autoMessage ? autoMessage.getState() : null;
+});
+// Linha de sistema no historico (ex: resposta recebida de um contato)
+ipcMain.handle('auto-msg-note', (e, payload) => {
+  payload = payload || {};
+  if (autoMessage && payload.text && payload.zapId) {
+    autoMessage.pushSystem(String(payload.text).substring(0, 300), String(payload.zapId));
+    autoMessage.save();
+    autoMessage.emitUpdate();
+  }
+  return autoMessage ? autoMessage.getState() : null;
+});
+ipcMain.handle('auto-msg-transcribe', async (e, audio, zapId) => {
+  const providersData = loadProvidersData();
+  const zid = String(zapId || '');
+  const zap = loadZapsData().find(z => String(z.id) === zid);
+  return await transcribeAudio(audio, providersData, zid, zap ? zap.apiKeySelections : null);
+});
+
+// ------------------------------------------------------------
+// IPC - Agente IA do Dashboard (controla o app)
+// ------------------------------------------------------------
+ipcMain.handle('agent-chat', async (e, payload) => {
+  if (!appAgent) return { reply: 'Agente ainda nao inicializado. Reinicie o app.', steps: [] };
+  try {
+    return await appAgent.run(payload || {});
+  } catch (err) {
+    console.error('[AGENTE] erro:', err && err.stack ? err.stack : err);
+    return {
+      reply: 'Tive um problema para processar: ' + (err && err.message ? err.message : String(err)),
+      steps: [],
+      error: true
+    };
+  }
+});
 
 // ------------------------------------------------------------
 // IPC - Data persistence
@@ -711,3 +1379,16 @@ ipcMain.handle('delete-trainings-for-zap', (e, zapId) => {
   fs.writeFileSync(getFilePath('trainings.json'), JSON.stringify(all, null, 2));
   return true;
 });
+
+module.exports = {
+  getDataDir,
+  getFilePath,
+  ensureDataDir,
+  isHeadless,
+  buildStatusState,
+  startStatusServer,
+  getStatusServer,
+  getLogRing,
+  autoConnectSavedSessions,
+  getAutoMessage: () => autoMessage
+};

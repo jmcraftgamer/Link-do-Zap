@@ -1,0 +1,9 @@
+node_modules
+.git
+*.log
+.wwebjs_cache
+.wwebjs_auth
+data
+heartbeat.txt
+.github
+DEPLOY_*.md

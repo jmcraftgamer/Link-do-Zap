@@ -1,4 +1,4 @@
-/* ============================================
+﻿/* ============================================
    Link no WhatsApp - Styles
    ============================================ */
 
@@ -1069,7 +1069,7 @@ input, textarea, select {
 
 /* Charts */
 .chart-box {
-  background: #0B0B0B;
+  background: #000000;
   border: none;
   border-radius: 12px;
   padding: 16px;
@@ -3791,4 +3791,734 @@ input, textarea, select {
   font-size: 13px;
   text-align: center;
   padding: 40px 0;
+}
+
+
+/* ============================================
+   Mensagem Automatica - somente ChatBox
+   ============================================ */
+.auto-msg-page.active {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - var(--topbar-height) - 72px);
+  min-height: 400px;
+}
+
+/* Historico da conversa */
+.am-history {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 14px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-bottom: none;
+  border-radius: 12px 12px 0 0;
+}
+
+.am-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--text-gray);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.am-empty strong {
+  color: var(--text-secondary);
+}
+
+/* Bolhas */
+.am-msg {
+  max-width: 72%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.am-msg.user {
+  align-self: flex-end;
+  background: #D9FDD3;
+  border-bottom-right-radius: 4px;
+}
+
+.am-msg.agent {
+  align-self: flex-start;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-bottom-left-radius: 4px;
+}
+
+.am-msg.system {
+  align-self: center;
+  max-width: 90%;
+  background: var(--bg-primary);
+  border: 1px dashed var(--border-color);
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+  padding: 5px 12px;
+  border-radius: 8px;
+}
+
+.am-msg.pending {
+  opacity: 0.6;
+}
+
+.am-msg-time {
+  display: block;
+  font-size: 10px;
+  color: var(--text-gray);
+  text-align: right;
+  margin-top: 4px;
+}
+
+.am-msg.system .am-msg-time {
+  text-align: center;
+  opacity: 0.7;
+}
+
+/* Anexos selecionados */
+.am-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-primary);
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+}
+
+.am-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 12px;
+  max-width: 220px;
+}
+
+.am-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.am-chip-remove {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-gray);
+  padding: 0 2px;
+}
+
+/* Barra do ChatBox */
+.am-compose {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 0 0 12px 12px;
+}
+
+.am-icon-btn {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.am-icon-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.am-icon-btn.recording {
+  background: #E53935;
+  color: #fff;
+  border-color: #E53935;
+  animation: am-pulse 1s infinite;
+}
+
+/* Botoes rotulados (Ditar / Enviar) - retangulos na barra do ChatBox */
+.am-text-btn {
+  flex: none;
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-family);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.am-text-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.am-text-btn.recording {
+  background: #E53935;
+  color: #fff;
+  border-color: #E53935;
+  animation: am-pulse 1s infinite;
+}
+
+@keyframes am-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229, 57, 53, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(229, 57, 53, 0); }
+}
+
+.am-connect {
+  flex: none;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 18px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-family);
+  cursor: pointer;
+}
+
+.am-connect:hover {
+  background: var(--bg-secondary);
+}
+
+.am-connect.connected {
+  color: #1B8E3E;
+  border-color: rgba(27, 142, 62, 0.4);
+  background: rgba(27, 142, 62, 0.08);
+}
+
+.am-caret {
+  flex: none;
+  width: 26px;
+  height: 36px;
+  border: 0;
+  background: none;
+  color: var(--text-gray);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 8px;
+}
+
+.am-caret:hover,
+.am-caret.open {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.am-input {
+  flex: 1;
+  min-height: 36px;
+  max-height: 140px;
+  resize: none;
+  border: 1px solid var(--border-color);
+  border-radius: 18px;
+  padding: 8px 14px;
+  font-size: 14px;
+  font-family: var(--font-family);
+  outline: none;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.am-input:focus {
+  background: var(--bg-primary);
+  border-color: #cfcfcf;
+}
+
+.am-send-btn {
+  flex: none;
+  height: 36px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--text-primary);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--font-family);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.am-send-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.am-send-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Painel de contas (abre no >) */
+.am-accounts {
+  position: absolute;
+  left: 10px;
+  bottom: calc(100% + 8px);
+  width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  padding: 8px;
+  z-index: 60;
+}
+
+.am-accounts-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-gray);
+  padding: 4px 8px 6px;
+}
+
+.am-accounts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.am-account-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+  font-family: var(--font-family);
+  color: var(--text-primary);
+}
+
+.am-account-row:hover {
+  background: var(--bg-secondary);
+}
+
+.am-account-row.active {
+  background: var(--bg-secondary);
+  font-weight: 600;
+}
+
+.am-account-row .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #BDBDBD;
+  flex: none;
+}
+
+.am-account-row.online .dot {
+  background: #1B8E3E;
+}
+
+.am-account-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.am-account-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.am-account-phone {
+  color: var(--text-gray);
+  font-size: 11px;
+}
+
+.am-accounts-add {
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px dashed var(--border-color);
+  border-radius: 8px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-family: var(--font-family);
+  cursor: pointer;
+}
+
+.am-accounts-add:hover {
+  background: var(--bg-secondary);
+}
+
+.am-campaign {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--border-light);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.am-campaign-text {
+  flex: 1;
+}
+
+.am-campaign-stop {
+  border: 1px solid #E53935;
+  background: none;
+  color: #E53935;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font-family);
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.am-campaign-stop:hover {
+  background: #E53935;
+  color: #fff;
+}
+
+.am-history::-webkit-scrollbar {
+  width: 8px;
+}
+
+.am-history::-webkit-scrollbar-thumb {
+  background: #d0d0d0;
+  border-radius: 4px;
+}
+
+/* Editar nome do Zap (lapis) */
+.panel-edit-name {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: none;
+  color: var(--text-gray);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+}
+
+.panel-edit-name:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.zap-name-edit-input {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  font-family: var(--font-family);
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 2px 10px;
+  outline: none;
+  min-width: 200px;
+  max-width: 360px;
+}
+
+.zap-name-edit-input:focus {
+  border-color: var(--text-primary);
+}
+
+.am-account-edit {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: none;
+  color: var(--text-gray);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+}
+
+.am-account-edit:hover {
+  background: var(--border-light);
+  color: var(--text-primary);
+}
+
+.am-account-info .zap-name-edit-input {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  min-width: 0;
+  width: 100%;
+  padding: 2px 6px;
+}
+
+/* Resposta instantanea (opcao do Zap) */
+.panel-instant-toggle {
+  margin-bottom: 4px;
+}
+
+.panel-instant-hint {
+  margin-top: 6px;
+}
+
+/* Sidebar - itens do rodape (Configuracoes / Ajuda) */
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 10px 14px;
+  gap: 1px;
+  flex: none;
+}
+
+/* Dashboard - ChatBox central */
+#page-dashboard.active {
+  display: block;
+}
+
+.dash-chat {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 100%);
+  height: calc(100vh - 72px);
+  margin: 0 auto;
+  background: #F6F6F6;
+  border-radius: 18px;
+  padding: 24px 26px 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.07);
+}
+
+.dash-chat-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  padding: 2px 4px 14px;
+  flex: none;
+}
+
+.dash-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  background: transparent;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dash-chat-bar {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.dash-chat-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  resize: none;
+  font-family: var(--font-family);
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  padding: 8px 4px;
+  max-height: 132px;
+}
+
+.dash-chat-input::placeholder {
+  color: var(--text-gray);
+}
+
+.dash-chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.dash-chat-btn {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border: none;
+  background: transparent;
+  color: var(--text-gray);
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.dash-chat-btn:hover {
+  background: rgba(0, 0, 0, 0.07);
+  color: var(--text-primary);
+}
+
+.dash-chat-send {
+  background: var(--text-primary);
+  color: #FFFFFF;
+}
+
+.dash-chat-send:hover {
+  background: #000000;
+  color: #FFFFFF;
+}
+
+/* Dashboard - Agente IA (bolhas, digitando, mencao @) */
+.dash-chat {
+  position: relative;
+}
+
+.dash-msg {
+  max-width: 78%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 14.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  align-self: flex-start;
+}
+
+.dash-msg-user {
+  align-self: flex-end;
+  background: #111111;
+  color: #FFFFFF;
+  border-bottom-right-radius: 4px;
+}
+
+.dash-msg-agent {
+  align-self: flex-start;
+  background: #FFFFFF;
+  color: var(--text-primary);
+  border-bottom-left-radius: 4px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.dash-msg-tool {
+  align-self: center;
+  font-size: 11.5px;
+  color: var(--text-gray);
+  padding: 2px 0;
+}
+
+.dash-typing {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  padding: 13px 16px;
+}
+
+.dash-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #B8B8B8;
+  animation: dashBlink 1.2s infinite;
+}
+
+.dash-dot:nth-child(2) { animation-delay: 0.2s; }
+.dash-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dashBlink {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-3px); }
+}
+
+.dash-chat-btn.recording {
+  background: #E53935;
+  color: #FFFFFF;
+}
+
+.dash-chat-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.dash-chat-input:disabled {
+  opacity: 0.5;
+}
+
+.dash-mention-dd {
+  position: absolute;
+  left: 26px;
+  bottom: 76px;
+  width: 320px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: #FFFFFF;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
+  padding: 6px;
+  display: none;
+  z-index: 60;
+}
+
+.dash-mention-item {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.dash-mention-item:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.dash-mention-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dash-mention-num {
+  font-size: 12px;
+  color: var(--text-gray);
 }

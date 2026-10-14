@@ -10,6 +10,8 @@ link-no-whatsapp/
 # Env
 .env
 .env.local
+# Dados locais (sessao/config do servidor - vivem em repo privado proprio)
+data/
 # OS
 *.swp
 *.swo

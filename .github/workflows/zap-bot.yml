@@ -1,0 +1,148 @@
+name: zap-bot
+
+# Cadeia 24h: cada execucao dispara a proxima via BOT_PAT (workflow_dispatch).
+# O cron */15 e rede de seguranca (ressuscita a cadeia se ela morrer).
+# Para PARAR: desative este workflow na aba Actions (ou crie data/STOP).
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: "Duracao maxima da execucao em minutos (testes: 3)"
+        required: false
+        default: "310"
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: zap-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      HEADLESS: "1"
+      LINK_AUTO_PAIR: "1"
+      LINK_HIDE_CODES: "1"
+      LINK_CODE_FILE: ${{ github.workspace }}/data/pairing-codes.json
+      DATA_DIR: ${{ github.workspace }}/data
+      MAX_MINUTES: ${{ inputs.max_minutes || '310' }}
+      CONTAINER: bot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clona repo de dados (privado)
+        env:
+          DATA_PAT: ${{ secrets.DATA_PAT }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATA_PAT:-}" ] || [ -z "${DATA_REPO:-}" ]; then
+            echo "::error::Secrets DATA_PAT e/ou DATA_REPO nao configurados (veja DEPLOY_GITHUB.md)"
+            exit 1
+          fi
+          git clone "https://x-access-token:${DATA_PAT}@github.com/${DATA_REPO}.git" "$DATA_DIR"
+          git -C "$DATA_DIR" config user.name "zap-bot"
+          git -C "$DATA_DIR" config user.email "zap-bot@users.noreply.github.com"
+
+      - name: Parado? (STOP no repo de dados)
+        run: |
+          if [ -f "$DATA_DIR/STOP" ]; then
+            echo "STOP encontrado - nada sera executado nem encadeado."
+            echo "STOPPED=true" >> "$GITHUB_ENV"
+          else
+            echo "STOPPED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Buildx
+        if: env.STOPPED != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build da imagem do bot (cache GHA)
+        if: env.STOPPED != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/actions/Dockerfile
+          load: true
+          tags: linkzap-bot:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sobe o container
+        if: env.STOPPED != 'true'
+        run: |
+          set -euo pipefail
+          docker run -d --name "$CONTAINER" \
+            --shm-size=1g \
+            -e HEADLESS=1 \
+            -e LINK_DATA_DIR=/data \
+            -e LINK_HTTP_PORT=8123 \
+            -e LINK_HTTP_HOST=127.0.0.1 \
+            -e LINK_AUTO_PAIR="$LINK_AUTO_PAIR" \
+            -e LINK_HIDE_CODES="$LINK_HIDE_CODES" \
+            -e LINK_CODE_FILE=/data/pairing-codes.json \
+            -e OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}" \
+            -e GOOGLE_AI_KEY="${{ secrets.GOOGLE_AI_KEY }}" \
+            -v "$DATA_DIR:/data" \
+            linkzap-bot:latest
+
+      - name: Boot check + status
+        id: boot
+        if: env.STOPPED != 'true'
+        run: |
+          set -uo pipefail
+          sleep 90
+          if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+            echo "::error::App morreu no boot - logs abaixo"
+            docker logs "$CONTAINER" --tail 80 || true
+            exit 1
+          fi
+          echo "BOOT_OK=true" >> "$GITHUB_ENV"
+          docker logs "$CONTAINER" --tail 40 || true
+          docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8123/status').then(r=>r.json()).then(j=>console.log('[STATUS] '+JSON.stringify(j))).catch(e=>console.log('[STATUS] indisponivel: '+e.message))" || true
+
+      - name: Dispara proxima execucao (no inicio - protege contra crash no meio)
+        if: env.STOPPED != 'true' && steps.boot.outcome == 'success'
+        continue-on-error: true
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: bash deploy/actions/dispatch.sh
+
+      - name: Monitor (backup 60s + watchdog + parada graceful)
+        if: env.STOPPED != 'true' && steps.boot.outcome == 'success'
+        run: bash deploy/actions/monitor.sh
+
+      - name: Dispara proxima execucao (no fim - passa a testemunha)
+        if: always() && env.STOPPED != 'true' && steps.boot.outcome == 'success'
+        continue-on-error: true
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: bash deploy/actions/dispatch.sh
+
+      - name: Heartbeat (mantem o cron do repo ativo)
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "run ${{ github.run_id }} attempt ${{ github.run_attempt }} $(date -u +%FT%TZ)" > heartbeat.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          if git diff --cached --quiet; then
+            echo "sem mudancas"
+          else
+            git commit -m "chore: heartbeat ${{ github.run_id }}"
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME:-main}" || echo "::warning::push do heartbeat falhou"
+          fi
+
+      - name: Limpeza
+        if: always()
+        run: docker rm -f "$CONTAINER" 2>/dev/null || true
