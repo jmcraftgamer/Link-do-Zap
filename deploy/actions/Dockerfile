@@ -13,7 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
 WORKDIR /app
+
+ENV PUPPETEER_CACHE_DIR=/app/.puppeteer-cache
 
 COPY package.json package-lock.json ./
 COPY patches ./patches
