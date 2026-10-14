@@ -15,7 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+ENV PUPPETEER_SKIP_DOWNLOAD=1
+
 COPY package.json package-lock.json ./
+COPY patches ./patches
 RUN npm install --no-audit --no-fund
 
 COPY . .

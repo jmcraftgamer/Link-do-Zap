@@ -24,7 +24,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+# deploy\actions\push-data.ps1 -> sobe 3 niveis ate a raiz do projeto
+$root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $dataDir = Join-Path $root "data"
 
 if (-not (Test-Path (Join-Path $Source "zaps.json"))) {
@@ -35,6 +36,7 @@ if (-not (Test-Path (Join-Path $dataDir ".git"))) {
   if (-not $DataRepo) {
     Write-Error "Primeira vez: informe o repo de dados. Ex: -DataRepo jmcraftgamer/linkzap-dados"
   }
+  $DataRepo = $DataRepo.Replace("\", "/")
   $url = if ($DataRepo -match "^https://") { $DataRepo } else { "https://github.com/$DataRepo.git" }
   Write-Host "Clonando $url -> $dataDir"
   git clone $url $dataDir
@@ -42,7 +44,7 @@ if (-not (Test-Path (Join-Path $dataDir ".git"))) {
 }
 
 # Configs (sempre)
-foreach ($f in @("zaps.json", "providers.json", "trainings.json")) {
+foreach ($f in @("zaps.json", "providers.json", "trainings.json", "contacts.json", "auto-msg-state.json")) {
   $src = Join-Path $Source $f
   if (Test-Path $src) {
     Copy-Item $src (Join-Path $dataDir $f) -Force
@@ -67,8 +69,17 @@ if ($IncludeHistory) {
 if ($IncludeSessions) {
   $sessSrc = Join-Path $Source "sessions"
   if (Test-Path $sessSrc) {
-    Copy-Item $sessSrc $dataDir -Recurse -Force
-    Write-Host "  copiado sessions\ (vinculo local leva junto)"
+    # So as sessoes dos zaps configurados (as demais sao residuo) e SEM as
+    # caches do Chromium (Code Cache/Cache sao dezenas de MB e regeneram).
+    $zapIds = @((Get-Content (Join-Path $Source "zaps.json") -Raw | ConvertFrom-Json) | ForEach-Object { "$($_.id)" })
+    $cacheDirs = @('Cache', 'Code Cache', 'GPUCache', 'Service Worker', 'blob_storage', 'Crashpad', 'Safe Browsing', 'segmentation_platform', 'ShaderCache', 'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'GrShaderCache', 'component_crd_cache', 'File System', 'Media Cache', 'Extension Rules', 'Extension Scripts', 'JumpListIconsMostVisited', 'JumpListIconsRecentClosed')
+    foreach ($id in $zapIds) {
+      $from = Join-Path $sessSrc $id
+      if (-not (Test-Path $from)) { Write-Host "  (sem sessao local para o zap $id)"; continue }
+      $to = Join-Path $dataDir "sessions\$id"
+      robocopy $from $to /MIR /XD $cacheDirs /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+      Write-Host "  copiado sessions\$id (sem caches)"
+    }
   }
 } else {
   Write-Host "  sessions/ NAO copiada (padrao) - o pareamento roda no servidor." -ForegroundColor DarkGray

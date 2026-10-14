@@ -6,6 +6,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
+    "postinstall": "node scripts/apply-patches.js",
     "start:headless": "electron . --no-sandbox --disable-gpu --disable-dev-shm-usage",
     "start:linux": "xvfb-run -a electron . --no-sandbox --disable-gpu --disable-dev-shm-usage",
     "test": "node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js",

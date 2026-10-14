@@ -1,0 +1,62 @@
+diff --git a/src/util/Injected/Utils.js b/src/util/Injected/Utils.js
+index 540078a..016f707 100644
+--- a/src/util/Injected/Utils.js
++++ b/src/util/Injected/Utils.js
+@@ -457,6 +457,27 @@ exports.LoadUtils = () => {
+             .require('WAWebGetEphemeralFieldsMsgActionsUtils')
+             .getEphemeralFields(chat);
+ 
++        const mediaFields = {};
++        if (mediaOptions && typeof mediaOptions === 'object') {
++            const skipMediaKeys = [
++                'revisionNumber',
++                '__fired',
++                '__changes',
++                '__initialized',
++                'parent',
++                'collection',
++                '_uiObservers',
++                'mirror',
++            ];
++            for (const k of Object.keys(mediaOptions)) {
++                if (k.lastIndexOf('__x_', 0) === 0 || skipMediaKeys.indexOf(k) !== -1) continue;
++                mediaFields[k] = mediaOptions[k];
++            }
++            if (typeof mediaOptions.toJSON === 'function') {
++                Object.assign(mediaFields, mediaOptions.toJSON() || {});
++            }
++        }
++
+         const message = {
+             ...options,
+             id: newMsgKey,
+@@ -470,8 +491,7 @@ exports.LoadUtils = () => {
+             isNewMsg: true,
+             type: 'chat',
+             ...ephemeralFields,
+-            ...mediaOptions,
+-            ...(mediaOptions.toJSON ? mediaOptions.toJSON() : {}),
++            ...mediaFields,
+             ...quotedMsgOptions,
+             ...locationOptions,
+             ...pollOptions,
+@@ -580,9 +600,7 @@ exports.LoadUtils = () => {
+ 
+         if (options.waitUntilMsgSent) await sendMsgResultPromise;
+ 
+-        return window
+-            .require('WAWebCollections')
+-            .Msg.get(newMsgKey._serialized);
++        return null;
+     };
+ 
+     window.WWebJS.editMessage = async (msg, content, options = {}) => {
+@@ -828,7 +846,7 @@ exports.LoadUtils = () => {
+             msg.replyButtons = JSON.parse(JSON.stringify(msg.replyButtons));
+         }
+ 
+-        if (typeof msg.id.remote === 'object') {
++        if (msg.id && typeof msg.id.remote === 'object') {
+             msg.id = Object.assign({}, msg.id, {
+                 remote: msg.id.remote._serialized,
+             });
