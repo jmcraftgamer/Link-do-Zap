@@ -463,7 +463,18 @@ class WhatsAppManager {
         // Somente o chat do proprio numero (autochat). Outros chats saem aqui.
         const selfNums = this._selfNums(data);
         const fromNum = this._normNum(msg.from || '');
-        const isSelfChat = selfNums.length ? selfNums.includes(chatNum) : (fromNum && chatNum === fromNum);
+        let isSelfChat = selfNums.length ? selfNums.includes(chatNum) : (fromNum && chatNum === fromNum);
+        if (!isSelfChat && chatJid.includes('@lid')) {
+          // Chat consigo mesmo vem como @lid (hash, nao telefone). Resolve o
+          // contato do chat e compara o numero de verdade.
+          try {
+            const chatObj = await msg.getChat();
+            const contact = await chatObj.getContact();
+            const wid = contact && contact.wid;
+            const cand = this._normNum((contact && contact.number) || (wid && (wid._serialized || wid)) || '');
+            if (cand && selfNums.includes(cand)) isSelfChat = true;
+          } catch (_) { /* contato nao resolvido - nao e autochat */ }
+        }
         if (!isSelfChat) return;
 
         const msgId = this._ensureMsgKey(msg);
