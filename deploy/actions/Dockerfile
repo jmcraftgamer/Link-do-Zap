@@ -19,6 +19,7 @@ ENV PUPPETEER_SKIP_DOWNLOAD=1
 
 COPY package.json package-lock.json ./
 COPY patches ./patches
+COPY scripts ./scripts
 RUN npm install --no-audit --no-fund
 
 COPY . .
