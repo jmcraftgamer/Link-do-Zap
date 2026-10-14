@@ -141,6 +141,14 @@ class WhatsAppManager {
       }
     }
 
+    // Trava de singleton do Chromium de execucoes anteriores (container
+    // cancelado no meio): sem limpar, o browser novo recusa abrir o perfil
+    // ("profile appears to be in use by another computer").
+    const wdProfile = path.dirname(profilePath);
+    for (const f of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+      try { fs.rmSync(path.join(wdProfile, f), { recursive: true, force: true }); } catch (_) { /* ignore */ }
+    }
+
     if (!fs.existsSync(sessionPath)) {
       fs.mkdirSync(sessionPath, { recursive: true });
     }
