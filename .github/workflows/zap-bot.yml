@@ -123,7 +123,7 @@ jobs:
         run: bash deploy/actions/monitor.sh
 
       - name: Dispara proxima execucao (no fim - passa a testemunha)
-        if: always() && env.STOPPED != 'true' && steps.boot.outcome == 'success'
+        if: always() && !cancelled() && env.STOPPED != 'true' && steps.boot.outcome == 'success'
         continue-on-error: true
         env:
           BOT_PAT: ${{ secrets.BOT_PAT }}
