@@ -96,6 +96,14 @@ class WhatsAppManager {
 
   async connectZap(zapId, phoneNumber, method = 'qrcode') {
     if (this.clients.has(zapId)) {
+      const existing = this.clients.get(zapId);
+      const busy = existing && ['connecting', 'waiting_qr', 'waiting_pairing', 'ready'].includes(existing.status);
+      if (busy) {
+        // Corrida de conectividade (boot: auto-connect + campanha AUTOMSG):
+        // nao destruir o browser que ja esta subindo - so aguardar o resultado.
+        this.logToApp(zapId, 'info', `Conexao ja em curso (${existing.status}) - aguardando sem reiniciar...`);
+        return this._waitReady(zapId, 180000);
+      }
       this.logToApp(zapId, 'info', 'Ja estava conectado - reconectando (limpando sessao anterior)...');
       await this.disconnectZap(zapId);
     }
