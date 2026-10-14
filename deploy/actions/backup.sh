@@ -16,7 +16,7 @@ if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
   exit 0
 fi
 
-git add -A || exit 1
+git add -A --ignore-errors || exit 1
 git commit -m "backup $(date -u +%Y-%m-%dT%H:%M:%SZ) run=${GITHUB_RUN_ID:-local}" >/dev/null || true
 
 for i in 1 2 3; do
