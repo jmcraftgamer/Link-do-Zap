@@ -95,17 +95,38 @@ class WhatsAppManager {
   }
 
   async connectZap(zapId, phoneNumber, method = 'qrcode') {
+    // Painel local com LINK_CONNECT_READONLY=1: a sessao deste zap vive no
+    // servidor 24h. Conectar pelo PC reusa as mesmas credenciais em outro
+    // navegador e o WhatsApp invalida a sessao do servidor (logout).
+    // Bloqueia o pedido local; configuracoes continuam funcionando.
+    try {
+      if (String(process.env.LINK_CONNECT_READONLY || '').toLowerCase() === '1') {
+        this.logToApp(zapId, 'warning', 'Conexao bloqueada neste app: este zap roda 24h no servidor. Use o app apenas para configurar - nao clique Conectar.');
+        return { status: 'readonly', error: 'zap gerenciado pelo servidor (LINK_CONNECT_READONLY)' };
+      }
+    } catch (_) { /* nao bloqueia o resto */ }
     if (this.clients.has(zapId)) {
       const existing = this.clients.get(zapId);
       const busy = existing && ['connecting', 'waiting_qr', 'waiting_pairing', 'ready'].includes(existing.status);
       if (busy) {
-        // Corrida de conectividade (boot: auto-connect + campanha AUTOMSG):
-        // nao destruir o browser que ja esta subindo - so aguardar o resultado.
-        this.logToApp(zapId, 'info', `Conexao ja em curso (${existing.status}) - aguardando sem reiniciar...`);
-        return this._waitReady(zapId, 180000);
+        // Pedido explicito de pareamento com conexao parada em QR/codigo
+        // antigo: reinicia para gerar codigo novo. Sem isso o guard de corrida
+        // recusava o pedido do usuario ("Conexao ja em curso") e o codigo
+        // nunca aparecia. Durante 'connecting' (mid-boot) segue o guard.
+        const wantPair = method === 'pairing' && !!String(phoneNumber || '').replace(/\D/g, '');
+        if (wantPair && (existing.status === 'waiting_qr' || existing.status === 'waiting_pairing')) {
+          this.logToApp(zapId, 'info', 'Pedido de pareamento: reiniciando conexao parada para gerar codigo novo...');
+          await this.disconnectZap(zapId, 'troca para pareamento');
+        } else {
+          // Corrida de conectividade (boot: auto-connect + campanha AUTOMSG):
+          // nao destruir o browser que ja esta subindo - so aguardar o resultado.
+          this.logToApp(zapId, 'info', `Conexao ja em curso (${existing.status}) - aguardando sem reiniciar...`);
+          return this._waitReady(zapId, 180000);
+        }
+      } else {
+        this.logToApp(zapId, 'info', 'Ja estava conectado - reconectando (limpando sessao anterior)...');
+        await this.disconnectZap(zapId);
       }
-      this.logToApp(zapId, 'info', 'Ja estava conectado - reconectando (limpando sessao anterior)...');
-      await this.disconnectZap(zapId);
     }
 
     const sessionPath = path.join(this._baseDir, 'sessions', zapId);
