@@ -102,13 +102,13 @@ function loadProvidersData() {
     // Garante que o provedor Google AI Studio possua os modelos oficiais válidos da API
     for (const p of list) {
       if (p && (p.id === 'googleai-preconfig' || String(p.name || '').includes('Google'))) {
+        // Oficiais validos para contas NOVAS do AI Studio (2.5/2.0/1.5
+        // retornam 404 "no longer available to new users")
         const officialModels = [
-          { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', free: true },
-          { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash-Lite', free: true },
-          { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', free: true },
-          { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash-Lite', free: true },
-          { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', free: true },
-          { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', free: true }
+          { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', free: true },
+          { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', free: true },
+          { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', free: true },
+          { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash-Lite', free: true }
         ];
         if (!Array.isArray(p.models) || p.models.length === 0) {
           p.models = officialModels;

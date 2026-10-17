@@ -107,7 +107,7 @@ class WhatsAppManager {
     } catch (_) { /* nao bloqueia o resto */ }
     if (this.clients.has(zapId)) {
       const existing = this.clients.get(zapId);
-      const busy = existing && ['connecting', 'waiting_qr', 'waiting_pairing', 'ready'].includes(existing.status);
+      const busy = existing && ['connecting', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated', 'ready'].includes(existing.status);
       if (busy) {
         // Pedido explicito de pareamento com conexao parada em QR/codigo
         // antigo: reinicia para gerar codigo novo. Sem isso o guard de corrida
@@ -268,13 +268,18 @@ class WhatsAppManager {
       // IDs de mensagens enviadas PELA IA - usados para evitar loop
       aiSentIds: new Set(),
       // Marcadores (corpo + timestamp) de envios em andamento da IA
-      pendingAiSends: []
+      pendingAiSends: [],
+      // Watchdog de pareamento (polling do socket) - detecta quando o
+      // celular aceita o codigo e força a conclusao se o 'ready' nao chegar
+      _pairWatchdog: null
     });
 
     client.on('qr', async (qr) => {
       const data = this.clients.get(zapId);
-      // Nunca rebaixa o status depois de autenticado/ready
-      if (!data || data.client !== client || data.status === 'ready' || data.status === 'authenticated') return;
+      // Nunca rebaixa o status depois de autenticado/ready, nem sobrescreve
+      // a tela de pareamento (a pagina renova o QR a cada 20s enquanto
+      // UNPAIRED e derrubava o codigo de pareamento da UI)
+      if (!data || data.client !== client || data.status === 'ready' || data.status === 'authenticated' || data.status === 'waiting_pairing' || data.status === 'pairing_accepted') return;
       this.logToApp(zapId, 'info', 'QR Code gerado. Escaneie com o celular.');
       data.qrCode = qr;
       data.status = 'waiting_qr';
@@ -296,6 +301,9 @@ class WhatsAppManager {
       data.pairingCode = code;
       data.status = 'waiting_pairing';
       this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
+      // Watchdog: detecta quando o celular aceita o codigo e força a
+      // conclusao se o 'ready' nao chegar (pagina reiniciou o contexto)
+      this._startPairingWatchdog(zapId, client);
     });
 
     client.on('loading_screen', (percent, message) => {
@@ -331,6 +339,7 @@ class WhatsAppManager {
       data.status = 'ready';
       data.qrCode = null;
       data.pairingCode = null;
+      this._stopPairingWatchdog(client); // pareamento resolvido
       // readyAt = PC clock (seconds), readyWall = wall time for history window, historyBufferUntil = 90s after ready
       // We use a hybrid check: for 90s after ready we filter by timestamp, after that we accept all (fixes PC clock skew)
       data.readyAt = Math.floor(Date.now() / 1000);
@@ -374,6 +383,7 @@ class WhatsAppManager {
       if (data.status === 'authenticated' || data.status === 'ready') return;
       data.status = 'authenticated';
       this._clearPagePairingInterval(client);
+      this._stopPairingWatchdog(client); // pareamento resolvido
       this.logToApp(zapId, 'success', 'Autenticado (sessao valida)');
       this.sendToRenderer('whatsapp-status', { zapId, status: 'authenticated' });
     };
@@ -382,6 +392,7 @@ class WhatsAppManager {
       const data = this.clients.get(zapId);
       if (!data || data.client !== client) return;
       data.status = 'auth_failure';
+      this._stopPairingWatchdog(client); // pareamento falhou - para o polling
       let friendlyMsg = msg || 'Autenticacao negada';
       if (msg && (msg.includes('query_link') || msg.includes('not allowed') || msg.includes('linked'))) {
         friendlyMsg = 'Nao foi possivel vincular. Verifique se o numero esta correto e se o WhatsApp esta aberto no celular.';
@@ -395,6 +406,7 @@ class WhatsAppManager {
       // LOGOUT/queda chega 2x (varios frames com post_logout=1/lastLoggedOut)
       if (data.status === 'disconnected') return;
       data.status = 'disconnected';
+      this._stopPairingWatchdog(client); // sessao caiu - para o polling
       // Janela de historico invalida - o proximo ready recria (readyAt null)
       data.readyAt = null;
       data.readyWall = null;
@@ -584,14 +596,14 @@ class WhatsAppManager {
         try {
           this.logToApp(zapId, 'info', `Solicitando codigo de pareamento para ${cleanPhone}...`);
           // Pequeno delay para garantir que a pagina carregou
-          await new Promise(r => setTimeout(r, 250));
+          await new Promise(r => setTimeout(r, 100));
           let code;
           try {
             code = await this._withTimeout(client.requestPairingCode(cleanPhone), 20000, 'requestPairingCode');
           } catch (firstErr) {
             // Fallback: tentar com intervalo explicito
             this.logToApp(zapId, 'warning', `Primeira tentativa falhou (${firstErr.message}), tentando novamente...`);
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 300));
             code = await this._withTimeout(client.requestPairingCode(cleanPhone, true), 20000, 'requestPairingCode');
           }
           const data = this.clients.get(zapId);
@@ -610,6 +622,9 @@ class WhatsAppManager {
             this.logToApp(zapId, 'success', this.pairingLogMessage(code, `(${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio)`));
             this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
           }
+          // Watchdog (idempotente): garante deteccao mesmo se o evento 'code'
+          // da pagina nao disparar neste caminho manual
+          this._startPairingWatchdog(zapId, client);
           // Sem regeneracao daqui: o intervalo proprio da pagina (3 min, padrao
           // do wwebjs) renova o codigo enquanto nao pareado e dispara o evento
           // 'code' para a UI. Regenerar manualmente reiniciava o vinculo por
@@ -971,6 +986,135 @@ class WhatsAppManager {
         }
       }).catch(() => { /* pagina ja fechada */ });
     } catch (_) { /* ignore */ }
+  }
+
+  // ============================================================
+  // WATCHDOG DE PAREAMENTO
+  // O wwebjs so emite 'authenticated'/'ready' quando o evento
+  // change:hasSynced da pagina dispara. Se a pagina navega/recria o
+  // contexto durante o handshake (comum no pareamento), o listener morre
+  // e o app fica travado em "waiting_pairing" para SEMPRE, mesmo com o
+  // celular ja mostrando "conectado". Este watchdog faz polling do
+  // estado do socket: ao ver que o celular aceitou o codigo (estado
+  // sai de UNPAIRED), avisa a UI na hora e, se o 'ready' nao chegar em
+  // alguns segundos, força a conclusao re-avaliando a pagina.
+  // ============================================================
+  _startPairingWatchdog(zapId, client) {
+    const data = this.clients.get(zapId);
+    if (!data || data.client !== client) return;
+    this._stopPairingWatchdog(client); // nunca dois watchdogs no mesmo client
+
+    let lastState = null;
+    let acceptedAt = null;
+    let nudged = false;
+    let stopped = false;
+
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      if (data._pairWatchdog) {
+        clearInterval(data._pairWatchdog);
+        data._pairWatchdog = null;
+      }
+    };
+
+    data._pairWatchdog = setInterval(async () => {
+      if (stopped) return;
+      const d = this.clients.get(zapId);
+      if (!d || d.client !== client) { stop(); return; }
+      // Para assim que resolver (ready) ou falhar definitivamente
+      if (d.status === 'ready' || d.status === 'disconnected' || d.status === 'auth_failure') { stop(); return; }
+
+      let state = null;
+      try {
+        state = await this._withTimeout(client.getState(), 4000, 'getState(pareamento)');
+      } catch (_) { return; } // pagina ocupada/navegando - tenta no proximo tick
+
+      if (state && state !== lastState) {
+        lastState = state;
+        console.log(`[PAIR-WD] Zap ${zapId} estado do socket: ${state}`);
+      }
+
+      const unpaired = state === 'UNPAIRED' || state === 'UNPAIRED_IDLE';
+      if (unpaired || !state) return; // ainda esperando o usuario digitar o codigo
+
+      // Celular aceitou o codigo (estado saiu de UNPAIRED)
+      if (!acceptedAt) {
+        acceptedAt = Date.now();
+        d.status = 'pairing_accepted';
+        this.logToApp(zapId, 'success', `Codigo aceito pelo celular (estado: ${state}) - sincronizando conversas...`);
+        this.sendToRenderer('whatsapp-status', { zapId, status: 'pairing_accepted' });
+      }
+
+      // Conectou mas o 'ready' nao chegou apos a gradacao: força a conclusao.
+      // So tenta UMA vez para nao ficar re-avaliando a pagina em loop.
+      const connectedLike = state === 'CONNECTED' || state === 'SYNCING' || state === 'OPENING';
+      if (!nudged && acceptedAt && connectedLike && (Date.now() - acceptedAt) >= 6000) {
+        nudged = true;
+        await this._nudgePairingFinalize(zapId, client);
+      }
+    }, 2000);
+  }
+
+  _stopPairingWatchdog(client) {
+    try {
+      // Percorre o mapa para achar o registro deste client
+      for (const [, d] of this.clients.entries()) {
+        if (d.client === client && d._pairWatchdog) {
+          clearInterval(d._pairWatchdog);
+          d._pairWatchdog = null;
+        }
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  // Forca a emissao de authenticated/ready quando o socket ja conectou mas o
+  // change:hasSynced (listener da pagina) nao disparou. Reexecuta o handler
+  // exposto onAppStateHasSyncedEvent dentro da pagina - e o mesmo caminho
+  // oficial do wwebjs, entao dispara authenticated + ready normalmente.
+  async _nudgePairingFinalize(zapId, client) {
+    const d = this.clients.get(zapId);
+    if (!d || d.client !== client || d.status === 'ready') return;
+    try {
+      const page = client.pupPage;
+      if (!page || (typeof page.isClosed === 'function' && page.isClosed())) {
+        this.logToApp(zapId, 'warning', 'Pareamento travado e pagina ja fechada - gere um novo codigo.');
+        return;
+      }
+      this.logToApp(zapId, 'info', 'Conexao detectada mas pronto nao chegou - forcando conclusao do pareamento...');
+      const res = await this._withTimeout(page.evaluate(async () => {
+        // Pagina navegou/recriou o contexto: o handler oficial nao existe mais
+        if (typeof window.onAppStateHasSyncedEvent !== 'function') {
+          return typeof window.WWebJS !== 'undefined' ? 'injected-no-handler' : 'missing';
+        }
+        try { await window.onAppStateHasSyncedEvent(); } catch (_) { /* ja autenticado */ }
+        return 'ok';
+      }), 8000, 'forcar-pareamento');
+
+      if (res === 'ok') {
+        this.logToApp(zapId, 'success', 'Pareamento concluido pelo watchdog (handler oficial reexecutado).');
+      } else if (res === 'injected-no-handler') {
+        // WWebJS injetado mas handler sumiu: reaplica os listeners e o
+        // fluxo de sync do proprio client, que reemite authenticated/ready.
+        this.logToApp(zapId, 'warning', 'Contexto da pagina recriado durante o pareamento - reaplicando listeners...');
+        try {
+          await this._withTimeout(client.attachEventListeners(), 10000, 'reattach(pareamento)');
+          await this._withTimeout(page.evaluate(() => {
+            window.require('WAWebSocketModel').Socket.on('change:hasSynced', () => {
+              if (typeof window.onAppStateHasSyncedEvent === 'function') window.onAppStateHasSyncedEvent();
+            });
+          }), 8000, 'relisten(pareamento)');
+          this.logToApp(zapId, 'info', 'Listeners reaplicados - se o socket sincronizar, o ready dispara sozinho.');
+        } catch (e) {
+          this.logToApp(zapId, 'warning', `Nao foi possivel reaplicar listeners: ${e.message}`);
+        }
+      } else {
+        this.logToApp(zapId, 'error', 'Pareamento nao concluiu (contexto da pagina indisponivel). Gere um novo codigo e tente novamente.');
+        this.sendToRenderer('whatsapp-status', { zapId, status: 'pairing_error', error: 'Pagina do WhatsApp reiniciou durante o pareamento. Gere um novo codigo.' });
+      }
+    } catch (e) {
+      this.logToApp(zapId, 'warning', `Falha ao forcar conclusao do pareamento: ${e.message}`);
+    }
   }
 
   // Baixa a midia de um audio. O downloadMedia do wwebjs chama evaluate e o
@@ -1748,6 +1892,7 @@ class WhatsAppManager {
   async disconnectZap(zapId, reason) {
     const clientData = this.clients.get(zapId);
     if (clientData) {
+      this._stopPairingWatchdog(clientData.client); // para o polling antes de destruir
       try {
         // Remove os listeners ANTES do destroy: um evento tardio do cliente
         // antigo (disconnected/ready) nao pode sobrescrever o status do novo

@@ -226,6 +226,7 @@ function getZapStatusInfo(zap) {
     connecting: { label: 'Conectando...', className: 'connecting', online: false },
     waiting_qr: { label: 'Aguardando QR', className: 'connecting', online: false },
     waiting_pairing: { label: 'Aguardando pareamento', className: 'connecting', online: false },
+    pairing_accepted: { label: 'Sincronizando...', className: 'connecting', online: false },
     authenticated: { label: 'Autenticado', className: 'connecting', online: false },
     auth_failure: { label: 'Erro de autenticacao', className: 'error', online: false },
     disconnected: { label: 'Desconectado', className: 'offline', online: false }
@@ -3440,6 +3441,17 @@ function updateZapStatus(zapId, status, error) {
       document.getElementById('connectProgressText').textContent = 'Conectando...';
     } else if (status === 'waiting_qr' || status === 'waiting_pairing') {
       connectProgress.style.display = 'none';
+    } else if (status === 'pairing_accepted') {
+      // Celular ja aceitou o codigo - só falta sincronizar (watchdog de pareamento)
+      connectProgress.style.display = 'none';
+      pairingStatus.textContent = 'Codigo aceito! Sincronizando conversas...';
+      pairingStatus.className = 'connect-status';
+    } else if (status === 'authenticated') {
+      connectProgress.style.display = 'none';
+      pairingStatus.textContent = 'Autenticado! Preparando sistema...';
+      pairingStatus.className = 'connect-status';
+      qrStatus.textContent = 'Autenticado! Preparando sistema...';
+      qrStatus.className = 'connect-status';
     } else if (status === 'ready') {
       connectProgress.style.display = 'none';
       qrStatus.textContent = 'Conectado com sucesso!';
@@ -3475,7 +3487,8 @@ function updateZapStatus(zapId, status, error) {
   if (zap) {
     const runtimeMap = {
       'connecting': 'connecting', 'waiting_qr': 'waiting_qr',
-      'waiting_pairing': 'waiting_pairing', 'authenticated': 'authenticated',
+      'waiting_pairing': 'waiting_pairing', 'pairing_accepted': 'pairing_accepted',
+      'authenticated': 'authenticated',
       'ready': 'ready', 'auth_failure': 'auth_failure', 'disconnected': 'disconnected'
     };
     const runtime = runtimeMap[status] || status;
