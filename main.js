@@ -80,8 +80,8 @@ function loadJsonFile(filename, fallback) {
 function loadZapsData() { return loadJsonFile('zaps.json', []); }
 function loadProvidersData() {
   const list = loadJsonFile('providers.json', []);
-  // Chaves podem vir do ambiente (secrets do GitHub Actions / env local)
-  // quando o providers.json chega sem chave nos preconfigs
+  // Chaves podem vir do ambiente (secrets do GitHub Actions / env local):
+  // se o secret estiver configurado, ele SEMPRE prevalece sobre chaves antigas ou invalidas do arquivo
   try {
     const envSpecs = [
       { id: 'openrouter-preconfig', name: 'OpenRouter', env: process.env.OPENROUTER_API_KEY },
@@ -92,10 +92,34 @@ function loadProvidersData() {
       if (!key) continue;
       for (const p of list) {
         if (!p || (p.id !== spec.id && String(p.name || '') !== spec.name)) continue;
-        const hasKey = (p.apiKey && String(p.apiKey).trim()) ||
-          (Array.isArray(p.apiKeys) && p.apiKeys.some(k => k && String(k).trim())) ||
-          (Array.isArray(p.keys) && p.keys.some(k => k && String(k).trim()));
-        if (!hasKey) p.apiKey = key;
+        // Secret do ambiente e a fonte da verdade: substitui apiKey legado
+        // E apiKeys[] (prioridade do resolveKey) para valer em todos os caminhos
+        p.apiKey = key;
+        p.apiKeys = [key];
+        p.apiKeyNames = ['Chave do ambiente'];
+      }
+    }
+    // Garante que o provedor Google AI Studio possua os modelos oficiais válidos da API
+    for (const p of list) {
+      if (p && (p.id === 'googleai-preconfig' || String(p.name || '').includes('Google'))) {
+        const officialModels = [
+          { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', free: true },
+          { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash-Lite', free: true },
+          { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', free: true },
+          { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash-Lite', free: true },
+          { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', free: true },
+          { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', free: true }
+        ];
+        if (!Array.isArray(p.models) || p.models.length === 0) {
+          p.models = officialModels;
+        } else {
+          // Adiciona os oficiais se faltarem
+          for (const off of officialModels) {
+            if (!p.models.some(m => m && m.id === off.id)) {
+              p.models.push(off);
+            }
+          }
+        }
       }
     }
   } catch (_) {}
@@ -775,17 +799,66 @@ function getStatusServer() {
   return statusServer;
 }
 
+function persistBotStatus() {
+  try {
+    ensureDataDir();
+    const filePath = getFilePath('bot-status.json');
+    const zaps = loadZapsData();
+    const states = whatsappManager && typeof whatsappManager.listConnectionStates === 'function'
+      ? whatsappManager.listConnectionStates()
+      : [];
+    const statusData = {
+      updatedAt: new Date().toISOString(),
+      uptimeSeconds: Math.floor(process.uptime()),
+      headless: isHeadless(),
+      zaps: zaps.map(z => {
+        const state = states.find(s => String(s.id) === String(z.id)) || {};
+        return {
+          id: z.id,
+          name: z.name,
+          phone: z.phone,
+          enabled: z.enabled !== false,
+          status: state.status || 'disconnected',
+          qrPending: !!state.qrPending,
+          pairingCode: state.pairingCode || null
+        };
+      })
+    };
+    fs.writeFileSync(filePath, JSON.stringify(statusData, null, 2));
+  } catch (_) {}
+}
+
 function autoConnectSavedSessions(staggerMs = 2000) {
   if (!whatsappManager || typeof whatsappManager.connectZap !== 'function') return 0;
   let count = 0;
   loadZapsData().forEach((z, i) => {
     const zapId = String(z.id);
+    if (z.enabled === false) return;
     const sessionDir = path.join(getDataDir(), 'sessions', zapId);
     if (!fs.existsSync(sessionDir)) return;
     count++;
     setTimeout(() => {
       console.log(`[AUTO] Reconectando zap ${zapId} (${z.name || ''}) com sessao salva...`);
       Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
+        .then(() => {
+          persistBotStatus();
+          // Se for headless com LINK_AUTO_PAIR=1: detecta se a sessao salva expirou (caiu em waiting_qr)
+          // para nao ficar como zumbi invisivel sem pareamento
+          if (isHeadless() && String(process.env.LINK_AUTO_PAIR || '') === '1') {
+            setTimeout(() => {
+              const st = whatsappManager.getStatus(zapId);
+              if (st && st.status === 'waiting_qr') {
+                const phone = String(z.phone || '').replace(/\D/g, '');
+                if (phone) {
+                  console.log(`[AUTO-PAIR] Sessao salva do zap ${zapId} expirou (caiu em QR). Limpando sessao e gerando codigo de pareamento...`);
+                  try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}
+                  whatsappManager.connectZap(zapId, phone, 'pairing')
+                    .catch((err) => console.error(`[AUTO-PAIR] Falha no pareamento do zap ${zapId}: ${err.message}`));
+                }
+              }
+            }, 12000);
+          }
+        })
         .catch((e) => console.error(`[AUTO] Falha ao reconectar ${zapId}: ${e.message}`));
     }, i * staggerMs);
   });
@@ -1158,22 +1231,35 @@ app.whenReady().then(() => {
     try { await handleIncomingMessage(messageData); } catch (e) { console.error('handleIncomingMessage erro:', e); }
   });
   startStatusServer();
-  if (isHeadless()) autoConnectSavedSessions();
+  autoConnectSavedSessions();
   if (isHeadless()) autoPairMissingSessions();
+  const statusTimer = setInterval(persistBotStatus, 30000);
+  if (statusTimer && typeof statusTimer.unref === 'function') statusTimer.unref();
 });
 
-app.on('window-all-closed', async () => {
+let isAppQuitting = false;
+app.on('before-quit', (e) => {
+  if (isAppQuitting) return;
   if (isHeadless()) return;
-  if (whatsappManager) { try { await whatsappManager.disconnectAll(); } catch (_) {} }
+  e.preventDefault();
+  isAppQuitting = true;
+  (async () => {
+    try {
+      if (conversationStore) conversationStore.flush();
+      if (whatsappManager) await whatsappManager.disconnectAll();
+      persistBotStatus();
+    } catch (_) {}
+    app.exit(0);
+  })();
+});
+
+app.on('window-all-closed', () => {
+  if (isHeadless()) return;
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('activate', () => {
   if (isHeadless()) return;
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
-app.on('before-quit', async () => {
-  if (conversationStore) { try { conversationStore.flush(); } catch (_) {} }
-  if (whatsappManager) { try { await whatsappManager.disconnectAll(); } catch (_) {} }
 });
 
 // ------------------------------------------------------------

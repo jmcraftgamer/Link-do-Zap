@@ -398,6 +398,24 @@ MENSAGENS MULTIPLAS (LEIA POR ULTIMO - OBRIGATORIO):
     return false;
   }
 
+  // Chave efetiva de um provedor: apiKeys[] tem prioridade sobre o apiKey
+  // legado, sempre com trim - assim chave nova salva pelo app vale em TODOS
+  // os caminhos (principal e fallbacks).
+  resolveProviderKey(provider, selectionIndex) {
+    if (!provider) return null;
+    const keys = (Array.isArray(provider.apiKeys) && provider.apiKeys.length)
+      ? provider.apiKeys
+      : (Array.isArray(provider.keys) && provider.keys.length)
+        ? provider.keys
+        : (provider.apiKey ? [provider.apiKey] : []);
+    if (!keys.length) return null;
+    const cleaned = keys.map(k => String(k || '').replace(/\s+/g, '').trim());
+    const idx = (selectionIndex != null && selectionIndex >= 0 && selectionIndex < cleaned.length)
+      ? selectionIndex
+      : 0;
+    return cleaned[idx] || cleaned.find(Boolean) || null;
+  }
+
   markModelFailed(modelKey) {
     this.failedModels.set(modelKey, Date.now());
   }
@@ -414,15 +432,8 @@ MENSAGENS MULTIPLAS (LEIA POR ULTIMO - OBRIGATORIO):
 
     const resolveKey = (provider) => {
       if (!provider) return null;
-      const keys = (Array.isArray(provider.apiKeys) && provider.apiKeys.length)
-        ? provider.apiKeys
-        : (Array.isArray(provider.keys) && provider.keys.length)
-          ? provider.keys
-          : (provider.apiKey ? [provider.apiKey] : []);
-      if (!keys.length) return null;
       const sel = zap.apiKeySelections && zap.apiKeySelections[provider.id];
-      const idx = (sel != null && sel >= 0 && sel < keys.length) ? sel : 0;
-      return keys[idx] || keys[0];
+      return this.resolveProviderKey(provider, sel);
     };
 
     // Modelos marcados no painel do Zap (marcar/desmarcar)
@@ -593,7 +604,7 @@ MENSAGENS MULTIPLAS (LEIA POR ULTIMO - OBRIGATORIO):
   async _transcribeWithGemini(key, b64, mime, provider) {
     // Gemini aceita audio inline via generateContent - nao precisa de Whisper
     const models = (provider.models || []).map(m => m.id).filter(Boolean);
-    const modelId = models.find(id => id.includes('flash')) || models[0] || 'gemini-3.6-flash';
+    const modelId = models.find(id => id.includes('flash')) || models[0] || 'gemini-2.5-flash';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${key}`;
     const body = {
       contents: [{
@@ -688,12 +699,16 @@ NOME DO CLIENTE: ${contactName}
     if (allProviders && Array.isArray(allProviders)) {
       for (const provider of allProviders) {
         if (!provider.models) continue;
+        // Chave efetiva do provedor (apiKeys[] > apiKey legado) - sem isso,
+        // fallbacks usariam chave antiga morta mesmo com chave nova salva
+        const effKey = this.resolveProviderKey(provider);
+        if (!effKey) continue;
         for (const model of provider.models) {
           const modelKey = `${provider.name}|${model.id}`;
           if (modelKey === primaryKey) continue;
           // Prefer free models
           fallbackQueue.push({
-            provider,
+            provider: { ...provider, apiKey: effKey },
             model,
             key: modelKey,
             free: model.free || false
@@ -923,6 +938,11 @@ NOME DO CLIENTE: ${contactName}
   }
 
   async callGoogleAI(modelId, apiKey, messages) {
+    // Mapeamento defensivo de IDs de modelos: se o usuário ou banco antigo tiver IDs legados/inexistentes
+    let effectiveModel = modelId;
+    if (modelId === 'gemini-3.6-flash') effectiveModel = 'gemini-2.5-flash';
+    else if (modelId === 'gemini-3.5-flash-lite' || modelId === 'gemini-3.1-flash-lite') effectiveModel = 'gemini-2.5-flash-lite';
+
     // Gemini requires role: "user" | "model". Map assistant -> model
     const contents = messages
       .filter(m => m.role !== 'system')
@@ -947,7 +967,7 @@ NOME DO CLIENTE: ${contactName}
       };
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${effectiveModel}:generateContent?key=${apiKey}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -969,10 +989,18 @@ NOME DO CLIENTE: ${contactName}
     const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
     // So o texto visivel: partes com thought=true sao pensamento oculto da IA
     // (pode conter coisas como "Check Constreainsts:...") e NUNCA vao ao cliente.
-    const text = parts
+    let text = parts
       .filter(p => p && typeof p.text === 'string' && !p.thought)
       .map(p => p.text)
       .join('');
+
+    // Fallback: se o modelo respondeu com thought mas não separou em partes explícitas,
+    // ou se todas as partes foram filtradas mas há texto limpo disponível
+    if (!text.trim() && parts.length > 0) {
+      const rawText = parts.map(p => (p && typeof p.text === 'string') ? p.text : '').join('');
+      const cleaned = rawText.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
+      if (cleaned) text = cleaned;
+    }
 
     if (!text.trim()) {
       throw new Error(`Gemini sem texto visivel (finishReason=${cand.finishReason || 'desconhecido'})`);

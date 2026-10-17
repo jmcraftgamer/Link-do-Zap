@@ -17,7 +17,7 @@ LAST_BACKUP=0
 
 urgent_pairing_dirty() {
   [ -d "$DATA_DIR/.git" ] || return 1
-  git -C "$DATA_DIR" status --porcelain -- pairing-codes.json 'qr-*.png' 2>/dev/null | grep -q .
+  git -C "$DATA_DIR" status --porcelain -- pairing-codes.json 'qr-*.png' bot-status.json 2>/dev/null | grep -q .
 }
 
 do_backup() {

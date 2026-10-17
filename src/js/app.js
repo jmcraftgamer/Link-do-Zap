@@ -152,16 +152,28 @@ const GOOGLEAI_PRECONFIGURED = {
   name: 'Google AI Studio',
   apiKey: BOOTSTRAP_KEYS.googleai || '',
   models: [
-    { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', free: true, limits: '10 RPM | 250k TPM | 250 RPD' },
-    { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', free: true, limits: '15 RPM | 250k TPM | 1.000 RPD' },
-    { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash-Lite', free: true, limits: '15 RPM | 250k TPM | 1.000 RPD' }
+    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', free: true, limits: '15 RPM | 1M TPM | 1.500 RPD' },
+    { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash-Lite', free: true, limits: '30 RPM | 1M TPM | 1.500 RPD' },
+    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', free: true, limits: '15 RPM | 1M TPM | 1.500 RPD' },
+    { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash-Lite', free: true, limits: '30 RPM | 1M TPM | 1.500 RPD' },
+    { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', free: true, limits: '15 RPM | 1M TPM | 1.500 RPD' },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', free: true, limits: '5 RPM | 250k TPM | 50 RPD' }
   ],
   createdAt: new Date().toISOString(),
   preconfigured: true
 };
 
-if (!providersData.find(p => p.id === 'googleai-preconfig')) {
+const existingGoogle = providersData.find(p => p.id === 'googleai-preconfig');
+if (!existingGoogle) {
   providersData.unshift(GOOGLEAI_PRECONFIGURED);
+  localStorage.setItem('linknozap_providers', JSON.stringify(providersData));
+} else {
+  // Garante que o provedor existente receba os modelos oficiais
+  GOOGLEAI_PRECONFIGURED.models.forEach(m => {
+    if (!existingGoogle.models.some(em => em && em.id === m.id)) {
+      existingGoogle.models.push(m);
+    }
+  });
   localStorage.setItem('linknozap_providers', JSON.stringify(providersData));
 }
 
@@ -1278,10 +1290,10 @@ function openZapPanel(zapId) {
           await window.electronAPI.whatsappDisconnect(zapId.toString());
           applyRuntimeStatus(z, 'disconnected');
         } else {
-          // Enabling: try to reconnect with saved method
+          // Enabling: try to reconnect with saved session
           applyRuntimeStatus(z, 'connecting');
-          const method = z.lastConnectMethod || 'qrcode';
-          await window.electronAPI.whatsappConnect(zapId.toString(), z.phone.replace(/\D/g, ''), method);
+          // Reutiliza a sessão salva existente sem apagar arquivos do disco
+          await window.electronAPI.whatsappConnect(zapId.toString(), z.phone ? z.phone.replace(/\D/g, '') : '', 'qrcode');
         }
       }
       saveZaps();
@@ -2549,6 +2561,47 @@ function provKeyNameAt(provider, index) {
   return names[index] || `Chave ${index + 1}`;
 }
 
+function normalizeKeyValue(value) {
+  return String(value || '').replace(/\s+/g, '').trim();
+}
+
+function keyPrefixHint(providerId) {
+  const id = String(providerId || '').toLowerCase();
+  if (id.includes('openrouter')) return 'sk-or-...';
+  if (id.includes('google')) return 'AIza... ou AQ....';
+  return null;
+}
+
+function keyLooksValidFor(providerId, key) {
+  const k = normalizeKeyValue(key);
+  if (k.length < 16) return false;
+  const id = String(providerId || '').toLowerCase();
+  if (id.includes('openrouter')) return k.startsWith('sk-or-');
+  if (id.includes('google')) return k.startsWith('AIza') || k.startsWith('AQ.');
+  return true;
+}
+
+// Persiste o estado atual das chaves imediatamente (localStorage + providers.json
+// via IPC). Chaves NUNCA devem depender do botao "Salvar" principal: se o app
+// fechar ou o usuario navegar, a chave tem que estar gravada.
+function persistProviderKeys() {
+  const provider = currentEditingProvider;
+  if (!provider) return;
+  provider.apiKeys = (provider.apiKeys || [])
+    .map(k => normalizeKeyValue(k))
+    .filter(Boolean);
+  provider.apiKey = provider.apiKeys[0] || '';
+  saveProviders();
+  const oldName = providerSnapshot ? providerSnapshot.name : provider.name;
+  if (typeof syncZapsWithProvider === 'function' && syncZapsWithProvider(provider, oldName)) {
+    saveZaps();
+    renderZaps(zapsData);
+  }
+  providerSnapshot = JSON.parse(JSON.stringify(provider));
+  setProvDirty(false);
+  renderProvKeysList();
+}
+
 function renderProvKeysList() {
   const provider = currentEditingProvider;
   const container = document.getElementById('provKeysList');
@@ -2650,14 +2703,18 @@ function startEditProvKey(row, index) {
   const cancelBtn = main.querySelector('[data-action="cancel"]');
 
   confirmBtn.addEventListener('click', () => {
-    const newValue = valueInput.value.trim();
+    const newValue = normalizeKeyValue(valueInput.value);
     if (!newValue) { alert('Informe a chave API.'); return; }
+    const hint = keyPrefixHint(provider.id);
+    if (hint && !keyLooksValidFor(provider.id, newValue)) {
+      if (!confirm(`Esta chave não parece válida para ${provider.name} (formato esperado: ${hint}).\nSalvar mesmo assim?`)) {
+        return;
+      }
+    }
     provider.apiKeys[index] = newValue;
     provider.apiKeyNames = provider.apiKeyNames || [];
     provider.apiKeyNames[index] = nameInput.value.trim() || `Chave ${index + 1}`;
-    provider.apiKey = provider.apiKeys.find(k => k && k.trim()) || provider.apiKeys[0] || '';
-    setProvDirty(true);
-    renderProvKeysList();
+    persistProviderKeys();
   });
 
   cancelBtn.addEventListener('click', () => renderProvKeysList());
@@ -2668,7 +2725,10 @@ function startEditProvKey(row, index) {
   };
   nameInput.addEventListener('keydown', onKey);
   valueInput.addEventListener('keydown', onKey);
+  // Seleciona tudo: se o usuario colar por cima sem Ctrl+A, substitui a chave
+  // antiga inteira em vez de concatenar (causa classica de chave invalida)
   valueInput.focus();
+  valueInput.select();
 }
 
 function removeProvKey(index) {
@@ -2683,9 +2743,7 @@ function removeProvKey(index) {
   keys.splice(index, 1);
   provider.apiKeys = keys;
   if (Array.isArray(provider.apiKeyNames)) provider.apiKeyNames.splice(index, 1);
-  provider.apiKey = keys.find(k => k && k.trim()) || keys[0] || '';
-  setProvDirty(true);
-  renderProvKeysList();
+  persistProviderKeys();
 }
 
 function openProvKeyForm() {
@@ -2706,18 +2764,23 @@ function confirmAddProvKey() {
   const provider = currentEditingProvider;
   if (!provider) return;
   const name = document.getElementById('provKeyNameInput').value.trim();
-  const value = document.getElementById('provKeyValueInput').value.trim();
+  const value = normalizeKeyValue(document.getElementById('provKeyValueInput').value);
   if (!value) { alert('Informe a chave API.'); return; }
+
+  const hint = keyPrefixHint(provider.id);
+  if (hint && !keyLooksValidFor(provider.id, value)) {
+    if (!confirm(`Esta chave não parece válida para ${provider.name} (formato esperado: ${hint}).\nAdicionar mesmo assim?`)) {
+      return;
+    }
+  }
 
   provider.apiKeys = provider.apiKeys || [];
   provider.apiKeyNames = provider.apiKeyNames || [];
   provider.apiKeys.push(value);
   provider.apiKeyNames.push(name || `Chave ${provider.apiKeys.length}`);
-  provider.apiKey = provider.apiKeys.find(k => k && k.trim()) || provider.apiKeys[0];
 
-  setProvDirty(true);
-  renderProvKeysList();
   closeProvKeyForm();
+  persistProviderKeys();
 }
 
 function renderProvModelsList() {
@@ -2927,9 +2990,11 @@ async function sendTestMessage() {
   // Show loading
   const loadingId = addChatMessage('assistant', 'Pensando...', true);
 
-  // Get API key
-  const apiKeys = currentTestProvider.apiKeys || [currentTestProvider.apiKey];
-  const apiKey = apiKeys[0];
+  // Get API key (mesma resolucao do processo principal: apiKeys primeiro, limpa)
+  const apiKeys = (Array.isArray(currentTestProvider.apiKeys) && currentTestProvider.apiKeys.length)
+    ? currentTestProvider.apiKeys
+    : [currentTestProvider.apiKey];
+  const apiKey = apiKeys.map(k => normalizeKeyValue(k)).find(Boolean) || '';
 
   if (!apiKey) {
     updateChatMessage(loadingId, 'error', 'Nenhuma chave API configurada.');

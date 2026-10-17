@@ -1217,6 +1217,14 @@ class WhatsAppManager {
     const ids = [];
     const push = (v) => { if (v && !ids.includes(v)) ids.push(v); };
 
+    // @lid já é um identificador de chat válido no WhatsApp Web moderno.
+    // getNumberId espera um número de telefone com DDI/DDD e retornaria null para hashes de LID,
+    // marcando erroneamente notOnWa: true e impedindo o envio de respostas e mensagens de erro.
+    if (typeof targetId === 'string' && targetId.includes('@lid')) {
+      push(targetId);
+      return { ids, notOnWa: false };
+    }
+
     const num = this._normNum(targetId);
     if (!num || typeof client.getNumberId !== 'function') {
       push(targetId);
