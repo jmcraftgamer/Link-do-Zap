@@ -437,6 +437,18 @@ test('horario: configuracao invalida nao bloqueia', () => {
   assert.strictEqual(isWithinWorkHours({ enabled: true, start: '08:00', end: '08:00' }), true, 'janela de 24h');
 });
 
+test('horario: usa o fuso configurado (servidor roda em UTC)', () => {
+  const wh = { enabled: true, start: '22:00', end: '23:30', days: [0], tz: 'America/Sao_Paulo' };
+  assert.strictEqual(isWithinWorkHours(wh, new Date('2026-01-05T02:00:00Z')), true, 'domingo 23h em SP');
+  assert.strictEqual(
+    isWithinWorkHours({ enabled: true, start: '22:00', end: '23:30', days: [1], tz: 'UTC' }, new Date('2026-01-05T02:00:00Z')),
+    false, 'mesmo instante em UTC seria segunda 02h');
+  assert.strictEqual(
+    isWithinWorkHours({ enabled: true, start: '08:00', end: '18:00', tz: 'Fuso/Invalido' }, new Date()),
+    isWithinWorkHours({ enabled: true, start: '08:00', end: '18:00' }, new Date()),
+    'fuso invalido cai para a hora do sistema');
+});
+
 test('horario: main.js e o painel usam o horario de atendimento', () => {
   const mainSrc = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
   assert.ok(mainSrc.includes('isWithinWorkHours'), 'main.js nao checa o horario');
@@ -446,6 +458,7 @@ test('horario: main.js e o painel usam o horario de atendimento', () => {
   assert.ok(html.includes('panelWorkStart') && html.includes('panelWorkEnd'), 'painel sem campos de hora');
   const appSrc = fs.readFileSync(path.join(root, 'src', 'js', 'app.js'), 'utf8');
   assert.ok(appSrc.includes('workHours'), 'app.js nao persiste o horario');
+  assert.ok(appSrc.includes('resolvedOptions'), 'app.js nao grava o fuso (servidor roda em UTC)');
 });
 
 // ================= MEMORIA / HISTORICO DE CONVERSAS =================

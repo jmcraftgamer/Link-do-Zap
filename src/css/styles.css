@@ -449,6 +449,10 @@ input, textarea, select {
   background: var(--bg-secondary);
 }
 
+#addZapBtn {
+  border: none;
+}
+
 .btn-primary {
   background: var(--text-primary);
   border: 1.5px solid var(--text-primary);
@@ -511,8 +515,6 @@ input, textarea, select {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg-secondary);
-  border-radius: 8px;
   flex-shrink: 0;
   margin-right: 14px;
 }

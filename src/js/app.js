@@ -1277,7 +1277,8 @@ function openZapPanel(zapId) {
     enabled: whCb.checked,
     start: whStart.value || '08:00',
     end: whEnd.value || '18:00',
-    days: whDayBoxes.filter(cb => cb.checked).map(cb => Number(cb.value))
+    days: whDayBoxes.filter(cb => cb.checked).map(cb => Number(cb.value)),
+    tz: (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) { return ''; } })()
   });
   const persistWorkHours = () => {
     const z = zapsData.find(x => String(x.id) === String(zapId));
