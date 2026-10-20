@@ -344,6 +344,36 @@
               <div class="model-config-hint panel-instant-hint">Ignora o sorteio de tempo (15s, 25s ou 35s) e comeca a responder na hora.</div>
             </div>
 
+            <!-- Horario de atendimento -->
+            <div class="panel-section">
+              <div class="panel-section-title">Horario de atendimento</div>
+              <label class="panel-enabled-toggle">
+                <input type="checkbox" id="panelWorkHours">
+                <span class="toggle-slider"></span>
+                <span class="panel-enabled-label" id="panelWorkHoursLabel">Responder so no horario definido</span>
+              </label>
+              <div class="model-config-row" id="panelWorkHoursRow" style="display:none">
+                <div>
+                  <div class="model-config-label">Inicio</div>
+                  <input type="time" class="panel-area-input" id="panelWorkStart" value="08:00">
+                </div>
+                <div>
+                  <div class="model-config-label">Fim</div>
+                  <input type="time" class="panel-area-input" id="panelWorkEnd" value="18:00">
+                </div>
+              </div>
+              <div id="panelWorkDays" style="display:none; flex-wrap:wrap; gap:10px; margin-top:8px">
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="1"> Seg</label>
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="2"> Ter</label>
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="3"> Qua</label>
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="4"> Qui</label>
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="5"> Sex</label>
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="6"> Sab</label>
+                <label style="display:inline-flex; align-items:center; gap:4px"><input type="checkbox" class="panel-work-day" value="0"> Dom</label>
+              </div>
+              <div class="model-config-hint">Fora desse horario a IA nao responde e a mensagem nem e enviada para ela.</div>
+            </div>
+
             <!-- Charts -->
             <div class="panel-section">
               <div class="panel-section-title">Estatsticas</div>

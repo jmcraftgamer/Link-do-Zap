@@ -202,6 +202,9 @@ class WhatsAppManager {
         clientId: zapId,
         dataPath: sessionPath
       }),
+      // Redes lentas: o WA Web pode demorar para expor window.Debug apos o
+      // evento load. O padrao do wwebjs e 30s e estoura "auth timeout".
+      authTimeoutMs: 180000,
       puppeteer: {
         headless: true,
         args: [
@@ -261,6 +264,10 @@ class WhatsAppManager {
       messages: new Map(),
       chats: new Map(),
       startupTime: Math.floor(Date.now() / 1000),
+      // Maior timestamp (relogio do SERVIDOR) de mensagem vista nesta sessao.
+      // Usado como sanidade independente do relogio do PC (que costuma estar
+      // adiantado/atrasado minutos e fazia mensagens reais serem descartadas).
+      newestMsgTs: 0,
       // Autochat (mensagens para o proprio numero)
       selfNumber: null,
       // Numero pareado (fallback/segundo candidato do autochat)
@@ -345,6 +352,9 @@ class WhatsAppManager {
       data.readyAt = Math.floor(Date.now() / 1000);
       data.readyWall = Date.now();
       data.historyBufferUntil = Date.now() + 90 * 1000;
+      // Zera a referencia de "mensagem mais nova" da sessao (fica pronta para
+      // aceitar a primeira mensagem real imediatamente, sem depender de relogio)
+      data.newestMsgTs = 0;
       // Autochat: descobre o numero proprio para reconhecer mensagens enviadas a si mesmo
       try {
         const wid = client.info && client.info.wid;
@@ -411,6 +421,7 @@ class WhatsAppManager {
       data.readyAt = null;
       data.readyWall = null;
       data.historyBufferUntil = null;
+      data.newestMsgTs = 0;
       this.logToApp(zapId, 'warning', `Zap DESCONECTADO (${reason}). Mensagens nao serao processadas ate reconectar.`);
       if (reason === 'LOGOUT') {
         this.logToApp(zapId, 'error', 'Sessao expirada no WhatsApp (LOGOUT). Reconecte pelo painel para gerar um novo pareamento.');
@@ -489,6 +500,17 @@ class WhatsAppManager {
         if (!msg.fromMe) return; // mensagens recebidas vêm pelo evento 'message'
         const data = this.clients.get(zapId);
         if (!data || data.client !== client) return;
+
+        // DONO RESPONDEU MANUALMENTE (celular/outro aparelho): registra o
+        // horario para a IA NAO responder por cima. 'web' = mesma sessao do
+        // app (envio da propria IA/UI) - nao conta como resposta do dono.
+        if (msg.deviceType && msg.deviceType !== 'web') {
+          const ownerJid = msg.to || msg.from || '';
+          if (!this._isGroupJid(ownerJid)) {
+            this.markOwnerReply(zapId, ownerJid, msg.timestamp);
+            this.logToApp(zapId, 'info', `Dono respondeu manualmente (${msg.deviceType}) em ${ownerJid} - IA nao vai responder por cima.`);
+          }
+        }
 
         // Chat da mensagem: para mensagens enviadas por mim, o chat e msg.to
         const chatJid = msg.to || msg.from || '';
@@ -806,8 +828,10 @@ class WhatsAppManager {
         return;
       }
 
-      // REGRA 1: Bot precisa estar pronto (ready)
-      if (clientData.status !== 'ready') {
+      // REGRA 1: Bot precisa estar pronto. Aceita 'ready' (sync concluido) e
+      // tambem 'authenticated' (sessao ja autenticada, socket aberto) - assim
+      // mensagens que chegam logo apos o pareamento NAO sao descartadas.
+      if (clientData.status !== 'ready' && clientData.status !== 'authenticated') {
         this.logToApp(zapId, 'warning', `IA ignorada: status atual e "${clientData.status}" (aguardando ready).`);
         return;
       }
@@ -827,29 +851,21 @@ class WhatsAppManager {
         }
       }
 
-      // REGRA 2: Mensagem precisa ter sido enviada DEPOIS do pareamento
-      // Híbrido: por 90s após ready filtra por timestamp (com grace 60s para skew de relógio PC vs WhatsApp)
-      // Após 90s aceita tudo (corrige bug onde PC adiantado 4-6min fazia OI real ser ignorado como histórico)
-      const nowWall = Date.now();
-      if (clientData.historyBufferUntil && nowWall < clientData.historyBufferUntil) {
-        // Dentro da janela de buffer: filtra histórico
-        const grace = 60; // 60s de tolerância para skew
-        if (clientData.readyAt && msg.timestamp < clientData.readyAt - grace) {
+      // REGRA 2: o wwebjs SO emite o evento 'message' para mensagens novas
+      // (no listener injetado: `if (!msg.isNewMsg) return`) - historico/backlog
+      // NUNCA chega aqui. Por isso nao ha filtro por relogio do PC (que estava
+      // descartando mensagens reais por skew de minutos). Mantemos apenas uma
+      // sanidade independente de relogio: ignora se a mensagem for bem mais
+      // antiga (3 min) que a mensagem mais nova ja vista nesta sessao.
+      const msgTs = Number(msg.timestamp) || 0;
+      if (msgTs) {
+        const newest = Number(clientData.newestMsgTs) || 0;
+        if (newest && msgTs < newest - 180) {
           this.logToApp(zapId, 'warning',
-            `IA ignorada: mensagem historica (msg ${msg.timestamp} < readyAt ${clientData.readyAt} -${grace}s, diff ${clientData.readyAt - msg.timestamp}s, buffer ativo).`);
+            `IA ignorada: mensagem antiga (msg ${msgTs} < mais nova vista ${newest} -180s).`);
           return;
         }
-      } else if (clientData.readyAt && msg.timestamp) {
-        // Fora da janela: só ignora se for muito antiga (>10min antes do ready) - protege contra replay muito antigo
-        if (msg.timestamp < clientData.readyAt - 600) {
-          this.logToApp(zapId, 'warning',
-            `IA ignorada: mensagem muito antiga (msg ${msg.timestamp} < readyAt ${clientData.readyAt} -600s, diff ${clientData.readyAt - msg.timestamp}s).`);
-          return;
-        }
-        // Caso contrário, aceita mesmo se timestamp parecer antigo (clock skew)
-        if (msg.timestamp < clientData.readyAt) {
-          this.logToApp(zapId, 'info', `IA aceita: mensagem com timestamp antigo mas fora do buffer (clock skew, diff ${clientData.readyAt - msg.timestamp}s) - respondendo.`);
-        }
+        if (msgTs > newest) clientData.newestMsgTs = msgTs;
       }
 
       // Passou em todos os filtros - chamar a IA!
@@ -1369,6 +1385,14 @@ class WhatsAppManager {
       return { ids, notOnWa: false };
     }
 
+    // Cache de resolucao: evita chamar getNumberId (consulta de rede) a cada
+    // envio para o mesmo contato (no autochat o mesmo numero e enviado sempre).
+    if (!this._sendTargetCache) this._sendTargetCache = new Map();
+    const cached = this._sendTargetCache.get(targetId);
+    if (cached && (Date.now() - cached.t) < 10 * 60 * 1000) {
+      return { ids: cached.ids.slice(), notOnWa: false };
+    }
+
     const num = this._normNum(targetId);
     if (!num || typeof client.getNumberId !== 'function') {
       push(targetId);
@@ -1393,6 +1417,8 @@ class WhatsAppManager {
       push(alt); // @lid (preferido) ou @c.us resolvido
     }
     push(targetId); // fallback: numero original
+    if (this._sendTargetCache.size > 500) this._sendTargetCache.clear();
+    this._sendTargetCache.set(targetId, { ids: ids.slice(), t: Date.now() });
     return { ids };
   }
 
@@ -1489,7 +1515,7 @@ class WhatsAppManager {
           }
         }
       }
-      if (attempt < attempts) await new Promise(r => setTimeout(r, 1500));
+      if (attempt < attempts) await new Promise(r => setTimeout(r, 800));
     }
     throw lastErr || new Error('Falha ao enviar mensagem');
   }
@@ -1651,6 +1677,119 @@ class WhatsAppManager {
       }
       this.logToApp(zapId, 'error', `Falha ao enviar midia: ${e.message}`);
       throw e;
+    } finally {
+      const dEnd = this.clients.get(zapId);
+      if (dEnd) dEnd.aiSending = false;
+    }
+  }
+
+  // ============================================================
+  // RESPOSTA DO DONO DO NUMERO (evita a IA responder por cima)
+  // ============================================================
+
+  // Registra que o dono respondeu neste chat no horario `ts` (segundos).
+  markOwnerReply(zapId, chatId, ts) {
+    const cd = this.clients.get(String(zapId));
+    if (!cd) return;
+    const chatNorm = this._normNum(chatId);
+    if (!chatNorm) return;
+    if (!cd.ownerReplies) cd.ownerReplies = new Map();
+    const t = Number(ts) || Math.floor(Date.now() / 1000);
+    if (t > (cd.ownerReplies.get(chatNorm) || 0)) {
+      cd.ownerReplies.set(chatNorm, t);
+    }
+  }
+
+  // O dono respondeu depois de `sinceTs`? Checa o evento em tempo real e,
+  // quando `opts.live`, confere ao vivo na rede (pega o que o evento perdeu).
+  async hasOwnerReplied(zapId, chatId, sinceTs, opts) {
+    const cd = this.clients.get(String(zapId));
+    if (!cd) return false;
+    const since = Number(sinceTs) || 0;
+    const chatNorm = this._normNum(chatId);
+    if (cd.ownerReplies && chatNorm) {
+      const t = cd.ownerReplies.get(chatNorm) || 0;
+      if (t > since) return true;
+    }
+    if (opts && opts.live && since) {
+      try {
+        const msgs = await this.fetchRecentMessages(zapId, chatId, 4);
+        for (const m of msgs) {
+          if (m && m.fromMe && m.deviceType && m.deviceType !== 'web' && (m.timestamp || 0) > since) {
+            return true;
+          }
+        }
+      } catch (_) { /* rede falhou - segue com o que ja tem */ }
+    }
+    return false;
+  }
+
+  // Ultimas mensagens do chat, direto do WhatsApp (para conferencia ao vivo).
+  async fetchRecentMessages(zapId, chatId, limit) {
+    const cd = this.clients.get(String(zapId));
+    if (!cd || !cd.client) return [];
+    const client = cd.client;
+    const targetId = this._normalizeChatId(chatId);
+    let ids = [targetId];
+    try {
+      const resolved = await this._resolveSendTarget(client, targetId);
+      if (resolved && Array.isArray(resolved.ids) && resolved.ids.length) ids = resolved.ids;
+    } catch (_) { /* usa o id cru */ }
+    for (const id of ids) {
+      try {
+        const chat = await client.getChatById(id);
+        if (!chat || typeof chat.fetchMessages !== 'function') continue;
+        const msgs = await chat.fetchMessages({ limit: limit || 3 });
+        if (Array.isArray(msgs)) {
+          return msgs.map(m => ({
+            id: this._ensureMsgKey(m),
+            fromMe: !!m.fromMe,
+            deviceType: m.deviceType || null,
+            timestamp: m.timestamp || 0,
+            body: m.body || '',
+            hasMedia: !!m.hasMedia
+          }));
+        }
+      } catch (_) { /* tenta o proximo id */ }
+    }
+    return [];
+  }
+
+  // Envia citando (reply) a mensagem `quotedMsgId` armazenada no cache.
+  // Sem a mensagem em cache, cai para o envio normal.
+  async replyMessage(zapId, phone, text, quotedMsgId) {
+    const clientData = this.clients.get(zapId);
+    if (!clientData || clientData.status !== 'ready') {
+      throw new Error(`Zap ${zapId} nao esta conectado`);
+    }
+    const msgText = String(text || '');
+    const targetId = this._normalizeChatId(phone);
+    const quoted = (quotedMsgId && clientData.messages) ? clientData.messages.get(quotedMsgId) : null;
+    if (!quoted || typeof quoted.reply !== 'function') {
+      this.logToApp(zapId, 'warning', `Mensagem citada indisponivel (${quotedMsgId}) - enviando sem citacao.`);
+      return this.sendMessage(zapId, phone, msgText);
+    }
+
+    const d = this.clients.get(zapId);
+    if (d) {
+      if (!d.pendingAiSends) d.pendingAiSends = [];
+      d.pendingAiSends.push({ body: msgText, t: Date.now() });
+      if (d.pendingAiSends.length > 20) d.pendingAiSends.shift();
+      d.aiSending = true;
+    }
+    try {
+      const sentMsg = await this._sendRobust(zapId, [targetId], () => quoted.reply(msgText));
+      const sid = this._ensureMsgKey(sentMsg);
+      const d2 = this.clients.get(zapId);
+      if (d2 && sid) {
+        if (!d2.aiSentIds) d2.aiSentIds = new Set();
+        d2.aiSentIds.add(sid);
+      }
+      this.logToApp(zapId, 'success', `Mensagem enviada citando a mensagem anterior para ${targetId}`);
+      return { success: true, msgId: sid, quoted: true };
+    } catch (e) {
+      this.logToApp(zapId, 'warning', `Envio citado falhou (${e.message}) - enviando sem citacao.`);
+      return this.sendMessage(zapId, phone, msgText);
     } finally {
       const dEnd = this.clients.get(zapId);
       if (dEnd) dEnd.aiSending = false;

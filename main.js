@@ -4,9 +4,22 @@ const fs = require('fs');
 const WhatsAppManager = require('./src/js/whatsapp-manager');
 const AIResponder = require('./src/js/ai-responder');
 const { resolveReplyMedia } = require('./src/js/media-resolver');
+const { verifyMessage } = require('./src/js/message-guard');
+const { isWithinWorkHours } = require('./src/js/work-hours');
+
+// Memoria de conversas: historico dos dias anteriores vai junto no prompt da
+// IA e tambem e gravado em .txt (<dados>/memorias/<zapId>/<contato>.txt).
+const MEMORY_DAYS = 3;
+const MEMORY_MAX_CHARS = 6000;
+
+// Citacao eventual: chance de, numa resposta com varias mensagens, UMA delas
+// sair como "responder citando" a mensagem do cliente (mostra qual mensagem
+// esta sendo respondida, sem dizer nada no texto).
+const QUOTE_CHANCE = 0.35;
 const ConversationStore = require('./src/js/conversation-store');
 const AutoMessageManager = require('./src/js/auto-message');
 const AppAgent = require('./src/js/app-agent');
+const ServerSync = require('./src/js/server-sync');
 
 let mainWindow;
 let whatsappManager;
@@ -15,6 +28,9 @@ let conversationStore = null;
 let autoMessage = null;
 let appAgent = null;
 let rendererDragging = false;
+let serverSync = null;
+let serverMode = false;
+let serverKnownZaps = null;
 
 // Um evaluate do wwebjs numa pagina morta (teardown de LOGOUT) rejeita sem
 // catcher e no Node derrubaria o processo inteiro - aqui so registra o erro
@@ -168,6 +184,18 @@ function scheduleMidnightRollover() {
     }
   }, 60 * 1000);
   if (rolloverTimer && typeof rolloverTimer.unref === 'function') rolloverTimer.unref();
+}
+
+function memoryFileText(contactName, zapId, chatId, body) {
+  const head = [
+    'MEMORIA DE CONVERSAS',
+    `Cliente: ${contactName || chatId}`,
+    `Zap: ${zapId}    Contato: ${chatId}`,
+    `Gerado em: ${new Date().toISOString()}`,
+    `Periodo: ultimos ${MEMORY_DAYS} dias`,
+    '------------------------------------------------------------'
+  ].join('\n');
+  return `${head}\n${body}\n`;
 }
 
 // ------------------------------------------------------------
@@ -350,6 +378,9 @@ async function processMessage(messageData) {
   const contactName = contact?.name || from;
   const chatId = chat?.id || from;
   const audioFailed = !!messageData.audioFailed;
+  // Horario da mensagem que disparou a IA (segundos). Serve para saber se o
+  // dono do numero respondeu DEPOIS dela antes de a IA mandar a resposta.
+  const triggerTs = messageData.timestamp || Math.floor(Date.now() / 1000);
 
   // ================= GRUPOS: CORTE NO TOPO =================
   // Nenhuma mensagem de grupo/canal/transmissao pode chegar na IA.
@@ -395,6 +426,13 @@ async function processMessage(messageData) {
     sendLog(zapId, 'warning', 'Auto-reply desativado para este Zap');
     return;
   }
+
+  // Horario de atendimento: fora da janela a mensagem nem chega na IA e nada
+  // e enviado ao cliente (a conversa tambem nao e registrada).
+  if (zap.workHours && zap.workHours.enabled === true && !isWithinWorkHours(zap.workHours)) {
+    sendLog(zapId, 'info', `Fora do horario de atendimento (${zap.workHours.start}-${zap.workHours.end}) - mensagem ignorada, nao enviada a IA.`);
+    return;
+  }
   // blockedContacts stores contact.id which may be @s.whatsapp.net or @c.us - normalize to number part
   if (zap.blockedContacts && zap.blockedContacts.length) {
     const fromNumber = (from || '').split('@')[0];
@@ -424,10 +462,35 @@ async function processMessage(messageData) {
       convResult = null;
     }
   }
-  const conversationInfo = convResult ? {
-    label: new Date(convResult.conversation.startedAt).toTimeString().substring(0, 5),
-    count: convResult.conversation.messages.length
-  } : null;
+  // ---- Memoria de conversas (ultimos 3 dias) ----
+  let memoryText = '';
+  try {
+    if (conversationStore) {
+      memoryText = conversationStore.memoryText(zapId, chatId, { days: MEMORY_DAYS, maxChars: MEMORY_MAX_CHARS });
+    }
+  } catch (e) {
+    sendLog(zapId, 'warning', `Memoria indisponivel: ${e.message}`);
+  }
+  if (memoryText) {
+    try {
+      const mdir = path.join(getDataDir(), 'memorias', String(zapId));
+      fs.mkdirSync(mdir, { recursive: true });
+      const safeChat = String(chatId).replace(/[^A-Za-z0-9@._-]/g, '_');
+      const mfile = path.join(mdir, `${safeChat}.txt`);
+      fs.writeFileSync(mfile, memoryFileText(contactName, zapId, chatId, memoryText));
+      sendLog(zapId, 'info', `Memoria de conversas anexada (${memoryText.split('\n').length} linha(s)) -> ${path.relative(getDataDir(), mfile)}`);
+    } catch (e) {
+      sendLog(zapId, 'warning', `Nao foi possivel gravar o arquivo de memoria: ${e.message}`);
+    }
+  }
+
+  const conversationInfo = Object.assign(
+    convResult ? {
+      label: new Date(convResult.conversation.startedAt).toTimeString().substring(0, 5),
+      count: convResult.conversation.messages.length
+    } : {},
+    memoryText ? { memoryText } : {}
+  );
 
   let finalBody = body;
 
@@ -586,9 +649,25 @@ async function processMessage(messageData) {
   // ---- 3) MENSAGENS MULTIPLAS ----
   // A IA separa com [QUEBRA] (ou, se nao marcou e o texto e grande, separamos
   // por frases). Curto = 1 mensagem. No maximo 4 baloes.
-  const parts = (aiResponder && typeof aiResponder.splitMessages === 'function')
+  const rawParts = (aiResponder && typeof aiResponder.splitMessages === 'function')
     ? aiResponder.splitMessages(media.text)
     : (String(media.text || '').trim() ? [String(media.text || '').trim()] : []);
+
+  // ---- 3.1) VERIFICADOR FINAL ----
+  // Ultimo portao antes do envio: nada de codigo, JSON, markdown, marcador
+  // vazado, texto de sistema, meta ou ingles. Reprova balao por balao.
+  const parts = [];
+  for (const p of rawParts) {
+    const v = verifyMessage(p, { incoming: finalBody });
+    if (v.ok) parts.push(p);
+    else sendLog(zapId, 'warning', `Mensagem reprovada pelo verificador (${v.reason}) - NAO enviada: "${p.substring(0, 80)}"`);
+  }
+  if (rawParts.length > 0 && parts.length === 0) {
+    sendLog(zapId, 'error', 'Todas as mensagens foram reprovadas pelo verificador - enviando aviso padrao.');
+    await clearTypingIndicator(zapId, chatId);
+    await sendErrorToWhatsApp(zapId, chatId, 'Desculpe, tive um problema tecnico. Pode repetir sua mensagem?');
+    return;
+  }
 
   if (aiResponder && typeof aiResponder.updateLastAssistant === 'function') {
     const delivered = parts.length ? parts.join(' ') : (String(media.text || '').trim() || '(mensagem sem texto)');
@@ -604,6 +683,16 @@ async function processMessage(messageData) {
     await clearTypingIndicator(zapId, chatId);
   }
 
+  // ---- 3.3) CITACAO EVENTUAL ----
+  // As vezes (nem sempre), numa resposta com varias mensagens, UMA delas sai
+  // como "responder citando" a mensagem do cliente - mostra qual mensagem
+  // esta sendo respondida sem escrever isso no texto.
+  let quoteIndex = -1;
+  if (parts.length > 1 && messageData.id && Math.random() < QUOTE_CHANCE) {
+    quoteIndex = Math.floor(Math.random() * parts.length);
+    sendLog(zapId, 'info', `Resposta tera 1 mensagem citando a mensagem do cliente (balão ${quoteIndex + 1}/${parts.length}).`);
+  }
+
   // ---- 4) ENTREGA: DIGITACAO REALISTA ENTRE CADA MENSAGEM ----
   for (let i = 0; i < parts.length; i++) {
     const text = parts[i];
@@ -614,16 +703,39 @@ async function processMessage(messageData) {
     if (i > 0) await sendTypingIndicator(zapId, chatId);
 
     await waitRealisticTyping(zapId, chatId, partTypingStart, text);
-    await clearTypingIndicator(zapId, chatId);
+    // Nao espera o indicador de digitacao sumir antes de enviar: isso somava
+    // ~1s de atraso por mensagem. Dispara em paralelo e segue para o envio.
+    clearTypingIndicator(zapId, chatId).catch(() => {});
+
+    // Portao final NO EXATO MOMENTO DO ENVIO: se o dono do numero ja respondeu
+    // depois da mensagem do cliente (inclusive durante o sorteio/digitacao),
+    // a IA NAO manda por cima.
+    let ownerReplied = false;
+    if (whatsappManager && typeof whatsappManager.hasOwnerReplied === 'function') {
+      try {
+        ownerReplied = await whatsappManager.hasOwnerReplied(String(zapId), chatId, triggerTs, { live: i === 0 });
+      } catch (_) { ownerReplied = false; }
+    }
+    if (ownerReplied) {
+      sendLog(zapId, 'info', 'Dono do numero ja respondeu esta conversa - IA nao vai responder por cima.');
+      return;
+    }
 
     const preview = text.substring(0, 80);
     const label = parts.length > 1 ? `[${i + 1}/${parts.length}] ` : '';
-    sendLog(zapId, 'outgoing', `Enviando ${label}: "${preview}..."`);
+    const citLabel = i === quoteIndex ? ' (citando a mensagem do cliente)' : '';
+    sendLog(zapId, 'outgoing', `Enviando ${label}${citLabel}: "${preview}..."`);
     try {
-      await whatsappManager.sendMessage(String(zapId), chatId, text);
+      const _sendT0 = Date.now();
+      if (i === quoteIndex && typeof whatsappManager.replyMessage === 'function') {
+        await whatsappManager.replyMessage(String(zapId), chatId, text, messageData.id);
+      } else {
+        await whatsappManager.sendMessage(String(zapId), chatId, text);
+      }
+      const _sendSecs = ((Date.now() - _sendT0) / 1000).toFixed(1);
       sendLog(zapId, 'success', parts.length > 1
-        ? `Mensagem ${i + 1}/${parts.length} enviada!`
-        : 'Mensagem enviada com sucesso!');
+        ? `Mensagem ${i + 1}/${parts.length} enviada!${citLabel} (${_sendSecs}s)`
+        : `Mensagem enviada com sucesso!${citLabel} (${_sendSecs}s)`);
     } catch (error) {
       sendLog(zapId, 'error', `ERRO ao enviar: ${error.message}`);
       throw error;
@@ -894,6 +1006,66 @@ function autoPairMissingSessions() {
   if (count) console.log(`[AUTO-PAIR] ${count} zap(s) aguardando pareamento (codigo em $LINK_CODE_FILE).`);
   else console.log('[AUTO-PAIR] Nenhum zap precisa de pareamento agora.');
   return count;
+}
+
+// ------------------------------------------------------------
+// Reconciler do servidor: aplica ao vivo o zaps.json alterado no painel
+// (novo zap = conecta/pareia; zap removido/desativado = desconecta)
+// ------------------------------------------------------------
+function startServerReconciler(intervalMs = 15000) {
+  if (!isHeadless() || !whatsappManager) return null;
+  const snapshot = () => {
+    const map = new Map();
+    for (const z of loadZapsData()) map.set(String(z.id), { enabled: z.enabled !== false });
+    return map;
+  };
+  if (!serverKnownZaps) serverKnownZaps = snapshot();
+  const autoPair = ['1', 'true', 'yes'].includes(String(process.env.LINK_AUTO_PAIR || '').toLowerCase());
+  const timer = setInterval(async () => {
+    try {
+      const zaps = loadZapsData();
+      const ids = new Set(zaps.map((z) => String(z.id)));
+      // Removidos no painel: desconecta e apaga a sessao no servidor
+      for (const id of [...serverKnownZaps.keys()]) {
+        if (ids.has(id)) continue;
+        console.log(`[SYNC] Zap ${id} removido no painel - desconectando`);
+        try { await whatsappManager.disconnectZap(id, 'removido no painel'); } catch (_) {}
+        try { fs.rmSync(path.join(getDataDir(), 'sessions', id), { recursive: true, force: true }); } catch (_) {}
+        serverKnownZaps.delete(id);
+      }
+      for (const z of zaps) {
+        const id = String(z.id);
+        const prev = serverKnownZaps.get(id);
+        const st = whatsappManager.getStatus(id) || { status: 'disconnected' };
+        const busy = ['connecting', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated', 'ready'].includes(st.status);
+        if (z.enabled === false) {
+          if (busy) {
+            console.log(`[SYNC] Zap ${id} desativado no painel - desconectando`);
+            try { await whatsappManager.disconnectZap(id, 'desativado no painel'); } catch (_) {}
+          }
+        } else if ((!prev || prev.enabled === false) && !busy) {
+          const sessionDir = path.join(getDataDir(), 'sessions', id);
+          const hasSession = fs.existsSync(sessionDir);
+          const phone = String(z.phone || '').replace(/\D/g, '');
+          if (hasSession) {
+            console.log(`[SYNC] Novo zap ${id} com sessao salva - conectando`);
+            Promise.resolve(whatsappManager.connectZap(id, '', 'qrcode'))
+              .catch((e) => console.error(`[SYNC] connectZap(${id}) falhou: ${e.message}`));
+          } else if (autoPair && phone) {
+            console.log(`[SYNC] Novo zap ${id} sem sessao - gerando pareamento`);
+            Promise.resolve(whatsappManager.connectZap(id, phone, 'pairing'))
+              .catch((e) => console.error(`[SYNC] pairing(${id}) falhou: ${e.message}`));
+          }
+        }
+        serverKnownZaps.set(id, { enabled: z.enabled !== false });
+      }
+    } catch (e) {
+      console.error('[SYNC] reconciler falhou:', e.message);
+    }
+  }, intervalMs);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  console.log(`[SYNC] Reconciler ativo (a cada ${Math.round(intervalMs / 1000)}s)`);
+  return timer;
 }
 
 // ------------------------------------------------------------
@@ -1202,6 +1374,28 @@ function ensureCampaignZapConnected() {
 app.whenReady().then(() => {
   ensureDataDir();
   if (!isHeadless()) createWindow();
+
+  // Modo servidor: o app local e apenas o painel. As configuracoes vao para
+  // o clone do repo de dados e o servidor 24h as aplica (nao conectamos o
+  // WhatsApp aqui para nao derrubar a sessao do servidor).
+  try {
+    const dataRepoDir = process.env.LINK_DATA_REPO_DIR || path.join(__dirname, 'data');
+    const resolvedRepo = path.resolve(dataRepoDir);
+    const localDir = path.resolve(getDataDir());
+    const syncOff = ['0', 'false', 'no'].includes(String(process.env.LINK_SERVER_SYNC || '').toLowerCase());
+    const isElectron = !!process.versions.electron; // falso nos testes (Node puro)
+    if (isElectron && !isHeadless() && !syncOff && resolvedRepo !== localDir && fs.existsSync(path.join(resolvedRepo, '.git'))) {
+      serverSync = new ServerSync({ sourceDir: localDir, dataDir: resolvedRepo });
+      serverMode = !!serverSync.enabled;
+    }
+  } catch (e) {
+    console.error('[SYNC] init falhou:', e.message);
+  }
+  if (serverMode) {
+    process.env.LINK_CONNECT_READONLY = '1';
+    console.log(`[SYNC] Modo servidor ativo - configs seguem para ${serverSync.dataDir}`);
+  }
+
   whatsappManager = new WhatsAppManager(mainWindow);
   aiResponder = new AIResponder();
   initConversationStore();
@@ -1216,11 +1410,13 @@ app.whenReady().then(() => {
       const tmp = p + '.tmp';
       fs.writeFileSync(tmp, JSON.stringify(zaps, null, 2));
       fs.renameSync(tmp, p);
+      if (serverSync) serverSync.scheduleSync();
     },
     loadTrainings: loadTrainingsData,
     saveTrainings: (data) => {
       ensureDataDir();
       fs.writeFileSync(getFilePath('trainings.json'), JSON.stringify(data, null, 2));
+      if (serverSync) serverSync.scheduleSync();
     },
     getConversationStore: () => conversationStore || initConversationStore(),
     whatsapp: whatsappManager,
@@ -1231,8 +1427,31 @@ app.whenReady().then(() => {
     try { await handleIncomingMessage(messageData); } catch (e) { console.error('handleIncomingMessage erro:', e); }
   });
   startStatusServer();
-  autoConnectSavedSessions();
-  if (isHeadless()) autoPairMissingSessions();
+  if (serverMode) {
+    // Mantem o status real do servidor no painel e repassa codigo/QR para a UI
+    try {
+      serverSync.onPairingCode((d) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-pairing-code', d);
+      });
+      serverSync.onQr((d) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-qr', d);
+      });
+      serverSync.onStatus((d) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-status', d);
+      });
+      serverSync.refreshStatus().catch(() => {});
+      const syncPoll = setInterval(() => serverSync.refreshStatus().catch(() => {}), 15000);
+      if (syncPoll && typeof syncPoll.unref === 'function') syncPoll.unref();
+    } catch (e) {
+      console.error('[SYNC] listeners falharam:', e.message);
+    }
+  } else {
+    autoConnectSavedSessions();
+  }
+  if (isHeadless()) {
+    autoPairMissingSessions();
+    startServerReconciler();
+  }
   const statusTimer = setInterval(persistBotStatus, 30000);
   if (statusTimer && typeof statusTimer.unref === 'function') statusTimer.unref();
 });
@@ -1295,13 +1514,33 @@ ipcMain.on('window-drag-move', (e, dx, dy) => {
 // ------------------------------------------------------------
 // IPC - WhatsApp
 // ------------------------------------------------------------
-ipcMain.handle('whatsapp-connect', (e, zapId, phone, method) => whatsappManager.connectZap(String(zapId), phone, method));
-ipcMain.handle('whatsapp-disconnect', (e, zapId) => whatsappManager.disconnectZap(String(zapId)));
-ipcMain.handle('whatsapp-status', (e, zapId) => whatsappManager.getStatus(String(zapId)));
-ipcMain.handle('whatsapp-send', (e, zapId, phone, text) => whatsappManager.sendMessage(String(zapId), phone, text));
+ipcMain.handle('whatsapp-connect', (e, zapId, phone, method) => {
+  if (serverMode) return { status: 'readonly', error: 'zap gerenciado pelo servidor - nao conecte pelo PC' };
+  return whatsappManager.connectZap(String(zapId), phone, method);
+});
+ipcMain.handle('whatsapp-disconnect', (e, zapId) => {
+  if (serverMode) return { ok: false, error: 'zap gerenciado pelo servidor' };
+  return whatsappManager.disconnectZap(String(zapId));
+});
+ipcMain.handle('whatsapp-status', (e, zapId) => {
+  if (serverMode && serverSync) {
+    const s = serverSync.getZapStatus(String(zapId));
+    if (s) return s;
+  }
+  return whatsappManager.getStatus(String(zapId));
+});
+ipcMain.handle('whatsapp-send', async (e, zapId, phone, text) => {
+  const r = await whatsappManager.sendMessage(String(zapId), phone, text);
+  whatsappManager.markOwnerReply(String(zapId), phone);
+  return r;
+});
 ipcMain.handle('whatsapp-conversations', (e, zapId) => whatsappManager.getConversations(String(zapId)));
 ipcMain.handle('whatsapp-messages', (e, zapId, chatId) => whatsappManager.getMessages(String(zapId), chatId));
-ipcMain.handle('whatsapp-send-media', (e, zapId, phone, media) => whatsappManager.sendMedia(String(zapId), phone, media || {}));
+ipcMain.handle('whatsapp-send-media', async (e, zapId, phone, media) => {
+  const r = await whatsappManager.sendMedia(String(zapId), phone, media || {});
+  whatsappManager.markOwnerReply(String(zapId), phone);
+  return r;
+});
 
 // ------------------------------------------------------------
 // IPC - Mensagem Automatica
@@ -1366,6 +1605,7 @@ ipcMain.handle('save-zaps', (e, data) => {
     // Nao joga erro para nao travar o app - apenas loga
     return false;
   }
+  if (serverSync) serverSync.scheduleSync();
   return true;
 });
 ipcMain.handle('load-providers', () => loadProvidersData());
@@ -1381,6 +1621,7 @@ ipcMain.handle('save-providers', (e, data) => {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
     throw err;
   }
+  if (serverSync) serverSync.scheduleSync();
   return true;
 });
 ipcMain.handle('load-trainings', () => loadTrainingsData());
@@ -1436,6 +1677,7 @@ ipcMain.handle('save-trainings', (e, data, deletedFiles) => {
     console.error('save-trainings erro:', err);
     throw err;
   }
+  if (serverSync) serverSync.scheduleSync();
   return true;
 });
 ipcMain.handle('delete-trainings-for-zap', (e, zapId) => {
@@ -1463,8 +1705,23 @@ ipcMain.handle('delete-trainings-for-zap', (e, zapId) => {
   }
   delete all[zid];
   fs.writeFileSync(getFilePath('trainings.json'), JSON.stringify(all, null, 2));
+  if (serverSync) serverSync.scheduleSync();
   return true;
 });
+
+// ------------------------------------------------------------
+// IPC - Sincronizacao com o servidor (painel unificado)
+// ------------------------------------------------------------
+ipcMain.handle('server-info', () => ({
+  enabled: serverMode,
+  dataDir: serverSync ? serverSync.dataDir : null,
+  status: serverSync ? serverSync.getStatus() : { enabled: false, state: 'disabled' }
+}));
+ipcMain.handle('server-sync-now', () => (serverSync ? serverSync.syncNow() : { ok: false, disabled: true, error: 'sincronizacao desativada' }));
+ipcMain.handle('server-sync-status', () => (serverSync ? serverSync.getStatus() : { enabled: false, state: 'disabled' }));
+ipcMain.handle('server-delete-zap-session', (e, zapId) => (serverSync ? serverSync.deleteZapSession(String(zapId)) : { ok: false, disabled: true }));
+ipcMain.handle('server-status', () => (serverSync ? serverSync.getBotStatus() : null));
+ipcMain.handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
 
 module.exports = {
   getDataDir,

@@ -1,13 +1,32 @@
+// Marcadores tolerantes a espacos/caixa ("[SEND_IMAGE : img1]", "[SEND_IMAGEM: x]").
+const IMAGE_MARKER_RE = /\[?\s*SEND[_\s-]?(?:IMAGE|IMAGEM|IMG)\s*[:;]\s*([^\]\n]*)\s*\]?/gi;
+// Id so de marcador completo (com "]") - marcador truncado nao vira id (so sai do texto).
+const IMAGE_MARKER_ID_RE = /\[\s*SEND[_\s-]?(?:IMAGE|IMAGEM|IMG)\s*[:;]\s*([^\]\n]+?)\s*\]/gi;
+// So marcadores SEND_* (os de quebra [QUEBRA]/[BREAK] sao consumidos depois
+// pelo splitMessages - remover aqui destruiria a separacao em baloes).
+const SYSTEM_MARKER_RE = /\[\s*SEND[\w\s-]*\s*[:;]?[^\]]*\]/gi;
+
 function parseImageMarkers(text) {
-  const re = /\[SEND_IMAGE:([^\]]+)\]/g;
+  const re = new RegExp(IMAGE_MARKER_ID_RE.source, 'gi');
   const ids = [];
   let m;
   while ((m = re.exec(text)) !== null) {
-    const id = m[1].trim().replace(/^["'`]+|["'`]+$/g, '');
+    const id = String(m[1] || '').trim().replace(/^["'`]+|["'`]+$/g, '');
     if (id) ids.push(id);
   }
-  const clean = String(text).replace(/\[SEND_IMAGE:[^\]]*\]?/g, '').replace(/\s{2,}/g, ' ').trim();
+  const clean = stripSystemMarkers(text);
   return { ids, clean };
+}
+
+// Remove qualquer marcador interno que tenha sobrado (inclusive formato torto),
+// pra nunca chegar ao cliente como "codigo".
+function stripSystemMarkers(text) {
+  return String(text || '')
+    .replace(new RegExp(IMAGE_MARKER_RE.source, 'gi'), '')
+    .replace(new RegExp(LINK_MARKER_RE.source, 'gi'), '')
+    .replace(new RegExp(SYSTEM_MARKER_RE.source, 'gi'), '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 function normText(s) {
@@ -63,10 +82,12 @@ function findTrainingImageById(enabledTrainings, id) {
   return null;
 }
 
+const LINK_MARKER_RE = /\[?\s*SEND[_\s-]?LINK\s*[:;]\s*([^\]\n]*)\s*\]?/gi;
+
 function applyLinkMarkers(text, enabledTrainings) {
   const used = [];
   const seen = new Set();
-  const out = String(text).replace(/\[SEND_LINK:([^\]]*)\]?/g, (full, raw) => {
+  const out = String(text).replace(new RegExp(LINK_MARKER_RE.source, 'gi'), (full, raw) => {
     const id = String(raw || '').trim().replace(/^["'`]+|["'`]+$/g, '');
     const lk = id ? findTrainingLinkById(enabledTrainings, id) : null;
     const url = lk ? normalizeUrl(lk.url) : '';
@@ -162,7 +183,7 @@ function resolveReplyMedia(response, userMessage, enabledTrainings, log) {
 
   const linkResult = applyLinkMarkers(aiText, enabledTrainings);
   const links = linkResult.links;
-  let text = linkResult.text;
+  let text = stripSystemMarkers(linkResult.text);
 
   if (links.length === 0 && wantsLinkAttachment(userMessage, text, images.length > 0)) {
     const lk = pickTrainingLink(enabledTrainings, userMessage, text);
@@ -179,6 +200,7 @@ function resolveReplyMedia(response, userMessage, enabledTrainings, log) {
 
 module.exports = {
   parseImageMarkers,
+  stripSystemMarkers,
   normText,
   wantsImageAttachment,
   collectTrainingImages,

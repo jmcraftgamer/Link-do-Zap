@@ -4,6 +4,7 @@
 // contatos, log detalhado, persistencia em disco e retomada automatica.
 // ============================================
 const fs = require('fs');
+const { verifyMessage } = require('./message-guard');
 
 const CONTACT_DELAY_MS = 5 * 60 * 1000;   // intervalo minimo entre contatos
 const RETRY_DELAY_MS = 60 * 1000;         // espera antes de tentar de novo
@@ -309,6 +310,11 @@ class AutoMessageManager {
         const files = this.resolveFiles(a.files, attachments);
         if (!nums.length) { notes.push('acao send sem numeros validos - ignorada'); continue; }
         if (!text.trim() && !files.length) { notes.push('acao send sem texto nem arquivo - ignorada'); continue; }
+        // Verificador: nao deixa codigo/markdown/marcador/texto de sistema entrar na fila.
+        if (text.trim()) {
+          const v = verifyMessage(text.trim());
+          if (!v.ok) { notes.push(`acao send reprovada pelo verificador (${v.reason}) - ignorada`); continue; }
+        }
         for (const phone of nums) {
           this.addRecipient(phone);
           for (let i = 0; i < repeat; i++) {

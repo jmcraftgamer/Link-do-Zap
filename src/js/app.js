@@ -23,6 +23,10 @@ function safeParseLS(key, fallback) {
 let zapsData = safeParseLS('linknozap_zaps', []);
 let providersData = safeParseLS('linknozap_providers', []);
 
+// Modo servidor: o app local e o painel; o WhatsApp roda 24h no servidor.
+// Nesse modo nao conectamos nada por aqui e as configs sincronizam sozinhas.
+let serverManaged = false;
+
 // Training state
 let trainingsData = {};
 let currentTrainingZapId = null;
@@ -152,12 +156,10 @@ const GOOGLEAI_PRECONFIGURED = {
   name: 'Google AI Studio',
   apiKey: BOOTSTRAP_KEYS.googleai || '',
   models: [
-    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', free: true, limits: '15 RPM | 1M TPM | 1.500 RPD' },
-    { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash-Lite', free: true, limits: '30 RPM | 1M TPM | 1.500 RPD' },
-    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', free: true, limits: '15 RPM | 1M TPM | 1.500 RPD' },
-    { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash-Lite', free: true, limits: '30 RPM | 1M TPM | 1.500 RPD' },
-    { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', free: true, limits: '15 RPM | 1M TPM | 1.500 RPD' },
-    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', free: true, limits: '5 RPM | 250k TPM | 50 RPD' }
+    { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', free: true, limits: '10 RPM | 250k TPM | 250 RPD' },
+    { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', free: true, limits: '10 RPM | 250k TPM | 250 RPD' },
+    { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', free: true, limits: '15 RPM | 250k TPM | 1.000 RPD' },
+    { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash-Lite', free: true, limits: '15 RPM | 250k TPM | 1.000 RPD' }
   ],
   createdAt: new Date().toISOString(),
   preconfigured: true
@@ -168,6 +170,11 @@ if (!existingGoogle) {
   providersData.unshift(GOOGLEAI_PRECONFIGURED);
   localStorage.setItem('linknozap_providers', JSON.stringify(providersData));
 } else {
+  // Remove modelos que contas novas do AI Studio nao aceitam mais (2.5/2.0/1.5
+  // retornam 404 "no longer available to new users") antes de garantir os
+  // oficiais - sem isso eles ficam no painel e toda requisicao cai neles.
+  existingGoogle.models = (existingGoogle.models || [])
+    .filter(em => em && em.id && !/^gemini-(2\.5|2\.0|1\.5)/.test(em.id));
   // Garante que o provedor existente receba os modelos oficiais
   GOOGLEAI_PRECONFIGURED.models.forEach(m => {
     if (!existingGoogle.models.some(em => em && em.id === m.id)) {
@@ -295,6 +302,13 @@ function refreshPanelStatusUI(zapId) {
   if (enabledLabel) enabledLabel.textContent = zap.enabled !== false ? 'Ativo' : 'Desativado';
 
   const connectBtn = document.getElementById('zapPanelConnect');
+  if (serverManaged) {
+    connectBtn.disabled = false;
+    connectBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M5 12h14"/><path d="M12 5v14"/></svg> Gerenciado pelo servidor`;
+    connectBtn.className = 'zap-panel-connect-btn';
+    connectBtn.onclick = () => { openConnectModal(zap.id, zap.name, zap.phone); };
+    return;
+  }
   if (info.online) {
     connectBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> Desconectar`;
     connectBtn.className = 'zap-panel-connect-btn disconnect';
@@ -342,6 +356,16 @@ function init() {
   });
 
   renderZaps(zapsData);
+
+  // Detecta se este app e o painel do servidor 24h
+  if (window.electronAPI && window.electronAPI.serverInfo) {
+    window.electronAPI.serverInfo().then((info) => {
+      serverManaged = !!(info && info.enabled);
+      renderZaps(zapsData);
+      if (serverManaged && currentPanelZapId != null) refreshPanelStatusUI(currentPanelZapId);
+    }).catch(() => {});
+  }
+
   setupEventListeners();
   initProviders();
   initProviderConfig();
@@ -435,8 +459,20 @@ function createZapCard(zap) {
 // ============================================
 function deleteZap(id) {
   if (!confirm('Tem certeza que deseja excluir este Zap?')) return;
+  if (window.electronAPI && window.electronAPI.whatsappDisconnect) {
+    try {
+      const p = window.electronAPI.whatsappDisconnect(String(id));
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
   zapsData = zapsData.filter(z => z.id !== id);
   saveZaps();
+  if (window.electronAPI && window.electronAPI.serverDeleteZapSession) {
+    try {
+      const p = window.electronAPI.serverDeleteZapSession(String(id));
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
   delete trainingsData[String(id)];
   if (window.electronAPI) {
     try {
@@ -1217,6 +1253,43 @@ function openZapPanel(zapId) {
     }
   };
 
+  // Horario de atendimento
+  const whCb = document.getElementById('panelWorkHours');
+  const whRow = document.getElementById('panelWorkHoursRow');
+  const whDays = document.getElementById('panelWorkDays');
+  const whStart = document.getElementById('panelWorkStart');
+  const whEnd = document.getElementById('panelWorkEnd');
+  const whLabel = document.getElementById('panelWorkHoursLabel');
+  const whDayBoxes = Array.from(document.querySelectorAll('.panel-work-day'));
+  const wh = zap.workHours || {};
+  whCb.checked = wh.enabled === true;
+  whStart.value = wh.start || '08:00';
+  whEnd.value = wh.end || '18:00';
+  const whDaysSel = Array.isArray(wh.days) ? wh.days.map(Number) : [1, 2, 3, 4, 5];
+  whDayBoxes.forEach(cb => { cb.checked = whDaysSel.includes(Number(cb.value)); });
+  const whToggleUI = () => {
+    whRow.style.display = whCb.checked ? 'flex' : 'none';
+    whDays.style.display = whCb.checked ? 'flex' : 'none';
+    if (whLabel) whLabel.textContent = whCb.checked ? 'IA responde so no horario definido' : 'IA responde a qualquer hora';
+  };
+  whToggleUI();
+  const readWorkHoursForm = () => ({
+    enabled: whCb.checked,
+    start: whStart.value || '08:00',
+    end: whEnd.value || '18:00',
+    days: whDayBoxes.filter(cb => cb.checked).map(cb => Number(cb.value))
+  });
+  const persistWorkHours = () => {
+    const z = zapsData.find(x => String(x.id) === String(zapId));
+    if (!z) return;
+    z.workHours = readWorkHoursForm();
+    saveZaps();
+  };
+  whCb.onchange = () => { whToggleUI(); persistWorkHours(); };
+  whStart.onchange = persistWorkHours;
+  whEnd.onchange = persistWorkHours;
+  whDayBoxes.forEach(cb => { cb.onchange = persistWorkHours; });
+
   // Personality
   const personalitySelect = document.getElementById('panelPersonality');
   const areaRow = document.getElementById('panelAreaRow');
@@ -1280,6 +1353,20 @@ function openZapPanel(zapId) {
     enabledLabel.textContent = enabling ? 'Ativo' : 'Desativado';
     saveZaps();
 
+    if (serverManaged) {
+      try {
+        const r = await window.electronAPI.serverSyncNow();
+        applyRuntimeStatus(z, z.runtimeStatus || 'disconnected');
+        renderZaps(zapsData);
+        refreshPanelStatusUI(zapId);
+        updateToggleZapBtn(z);
+        if (!r || !r.ok) alert('Nao foi possivel enviar ao servidor: ' + ((r && r.error) || 'erro'));
+      } catch (e) {
+        alert('Erro ao enviar ao servidor: ' + e.message);
+      }
+      return;
+    }
+
     toggleZapBtn.disabled = true;
     const origText = toggleZapBtn.querySelector('#panelToggleZapText').textContent;
     toggleZapBtn.querySelector('#panelToggleZapText').textContent = enabling ? 'Ativando...' : 'Desativando...';
@@ -1326,8 +1413,28 @@ function openZapPanel(zapId) {
     }
     z.autoReply = autoReplyCb.checked;
     z.enabled = enabledCb.checked;
+    if (typeof readWorkHoursForm === 'function') z.workHours = readWorkHoursForm();
     saveZaps();
     renderZaps(zapsData);
+
+    if (serverManaged) {
+      // O zap roda no servidor: so enviamos as configs (sem reiniciar local)
+      saveRestartBtn.disabled = true;
+      const origHtml = saveRestartBtn.innerHTML;
+      saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Enviando ao servidor...`;
+      try {
+        const r = await window.electronAPI.serverSyncNow();
+        if (r && r.ok) alert('Alteracoes salvas e enviadas ao servidor!');
+        else alert('Nao foi possivel enviar ao servidor: ' + ((r && r.error) || 'erro'));
+      } catch (e) {
+        alert('Erro ao enviar ao servidor: ' + e.message);
+      } finally {
+        saveRestartBtn.disabled = false;
+        saveRestartBtn.innerHTML = origHtml;
+        openZapPanel(zapId);
+      }
+      return;
+    }
 
     // Restart: disconnect then reconnect
     saveRestartBtn.disabled = true;
@@ -1376,6 +1483,12 @@ function openZapPanel(zapId) {
       closeZapPanel();
       zapsData = zapsData.filter(z => z.id !== zapId);
       saveZaps();
+      if (window.electronAPI && window.electronAPI.serverDeleteZapSession) {
+        try {
+          const p = window.electronAPI.serverDeleteZapSession(String(zapId));
+          if (p && p.catch) p.catch(() => {});
+        } catch (e) {}
+      }
       delete trainingsData[String(zapId)];
       if (window.electronAPI) {
         try {
@@ -2173,6 +2286,7 @@ function addNewZap() {
     model: modelValue,
     autoReply: true,
     enabled: true,
+    workHours: { enabled: false, start: '08:00', end: '18:00', days: [1, 2, 3, 4, 5] },
     runtimeStatus: 'disconnected',
     status: 'Desconectado',
     statusClass: 'offline',
@@ -2183,6 +2297,14 @@ function addNewZap() {
   saveZaps();
   renderZaps(zapsData);
   closeModalHandler();
+
+  if (serverManaged && window.electronAPI && window.electronAPI.serverSyncNow) {
+    // Envia na hora; o servidor conecta/pareia e o codigo chega pelo watcher
+    window.electronAPI.serverSyncNow().catch(() => {});
+    setTimeout(() => {
+      if (typeof openConnectModal === 'function') openConnectModal(newZap.id, newZap.name, newZap.phone);
+    }, 1500);
+  }
 }
 
 // ============================================
@@ -2779,9 +2901,27 @@ function confirmAddProvKey() {
   provider.apiKeyNames = provider.apiKeyNames || [];
   provider.apiKeys.push(value);
   provider.apiKeyNames.push(name || `Chave ${provider.apiKeys.length}`);
+  const newIndex = provider.apiKeys.length - 1;
 
   closeProvKeyForm();
   persistProviderKeys();
+
+  // A chave recem-adicionada passa a valer nos zaps que usam este provedor -
+  // senao ela fica guardada e o zap continua tentando a chave antiga (que e
+  // exatamente o "adicionei a chave e nao funciona").
+  let selectionChanged = false;
+  (zapsData || []).forEach(zap => {
+    if (!Array.isArray(zap.providers) || !zap.providers.includes(provider.id)) return;
+    if (!zap.apiKeySelections) zap.apiKeySelections = {};
+    if (zap.apiKeySelections[provider.id] !== newIndex) {
+      zap.apiKeySelections[provider.id] = newIndex;
+      selectionChanged = true;
+    }
+  });
+  if (selectionChanged) {
+    saveZaps();
+    renderZaps(zapsData);
+  }
 }
 
 function renderProvModelsList() {
@@ -2991,19 +3131,33 @@ async function sendTestMessage() {
   // Show loading
   const loadingId = addChatMessage('assistant', 'Pensando...', true);
 
-  // Get API key (mesma resolucao do processo principal: apiKeys primeiro, limpa)
+  // Chaves do provedor (apiKeys primeiro, limpas). Testa UMA a UMA: uma
+  // chave invalida no topo da lista nao pode derrubar o teste - usa a proxima.
   const apiKeys = (Array.isArray(currentTestProvider.apiKeys) && currentTestProvider.apiKeys.length)
     ? currentTestProvider.apiKeys
     : [currentTestProvider.apiKey];
-  const apiKey = apiKeys.map(k => normalizeKeyValue(k)).find(Boolean) || '';
+  const keys = apiKeys.map(k => normalizeKeyValue(k)).filter(Boolean);
 
-  if (!apiKey) {
+  if (!keys.length) {
     updateChatMessage(loadingId, 'error', 'Nenhuma chave API configurada.');
     return;
   }
 
   try {
-    const response = await callAIModel(currentTestProvider.name, currentTestModel.id, apiKey, message);
+    let response = null;
+    let lastErr = null;
+    for (const key of keys) {
+      try {
+        response = await callAIModel(currentTestProvider.name, currentTestModel.id, key, message);
+        break;
+      } catch (e) {
+        lastErr = e;
+        const msg = String((e && e.message) || '');
+        const keyError = /api[_ ]?key|unauthorized|forbidden|invalid.*key|permiss/i.test(msg);
+        if (!keyError) throw e; // erro do modelo/rede: trocar de chave nao resolve
+      }
+    }
+    if (response == null && lastErr) throw lastErr;
     updateChatMessage(loadingId, 'assistant', response);
   } catch (error) {
     updateChatMessage(loadingId, 'error', `Erro: ${error.message}`);
@@ -3395,6 +3549,21 @@ function generatePairingCode() {
 
 async function connectZapWithMethod(zapId, phone, method) {
   if (!window.electronAPI) { alert('Integracao com WhatsApp nao disponivel.'); return; }
+
+  if (serverManaged) {
+    // Nao conecta pelo PC: o servidor gera codigo/QR e o painel recebe por evento.
+    const cp = document.getElementById('connectProgress');
+    if (cp) cp.style.display = 'none';
+    const ps = document.getElementById('pairingStatus');
+    if (ps) {
+      ps.textContent = 'O servidor esta gerando o codigo/QR. Ele aparece aqui em instantes...';
+      ps.className = 'connect-status';
+    }
+    if (window.electronAPI.serverSyncNow) {
+      try { await window.electronAPI.serverSyncNow(); } catch (e) {}
+    }
+    return;
+  }
 
   const connectProgress = document.getElementById('connectProgress');
   const connectProgressText = document.getElementById('connectProgressText');

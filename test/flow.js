@@ -123,6 +123,11 @@ class FakeWhatsAppManager {
     });
   }
   setOnMessageCallback(cb) { this.cb = cb; }
+  async hasOwnerReplied() { return !!this.ownerReplied; }
+  async replyMessage(zapId, chatId, text) {
+    sentMessages.push({ zapId: String(zapId), chatId, text, quoted: true, t: Date.now() });
+    return { success: true, quoted: true };
+  }
   async sendMessage(zapId, chatId, text) {
     sentMessages.push({ zapId: String(zapId), chatId, text, t: Date.now() });
     return { success: true };
@@ -258,6 +263,26 @@ async function run() {
     assert.strictEqual(sent.text, 'Blz, te respondo ja ja!');
     assert.ok(!/Constreainsts/i.test(sent.text), 'texto lixo foi enviado ao cliente');
     assert.ok(/invalido|descartado/i.test(newLogs(s)), 'log de resposta descartada ausente');
+  });
+
+  testAsync('fluxo: JSON da IA nao chega ao cliente (cai no fallback)', async () => {
+    clearCooldown();
+    fetchHandler = (req) => (isGoogle(req) ? googleOk('{"reply":"Oi"}') : orOk('Claro, posso ajudar!'));
+    await fakeMgr.cb(mkMsg(person('5511777777777', 'Lia')));
+
+    const sent = lastSent();
+    assert.strictEqual(sent.text, 'Claro, posso ajudar!');
+    assert.ok(!/[{}]/.test(sent.text), 'JSON vazou ao cliente');
+  });
+
+  testAsync('fluxo: marcador de imagem torto nao vaza como codigo', async () => {
+    clearCooldown();
+    fetchHandler = (req) => (isGoogle(req) ? googleOk('[SEND_IMAGE : img1] Segue o cardapio') : orOk('x'));
+    await fakeMgr.cb(mkMsg(person('5511666666666', 'Rafa')));
+
+    const sent = lastSent();
+    assert.ok(!/SEND_IMAGE/i.test(sent.text || ''), 'marcador vazou ao cliente');
+    assert.ok(!/\[[^\]]*\]/.test(sent.text || ''), 'colchetes de marcador vazaram');
   });
 
   // ---------------------------------------------------------------
@@ -509,6 +534,53 @@ async function run() {
     // zaps.json de volta ao normal: os demais testes continuam com o sorteio
     const back = JSON.parse(fs.readFileSync(zapsPath, 'utf8'));
     assert.strictEqual(back[0].instantReply, undefined, 'restauracao do zaps.json falhou');
+  });
+
+  // dono ja respondeu -> IA nao envia nada
+  testAsync('fluxo: dono ja respondeu - IA NAO envia nada', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = () => googleOk('resposta que nao deve sair');
+    fakeMgr.ownerReplied = true;
+    try { await fakeMgr.cb(mkMsg()); } finally { fakeMgr.ownerReplied = false; }
+    assert.strictEqual(sentMessages.length, s.sent, 'IA enviou mesmo com resposta do dono');
+    assert.ok(newLogs(s).includes('Dono do numero ja respondeu'), 'log da checagem do dono ausente');
+  });
+
+  // horario de atendimento: fora da janela nada e enviado
+  testAsync('fluxo: fora do horario de atendimento - nada e enviado', async () => {
+    clearCooldown();
+    const zapsPath = path.join(dataDir, 'zaps.json');
+    const original = fs.readFileSync(zapsPath, 'utf8');
+    const amanha = (new Date().getDay() + 1) % 7;
+    fs.writeFileSync(zapsPath, JSON.stringify([
+      { id: ZAP_ID, name: 'Teste', enabled: true, autoReply: true, personality: 'padrao',
+        workHours: { enabled: true, start: '00:00', end: '23:59', days: [amanha] },
+        providers: ['g1', 'o1'], selectedModels: [], model: 'auto', blockedContacts: [] }
+    ], null, 2));
+
+    const s = snapshot();
+    fetchHandler = () => googleOk('nao deveria responder');
+    await fakeMgr.cb(mkMsg());
+
+    fs.writeFileSync(zapsPath, original);
+
+    assert.strictEqual(sentMessages.length, s.sent, 'IA respondeu fora do horario');
+    assert.strictEqual(fetchCalls.length, s.fetch, 'mensagem foi enviada a IA fora do horario');
+    assert.ok(newLogs(s).includes('Fora do horario de atendimento'), 'log de fora do horario ausente');
+  });
+
+  // as vezes, resposta com varios baloes -> 1 saira citando a mensagem do cliente
+  testAsync('fluxo: resposta com varios baloes pode sair com 1 mensagem citando', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = () => googleOk('Primeira parte[QUEBRA]Segunda parte');
+    const origRandom = Math.random;
+    Math.random = () => 0;
+    try { await fakeMgr.cb(mkMsg()); } finally { Math.random = origRandom; }
+    const enviados = sentMessages.slice(s.sent);
+    assert.ok(enviados.length >= 2, `esperava varios baloes, veio ${enviados.length}`);
+    assert.ok(enviados.some(m => m.quoted), 'nenhuma mensagem saiu citando a do cliente');
   });
 
   for (const p of pending) {

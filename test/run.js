@@ -348,6 +348,106 @@ testAsync('sendMedia: zap desconectado lanca erro sem chamar a pagina', async ()
   await assert.rejects(() => mgr.sendMedia('naoexiste', '5511999999999', MEDIA), /nao esta conectado/);
 });
 
+// ============ RESPOSTA DO DONO (a IA nao responde por cima) ============
+testAsync('dono: markOwnerReply guarda o horario e so vale DEPOIS da mensagem', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.clients.set('zap1', { status: 'ready', messages: new Map() });
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 0), false);
+  mgr.markOwnerReply('zap1', '5511999999999@c.us', 1000);
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 999), true);
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 1000), false, 'resposta no mesmo segundo nao conta');
+  mgr.markOwnerReply('zap1', '5511999999999@c.us', 500); // mais antigo: nao regride
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 0), true);
+});
+
+testAsync('dono: hasOwnerReplied confere ao vivo (fromMe nao-web)', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.clients.set('zap1', { status: 'ready', messages: new Map(), client: {
+    getChatById: async () => ({ fetchMessages: async () => ([
+      { id: { fromMe: false, remote: 'x', id: 'a' }, fromMe: false, timestamp: 100, body: 'oi' },
+      { id: { fromMe: true, remote: 'x', id: 'b' }, fromMe: true, deviceType: 'android', timestamp: 200, body: 'ja respondi' }
+    ]) })
+  } });
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 150, { live: true }), true);
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 250, { live: true }), false);
+});
+
+testAsync('dono: envio da propria sessao web NAO conta como resposta do dono', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.clients.set('zap1', { status: 'ready', messages: new Map(), client: {
+    getChatById: async () => ({ fetchMessages: async () => ([
+      { id: { fromMe: true, remote: 'x', id: 'c' }, fromMe: true, deviceType: 'web', timestamp: 200 }
+    ]) })
+  } });
+  assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 100, { live: true }), false);
+});
+
+testAsync('dono: replyMessage cita a mensagem em cache', async () => {
+  const mgr = new WhatsAppManager(null);
+  let replied = null;
+  const quoted = { reply: async (t) => { replied = t; return { id: { fromMe: true, remote: 'x', id: 'z' } }; } };
+  mgr.clients.set('zap1', { status: 'ready', messages: new Map([['false_1@c.us', quoted]]), pendingAiSends: [] });
+  const r = await mgr.replyMessage('zap1', '5511999999999', 'Beleza', 'false_1@c.us');
+  assert.strictEqual(replied, 'Beleza');
+  assert.strictEqual(r.quoted, true);
+});
+
+testAsync('dono: replyMessage sem mensagem em cache cai no envio normal', async () => {
+  const { mgr, state } = makeManager(() => undefined);
+  const r = await mgr.replyMessage('zap1', '5511999999999', 'oi', 'nao_existe');
+  assert.strictEqual(state.calls, 1);
+  assert.strictEqual(r.success, true);
+});
+
+// ================= HORARIO DE ATENDIMENTO =================
+const { isWithinWorkHours } = require(path.join(root, 'src', 'js', 'work-hours'));
+
+test('horario: desativado nao bloqueia nunca', () => {
+  assert.strictEqual(isWithinWorkHours(null), true);
+  assert.strictEqual(isWithinWorkHours({ enabled: false, start: '08:00', end: '18:00' }), true);
+});
+
+test('horario: dentro e fora da janela normal', () => {
+  const wh = { enabled: true, start: '08:00', end: '18:00' };
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 10, 0)), true);
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 7, 59)), false);
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 18, 0)), false, 'hora final e exclusiva');
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 17, 59)), true);
+});
+
+test('horario: janela que vira o dia (22:00 -> 06:00)', () => {
+  const wh = { enabled: true, start: '22:00', end: '06:00' };
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 23, 0)), true);
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 5, 0)), true);
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 12, 0)), false);
+});
+
+test('horario: dias da semana (vazio = todos)', () => {
+  const seg = new Date(2026, 0, 5, 10, 0);
+  const dom = new Date(2026, 0, 4, 10, 0);
+  assert.strictEqual(seg.getDay(), 1);
+  assert.strictEqual(dom.getDay(), 0);
+  assert.strictEqual(isWithinWorkHours({ enabled: true, start: '00:00', end: '23:59', days: [1] }, seg), true);
+  assert.strictEqual(isWithinWorkHours({ enabled: true, start: '00:00', end: '23:59', days: [1] }, dom), false);
+  assert.strictEqual(isWithinWorkHours({ enabled: true, start: '00:00', end: '23:59', days: [] }, dom), true);
+});
+
+test('horario: configuracao invalida nao bloqueia', () => {
+  assert.strictEqual(isWithinWorkHours({ enabled: true, start: 'xx', end: '18:00' }), true);
+  assert.strictEqual(isWithinWorkHours({ enabled: true, start: '08:00', end: '08:00' }), true, 'janela de 24h');
+});
+
+test('horario: main.js e o painel usam o horario de atendimento', () => {
+  const mainSrc = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  assert.ok(mainSrc.includes('isWithinWorkHours'), 'main.js nao checa o horario');
+  assert.ok(mainSrc.includes('Fora do horario de atendimento'), 'sem log ao ignorar fora do horario');
+  const html = fs.readFileSync(path.join(root, 'src', 'index.html'), 'utf8');
+  assert.ok(html.includes('panelWorkHours'), 'painel sem opcao de horario');
+  assert.ok(html.includes('panelWorkStart') && html.includes('panelWorkEnd'), 'painel sem campos de hora');
+  const appSrc = fs.readFileSync(path.join(root, 'src', 'js', 'app.js'), 'utf8');
+  assert.ok(appSrc.includes('workHours'), 'app.js nao persiste o horario');
+});
+
 // ================= MEMORIA / HISTORICO DE CONVERSAS =================
 const os = require('os');
 const TMP_CONV_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'conv-store-'));
@@ -642,6 +742,92 @@ test('MEMORIA: main.js agenda a virada 00:00 e injeta a memoria no fluxo', () =>
   assert.ok(src.includes('setHistoryStore'), 'conecta o store ao AIResponder');
   assert.ok(src.includes('conversations.json'), 'grava o historico em disco');
   assert.ok(src.includes('conversationStore.flush()'), 'salva ao fechar o app');
+});
+
+// --------------------- MEMORIA DE CONVERSAS (3 DIAS) ---------------------
+test('MEMORIA 3 DIAS: recentHistory junta dias anteriores e ignora a conversa atual', () => {
+  const s = newStore();
+  const now = at(2026, 9, 28, 12, 0);
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  s.append('z1', 'c1', 'user', 'quero acai', at(2026, 9, 27, 10, 0));
+  s.append('z1', 'c1', 'assistant', 'temos sim', at(2026, 9, 27, 10, 1));
+  s.rollOver(at(2026, 9, 28, 0, 1));
+  s.ensure('z1', 'c1', at(2026, 9, 28, 9, 0));
+  s.append('z1', 'c1', 'user', 'bom dia', at(2026, 9, 28, 9, 0));
+
+  const rec = s.recentHistory('z1', 'c1', { days: 3, now });
+  assert.strictEqual(rec.length, 2, 'so as mensagens de ontem entram na memoria');
+  assert.strictEqual(rec[0].content, 'quero acai');
+  assert.strictEqual(rec[1].role, 'assistant');
+});
+
+test('MEMORIA 3 DIAS: fora da janela de 3 dias fica de fora', () => {
+  const s = newStore();
+  const now = at(2026, 9, 28, 12, 0);
+  s.ensure('z1', 'c1', at(2026, 9, 20, 10, 0));
+  s.append('z1', 'c1', 'user', 'antiga', at(2026, 9, 20, 10, 0));
+  s.rollOver(at(2026, 9, 21, 0, 1));
+  s.ensure('z1', 'c1', at(2026, 9, 28, 9, 0));
+  assert.strictEqual(s.recentHistory('z1', 'c1', { days: 3, now }).length, 0);
+});
+
+test('MEMORIA 3 DIAS: memoryText formata com data/hora e quem falou', () => {
+  const s = newStore();
+  const now = at(2026, 9, 28, 12, 0);
+  s.ensure('z1', 'c1', at(2026, 9, 27, 14, 32));
+  s.append('z1', 'c1', 'user', 'oi, tudo bem?', at(2026, 9, 27, 14, 32));
+  s.append('z1', 'c1', 'assistant', 'Tudo sim!', at(2026, 9, 27, 14, 33));
+  s.rollOver(at(2026, 9, 28, 0, 1));
+  s.ensure('z1', 'c1', at(2026, 9, 28, 9, 0));
+  const txt = s.memoryText('z1', 'c1', { days: 3, now, maxChars: 6000 });
+  assert.ok(txt.includes('[27/09 14:32] Cliente: oi, tudo bem?'), txt);
+  assert.ok(txt.includes('[27/09 14:33] Atendente: Tudo sim!'), txt);
+});
+
+test('MEMORIA 3 DIAS: memoryText corta por tamanho mantendo o fim', () => {
+  const s = newStore();
+  const now = at(2026, 9, 28, 12, 0);
+  s.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
+  for (let i = 1; i <= 20; i++) s.append('z1', 'c1', 'user', `mensagem numero ${i}`, at(2026, 9, 27, 10, i));
+  s.rollOver(at(2026, 9, 28, 0, 1));
+  s.ensure('z1', 'c1', at(2026, 9, 28, 9, 0));
+  const txt = s.memoryText('z1', 'c1', { days: 3, now, maxChars: 120 });
+  assert.ok(txt.length <= 200, `memoria grande demais: ${txt.length}`);
+  assert.ok(txt.includes('mensagem numero 20'), 'mantem as mais recentes');
+});
+
+test('MEMORIA IA: bloco MEMORIA DE CONVERSAS entra no prompt quando ha memoryText', () => {
+  const ai = new AIResponder();
+  const withMem = ai.getSystemPrompt({ personality: 'padrao', trainings: [], conversationInfo: { label: '10:00', count: 2, memoryText: '[27/09 14:32] Cliente: quero acai' } });
+  assert.ok(withMem.includes('MEMORIA DE CONVERSAS'), 'bloco de memoria de dias anteriores ausente');
+  assert.ok(withMem.includes('quero acai'), 'texto da memoria nao entrou no prompt');
+  const sem = ai.getSystemPrompt({ personality: 'padrao', trainings: [], conversationInfo: { label: '10:00', count: 2 } });
+  assert.strictEqual(sem.includes('MEMORIA DE CONVERSAS'), false);
+});
+
+test('MEMORIA 3 DIAS: main.js grava .txt e passa memoryText no prompt', () => {
+  const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  assert.ok(src.includes('MEMORY_DAYS'), 'janela de dias configuravel');
+  assert.ok(src.includes('conversationStore.memoryText'), 'usa o store para montar a memoria');
+  assert.ok(src.includes("'memorias'"), 'grava o arquivo .txt');
+  assert.ok(src.includes('memoryText'), 'injeta a memoria no prompt');
+});
+
+// --------------------- PONTUACAO HUMANA (SEM CARA DE IA) ---------------------
+test('FORMATO: prompt proibe pontuacao de robo (! e ...) e "?" so em pergunta', () => {
+  const ai = new AIResponder();
+  const p = ai.getSystemPrompt({ personality: 'padrao', trainings: [] });
+  assert.ok(p.includes('PONTUACAO HUMANA'), 'regra de pontuacao humana ausente no prompt');
+  assert.ok(p.includes('NUNCA use ponto de exclamacao'), 'nao proibe o "!"');
+  assert.ok(p.includes('NUNCA use "..."'), 'nao proibe o "..."');
+  assert.ok(p.includes('"?" SOMENTE quando for pergunta'), 'nao limita o "?" a perguntas');
+});
+
+test('FORMATO: exemplos do prompt nao ensinam a IA a usar "!"', () => {
+  const ai = new AIResponder();
+  const secao = ai.buildNaturalTalkSection();
+  assert.strictEqual(/Sim!|Beleza!|Entendi!|Tranquilo!|Bem-vindo!|Obrigado!|estamos abertos!/.test(secao), false,
+    'exemplo com "!" ensina a IA a usar "!"');
 });
 
 async function runPending() {

@@ -27,6 +27,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsappConversations: (zapId) => ipcRenderer.invoke('whatsapp-conversations', zapId),
   whatsappMessages: (zapId, chatId) => ipcRenderer.invoke('whatsapp-messages', zapId, chatId),
 
+  // Sincronizacao com o servidor 24h (painel)
+  serverInfo: () => ipcRenderer.invoke('server-info'),
+  serverSyncNow: () => ipcRenderer.invoke('server-sync-now'),
+  serverSyncStatus: () => ipcRenderer.invoke('server-sync-status'),
+  serverDeleteZapSession: (zapId) => ipcRenderer.invoke('server-delete-zap-session', zapId),
+  serverStatus: () => ipcRenderer.invoke('server-status'),
+  serverPairingCodes: () => ipcRenderer.invoke('server-pairing-codes'),
+
   // Mensagem Automatica
   autoMsgState: () => ipcRenderer.invoke('auto-msg-state'),
   autoMsgChat: (payload) => ipcRenderer.invoke('auto-msg-chat', payload),

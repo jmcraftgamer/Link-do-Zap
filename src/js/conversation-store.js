@@ -158,6 +158,54 @@ class ConversationStore {
     };
   }
 
+  // Historico das conversas ANTERIORES (dias passados) dentro da janela de N
+  // dias. A conversa do dia atual ja vai como "turns" para a IA, entao nao e
+  // repetida aqui - esta memoria e o "o que conversamos nos dias passados".
+  recentHistory(zapId, chatId, opts) {
+    opts = opts || {};
+    const days = Math.max(1, parseInt(opts.days, 10) || 3);
+    const now = opts.now || Date.now();
+    const cutoff = now - days * 86400000;
+    const key = this.keyOf(zapId, chatId);
+    const active = this.findActive(zapId, chatId);
+    const out = [];
+    for (const c of this.conversations) {
+      if (c.key !== key) continue;
+      if (active && c.id === active.id) continue; // hoje = turns, nao memoria
+      if ((c.endedAt || c.startedAt) < cutoff) continue;
+      for (const m of (c.messages || [])) {
+        if (!m || !m.content) continue;
+        const at = m.at || c.startedAt;
+        if (at < cutoff) continue;
+        out.push({ role: m.role, content: m.content, at });
+      }
+    }
+    out.sort((a, b) => a.at - b.at);
+    return out;
+  }
+
+  // Texto da memoria (linhas tipo "[18/10 14:32] Cliente: ..."), das mais
+  // antigas para as mais recentes, cortado em maxChars mantendo o fim.
+  memoryText(zapId, chatId, opts) {
+    opts = opts || {};
+    const msgs = this.recentHistory(zapId, chatId, opts);
+    if (!msgs.length) return '';
+    const maxChars = opts.maxChars || 6000;
+    const lines = [];
+    let total = 0;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      const d = new Date(m.at);
+      const stamp = `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+      const who = m.role === 'assistant' ? 'Atendente' : 'Cliente';
+      const line = `[${stamp}] ${who}: ${String(m.content).replace(/\s+/g, ' ').trim()}`;
+      if (total + line.length > maxChars && lines.length) break;
+      total += line.length;
+      lines.unshift(line);
+    }
+    return lines.join('\n');
+  }
+
   rollOver(now) {
     const ts = now || Date.now();
     const today = dayKey(ts);

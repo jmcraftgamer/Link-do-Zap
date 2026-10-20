@@ -318,6 +318,11 @@ Regras:
         const idx = zaps.indexOf(z);
         zaps.splice(idx, 1);
         this.saveZaps(zaps);
+        try {
+          if (this.whatsapp && this.whatsapp.disconnectZap) {
+            await this.whatsapp.disconnectZap(String(z.id), 'zap excluido');
+          }
+        } catch (_) {}
         const trainings = this.loadTrainings();
         const hadTrainings = (trainings[String(z.id)] || []).length;
         if (trainings[String(z.id)]) {

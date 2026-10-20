@@ -6,6 +6,7 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const AIResponder = require(path.join(root, 'src', 'js', 'ai-responder'));
+const { verifyMessage } = require(path.join(root, 'src', 'js', 'message-guard'));
 
 const pending = [];
 let passed = 0;
@@ -92,6 +93,43 @@ test('junk: resposta normal NAO e descartada', () => {
   assert.strictEqual(ai.isJunkResponse('Sai por R$ 50, quer que eu reserve?'), false);
   assert.strictEqual(ai.isJunkResponse('Fechado, Joao! Ja te dou o retorno.'), false);
   assert.strictEqual(ai.isJunkResponse('kkkkkk boa!'), false);
+});
+
+// ---------------------------------------------------------------
+// 1b) verificador de mensagens (message-guard)
+// ---------------------------------------------------------------
+test('guard: codigo/JSON/XML/markdown reprovados', () => {
+  assert.strictEqual(verifyMessage('```js\nconst a = 1;\n```').ok, false);
+  assert.strictEqual(verifyMessage('{"reply":"Oi"}').ok, false);
+  assert.strictEqual(verifyMessage('<tool_call>{"x":1}</tool_call>').ok, false);
+  assert.strictEqual(verifyMessage('**Oi** tudo bem?').ok, false);
+  assert.strictEqual(verifyMessage('- item um\n- item dois').ok, false);
+});
+
+test('guard: marcador interno vazado reprovado', () => {
+  assert.strictEqual(verifyMessage('[SEND_IMAGE:img1]').ok, false);
+  assert.strictEqual(verifyMessage('[QUEBRA] Oi').ok, false);
+  assert.strictEqual(verifyMessage('[SEND_IMAGE:img1]Oi', { allowKnownMarkers: true }).ok, true);
+  assert.strictEqual(verifyMessage('[MARCADOR_TORTO:1]Oi', { allowKnownMarkers: true }).ok, false);
+});
+
+test('guard: prompt/artefato vazado reprovado', () => {
+  assert.strictEqual(verifyMessage('REGRAS DE RESPOSTA (IMPORTANTE): responda curto').ok, false);
+  assert.strictEqual(verifyMessage('finish_reason=length max_tokens').ok, false);
+  assert.strictEqual(verifyMessage('***').ok, false);
+});
+
+test('guard: ingles so bloqueia quando o cliente escreveu em PT', () => {
+  assert.strictEqual(verifyMessage('Hello, how are you? Please let me know now.', { incoming: 'oi, tudo bem?' }).ok, false);
+  assert.strictEqual(verifyMessage('Hello, how are you? Please let me know now.', { incoming: 'hello there' }).ok, true);
+  assert.strictEqual(verifyMessage('Oi, tudo bem?', { incoming: 'oi' }).ok, true);
+});
+
+test('guard: frases normais de WhatsApp passam', () => {
+  const ok = ['Oi, em que posso ajudar?', 'Sai por R$ 50, quer que eu reserve?',
+    'Fechado, Joao! Ja te dou o retorno.', 'kkkkkk boa!', 'Sim! Ate as 13h.',
+    'Deixa eu confirmar e ja te falo!'];
+  for (const t of ok) assert.strictEqual(verifyMessage(t).ok, true, `reprovou frase legitima: ${t}`);
 });
 
 // ---------------------------------------------------------------
@@ -215,6 +253,18 @@ testAsync('junk: todos os modelos lixo -> devolve null (main envia erro padrao)'
   assert.strictEqual(r, null);
 });
 
+testAsync('guard: resposta reprovada pede de novo ao mesmo modelo e envia a corrigida', async () => {
+  const ai = new AIResponder();
+  let g = 0;
+  mockFetch((req) => {
+    if (isGoogle(req)) { g++; return googleOk(g === 1 ? '{"reply":"Oi"}' : 'Oi, em que posso ajudar?'); }
+    return orOk('fallback');
+  });
+  const r = await ai.generateResponse(msg(), cfg(GOOGLE, GOOGLE.models[0]), providers);
+  assert.strictEqual(r, 'Oi, em que posso ajudar?');
+  assert.strictEqual(g, 2, 'esperava 2 chamadas ao Google (original + correcao)');
+});
+
 // ---------------------------------------------------------------
 // 7) mensagens multiplas (separador [QUEBRA], teto de 4)
 // ---------------------------------------------------------------
@@ -323,9 +373,9 @@ test('natural: regras essenciais do guia estao todas presentes', () => {
 
 test('natural: exemplos robótico vs natural estao no prompt', () => {
   const s = new AIResponder().getSystemPrompt({ personality: 'padrao', trainings: [] });
-  assert.ok(s.includes('Temos sim! Voce quer o 13 normal ou o 13 Pro?'), 'exemplo natural ausente');
+  assert.ok(s.includes('Temos sim, voce quer o 13 normal ou o 13 Pro?'), 'exemplo natural ausente');
   assert.ok(s.includes('Gostaria de prosseguir com a compra?'), 'exemplo robotico ausente');
-  assert.ok(s.includes('Tranquilo! Qualquer coisa e so chamar.'), 'exemplo de encerramento natural ausente');
+  assert.ok(s.includes('Tranquilo, qualquer coisa e so chamar'), 'exemplo de encerramento natural ausente');
   assert.ok(s.toLowerCase().includes('nao e escrever errado de proposito'), 'anti-erro-artificial ausente');
 });
 
