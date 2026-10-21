@@ -403,9 +403,25 @@ function init() {
   initProviders();
   initProviderConfig();
 
-  // Force sync all data to main process files
+  // O config real fica no processo principal (zaps.json). Carrega dele antes de
+  // qualquer escrita; so usa o cache do localStorage se ainda nao houver config.
   if (window.electronAPI) {
-    window.electronAPI.saveZaps(zapsData);
+    Promise.resolve(window.electronAPI.loadZaps()).then((list) => {
+      if (Array.isArray(list) && list.length) {
+        zapsData = list;
+        zapsData.forEach((zap) => {
+          if (zap.enabled !== true) zap.enabled = true;
+          try { applyRuntimeStatus(zap, zap.runtimeStatus || 'disconnected'); } catch (_) {}
+        });
+        try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
+        renderZaps(zapsData);
+        updateZapSelector();
+      } else {
+        window.electronAPI.saveZaps(zapsData);
+      }
+    }).catch(() => {
+      try { window.electronAPI.saveZaps(zapsData); } catch (_) {}
+    });
     window.electronAPI.saveProviders(providersData);
 
     window.electronAPI.loadTrainings().then(data => {
