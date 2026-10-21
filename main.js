@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const WhatsAppManager = require('./src/js/whatsapp-manager');
@@ -31,6 +31,7 @@ let rendererDragging = false;
 let serverSync = null;
 let serverMode = false;
 let serverKnownZaps = null;
+const zapErrors = new Map();
 
 // Um evaluate do wwebjs numa pagina morta (teardown de LOGOUT) rejeita sem
 // catcher e no Node derrubaria o processo inteiro - aqui so registra o erro
@@ -203,6 +204,9 @@ function memoryFileText(contactName, zapId, chatId, body) {
 // ------------------------------------------------------------
 function sendLog(zapId, type, msg) {
   console.log(`[LOG][${type}] Zap ${zapId}: ${msg}`);
+  if (type === 'error' && zapId != null) {
+    zapErrors.set(String(zapId), Date.now());
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('whatsapp-log', { zapId, type, msg });
   }
@@ -932,7 +936,8 @@ function persistBotStatus() {
           enabled: z.enabled !== false,
           status: state.status || 'disconnected',
           qrPending: !!state.qrPending,
-          pairingCode: state.pairingCode || null
+          pairingCode: state.pairingCode || null,
+          lastErrorAt: zapErrors.get(String(z.id)) || null
         };
       })
     };
@@ -1528,6 +1533,29 @@ ipcMain.handle('whatsapp-status', (e, zapId) => {
     if (s) return s;
   }
   return whatsappManager.getStatus(String(zapId));
+});
+ipcMain.handle('pick-zap-icon', async () => {
+  try {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Escolher icone do Zap',
+      properties: ['openFile'],
+      filters: [{ name: 'Imagens', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] }]
+    });
+    if (!res || res.canceled || !res.filePaths || !res.filePaths[0]) {
+      return { ok: false, canceled: true };
+    }
+    const img = nativeImage.createFromPath(res.filePaths[0]);
+    if (img.isEmpty()) return { ok: false, error: 'arquivo de imagem invalido' };
+    const size = img.getSize();
+    const max = 128;
+    const scale = Math.min(1, max / Math.max(size.width || 1, size.height || 1));
+    const out = scale < 1
+      ? img.resize({ width: Math.round(size.width * scale), height: Math.round(size.height * scale) })
+      : img;
+    return { ok: true, dataUrl: out.toDataURL() };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 });
 ipcMain.handle('whatsapp-send', async (e, zapId, phone, text) => {
   const r = await whatsappManager.sendMessage(String(zapId), phone, text);

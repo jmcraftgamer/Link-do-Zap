@@ -249,15 +249,50 @@ function applyRuntimeStatus(zap, runtimeStatus) {
   return info;
 }
 
+// Indicador de status do painel: verde (ok), amarelo (falhas recentes) e
+// vermelho (desligado/desconectado ou erro - neste caso com X no circulo).
+const RECENT_ERROR_MS = 10 * 60 * 1000;
+
+function computePanelIndicator(zap, info) {
+  info = info || getZapStatusInfo(zap);
+  const lastErr = Number(zap.lastErrorAt || 0);
+  const recentError = lastErr && (Date.now() - lastErr) < RECENT_ERROR_MS;
+
+  if (info.online) {
+    return recentError
+      ? { cls: 'warn', title: 'Funcionando, mas com falhas recentes' }
+      : { cls: 'ok', title: 'Servidor funcionando e IA respondendo' };
+  }
+  if (info.className === 'error') {
+    return { cls: 'bad error', title: 'Erro: ' + info.label };
+  }
+  return { cls: 'bad', title: info.label || 'Desconectado' };
+}
+
 async function refreshAllZapStatuses() {
   if (!window.electronAPI || !zapsData.length) return;
+
+  let serverZaps = null;
+  if (serverManaged && window.electronAPI.serverStatus) {
+    try {
+      const bs = await window.electronAPI.serverStatus();
+      if (bs && Array.isArray(bs.zaps)) serverZaps = bs.zaps;
+    } catch (_) {}
+  }
 
   let changed = false;
   for (const zap of zapsData) {
     try {
-      const st = await window.electronAPI.whatsappStatus(String(zap.id));
+      let next;
+      if (serverZaps) {
+        const sz = serverZaps.find(s => String(s.id) === String(zap.id));
+        next = sz ? (sz.status || 'disconnected') : 'disconnected';
+        zap.lastErrorAt = sz && sz.lastErrorAt ? Number(sz.lastErrorAt) : null;
+      } else {
+        const st = await window.electronAPI.whatsappStatus(String(zap.id));
+        next = (st && st.status) || 'disconnected';
+      }
       const prev = zap.runtimeStatus;
-      const next = (st && st.status) || 'disconnected';
       if (prev !== next) {
         applyRuntimeStatus(zap, next);
         addLog(zap.id, next === 'ready' ? 'success' : (next === 'disconnected' ? 'warning' : 'info'), `Status alterado: ${prev || 'desconhecido'} -> ${next} (poll)`);
@@ -293,13 +328,11 @@ function refreshPanelStatusUI(zapId) {
 
   const statusEl = document.getElementById('zapPanelStatus');
   const info = getZapStatusInfo(zap);
-  statusEl.className = 'zap-card-status ' + info.className;
-  statusEl.innerHTML = `<span class="dot"></span> ${info.label}`;
-
-  const enabledCb = document.getElementById('panelEnabled');
-  if (enabledCb) enabledCb.checked = zap.enabled !== false;
-  const enabledLabel = document.getElementById('panelEnabledLabel');
-  if (enabledLabel) enabledLabel.textContent = zap.enabled !== false ? 'Ativo' : 'Desativado';
+  if (statusEl) {
+    const ind = computePanelIndicator(zap, info);
+    statusEl.className = 'panel-status-dot ' + ind.cls;
+    statusEl.title = ind.title;
+  }
 
   const connectBtn = document.getElementById('zapPanelConnect');
   if (serverManaged) {
@@ -343,7 +376,7 @@ function saveProviders() {
 function init() {
   // Migrate old zaps: ensure enabled field exists, don't trust stale status
   zapsData.forEach(zap => {
-    if (zap.enabled === undefined) zap.enabled = true;
+    if (zap.enabled !== true) zap.enabled = true;
     // Stale "Online" from disk is a lie after app restart - will be refreshed
     if (zap.status === 'Online' && !zap.runtimeStatus) {
       zap.runtimeStatus = 'disconnected';
@@ -440,6 +473,13 @@ function createZapCard(zap) {
       &rsaquo;
     </button>
   `;
+
+  if (zap.icon) {
+    const iconEl = card.querySelector('.zap-card-icon');
+    if (iconEl) {
+      iconEl.innerHTML = `<img src="${zap.icon}" alt="" style="width:36px;height:36px;object-fit:cover;border-radius:50%">`;
+    }
+  }
 
   const arrowBtn = card.querySelector('.open-panel');
   if (arrowBtn) {
@@ -1177,6 +1217,65 @@ function startRenameZap(zap, nameEl) {
   input.addEventListener('blur', () => commit(true));
 }
 
+// ============================================
+// Personalidades (lista + criacao)
+// ============================================
+const BUILTIN_PERSONALITIES = [
+  { id: 'padrao', name: 'Jovem de 17 anos' },
+  { id: 'vendedor', name: 'Vendedor' },
+  { id: 'atendente', name: 'Atendente' },
+  { id: 'especialista', name: 'Especialista' }
+];
+
+function loadCustomPersonalities() {
+  try {
+    const raw = localStorage.getItem('linknozap_personalities');
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter(p => p && p.id && p.name) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveCustomPersonalities(list) {
+  try { localStorage.setItem('linknozap_personalities', JSON.stringify(list)); } catch (_) {}
+}
+
+function getPersonalitiesList() {
+  return BUILTIN_PERSONALITIES.concat(loadCustomPersonalities());
+}
+
+function openPersonalityModal(onDone) {
+  const modal = document.getElementById('personalityModal');
+  const nameInput = document.getElementById('personalityName');
+  const promptInput = document.getElementById('personalityPrompt');
+  if (!modal || !nameInput || !promptInput) return;
+
+  nameInput.value = '';
+  promptInput.value = '';
+  modal.classList.add('active');
+  setTimeout(() => nameInput.focus(), 50);
+
+  const close = () => modal.classList.remove('active');
+  const closeBtn = document.getElementById('closePersonalityModal');
+  const cancelBtn = document.getElementById('cancelPersonality');
+  const saveBtn = document.getElementById('savePersonality');
+  if (closeBtn) closeBtn.onclick = close;
+  if (cancelBtn) cancelBtn.onclick = close;
+  if (saveBtn) saveBtn.onclick = () => {
+    const name = nameInput.value.trim();
+    const instructions = promptInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    if (!instructions) { promptInput.focus(); return; }
+    const list = loadCustomPersonalities();
+    const id = 'custom_' + Date.now().toString(36);
+    list.push({ id, name, instructions });
+    saveCustomPersonalities(list);
+    close();
+    if (typeof onDone === 'function') onDone(id);
+  };
+}
+
 function openZapPanel(zapId) {
   const zap = zapsData.find(z => String(z.id) === String(zapId));
   if (!zap) return;
@@ -1197,41 +1296,51 @@ function openZapPanel(zapId) {
   const editNameBtn = document.getElementById('panelEditName');
   editNameBtn.onclick = () => startRenameZap(zap, document.getElementById('zapPanelName'));
 
-  // Copy phone
+  // Copiar numero (somente o simbolo)
   const copyBtn = document.getElementById('copyZapPhone');
   copyBtn.onclick = () => {
     navigator.clipboard.writeText(zap.phone).then(() => {
       const orig = copyBtn.innerHTML;
-      copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><polyline points="20 6 9 17 4 12"/></svg> Copiado!';
+      copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><polyline points="20 6 9 17 4 12"/></svg>';
       setTimeout(() => { copyBtn.innerHTML = orig; }, 2000);
     });
   };
 
-  // Status badge (real status next to name)
-  const statusInfo = getZapStatusInfo(zap);
-  const statusEl = document.getElementById('zapPanelStatus');
-  statusEl.className = 'zap-card-status ' + statusInfo.className;
-  statusEl.innerHTML = `<span class="dot"></span> ${statusInfo.label}`;
-
-  // Enabled toggle (Ativo/Desativado)
-  const enabledCb = document.getElementById('panelEnabled');
-  const enabledLabel = document.getElementById('panelEnabledLabel');
-  enabledCb.checked = zap.enabled !== false;
-  enabledLabel.textContent = zap.enabled !== false ? 'Ativo' : 'Desativado';
-  enabledCb.onchange = () => {
-    const z = zapsData.find(x => String(x.id) === String(zapId));
-    if (z) {
-      z.enabled = enabledCb.checked;
-      enabledLabel.textContent = z.enabled ? 'Ativo' : 'Desativado';
-      saveZaps();
-      applyRuntimeStatus(z, z.runtimeStatus || 'disconnected');
-      renderZaps(zapsData);
-      refreshPanelStatusUI(zapId);
-      updateToggleZapBtn(z);
+  // Trocar icone do Zap (lapis no canto do icone)
+  const editIconBtn = document.getElementById('panelEditIcon');
+  const iconImg = document.getElementById('zapPanelIconImg');
+  const defaultIcon = document.querySelector('#zapPanelIcon .panel-icon-default');
+  const applyZapIcon = (z) => {
+    if (z && z.icon) {
+      if (iconImg) { iconImg.src = z.icon; iconImg.style.display = 'block'; }
+      if (defaultIcon) defaultIcon.style.display = 'none';
+    } else {
+      if (iconImg) { iconImg.style.display = 'none'; iconImg.removeAttribute('src'); }
+      if (defaultIcon) defaultIcon.style.display = 'block';
     }
   };
+  applyZapIcon(zap);
+  if (editIconBtn) {
+    editIconBtn.onclick = async () => {
+      if (!window.electronAPI || !window.electronAPI.pickZapIcon) return;
+      try {
+        const r = await window.electronAPI.pickZapIcon();
+        if (!r || !r.ok || !r.dataUrl) return;
+        const z = zapsData.find(x => String(x.id) === String(zapId));
+        if (!z) return;
+        z.icon = r.dataUrl;
+        saveZaps();
+        applyZapIcon(z);
+        renderZaps(zapsData);
+      } catch (e) {
+        alert('Nao foi possivel trocar o icone: ' + e.message);
+      }
+    };
+  }
 
-  // Auto-reply toggle (next to status)
+  // Indicador de status (circulo) - detalhe em refreshPanelStatusUI
+
+  // Auto-reply toggle (na frente, junto do nome)
   const autoReplyCb = document.getElementById('panelAutoReply');
   autoReplyCb.checked = zap.autoReply !== false;
   autoReplyCb.onchange = () => {
@@ -1291,48 +1400,75 @@ function openZapPanel(zapId) {
   whEnd.onchange = persistWorkHours;
   whDayBoxes.forEach(cb => { cb.onchange = persistWorkHours; });
 
-  // Personality
-  const personalitySelect = document.getElementById('panelPersonality');
+  // Personalidade (lista de opcoes)
   const areaRow = document.getElementById('panelAreaRow');
   const areaInput = document.getElementById('panelArea');
   const personalityBadge = document.getElementById('zapPanelPersonality');
-  const personalityLabels = {
-    padrao: 'Personalidade: Padro (Jovem 17 anos)',
-    vendedor: 'Personalidade: Vendedor',
-    atendente: 'Personalidade: Atendente',
-    especialista: 'Personalidade: Especialista'
-  };
+  const personalityList = document.getElementById('panelPersonalityList');
 
-  personalitySelect.value = zap.personality || 'padrao';
-  areaInput.value = zap.area || '';
-  areaRow.style.display = personalitySelect.value === 'especialista' ? 'flex' : 'none';
+  const currentZap = () => zapsData.find(x => String(x.id) === String(zapId));
 
   const updatePersonalityBadge = () => {
     if (!personalityBadge) return;
-    let text = personalityLabels[personalitySelect.value] || personalityLabels.padrao;
-    const area = areaInput.value.trim();
-    if (personalitySelect.value === 'especialista' && area) text += ` - ${area}`;
-    personalityBadge.textContent = text;
+    const z = currentZap();
+    const selId = (z && z.personality) || 'padrao';
+    const item = getPersonalitiesList().find(p => p.id === selId);
+    personalityBadge.textContent = item ? item.name : 'Jovem de 17 anos';
   };
+
+  const renderPersonalityList = () => {
+    if (!personalityList) return;
+    const z = currentZap();
+    const selId = (z && z.personality) || 'padrao';
+    personalityList.innerHTML = getPersonalitiesList().map(p => `
+      <label class="panel-personality-item ${p.id === selId ? 'selected' : ''}">
+        <input type="radio" name="panelPersonalityRadio" value="${escapeHtml(p.id)}" ${p.id === selId ? 'checked' : ''}>
+        <span class="panel-personality-name">${escapeHtml(p.name)}</span>
+      </label>
+    `).join('');
+    personalityList.querySelectorAll('input[type="radio"]').forEach(radio => {
+      radio.onchange = () => {
+        const zz = currentZap();
+        if (!zz) return;
+        zz.personality = radio.value;
+        saveZaps();
+        areaRow.style.display = radio.value === 'especialista' ? 'flex' : 'none';
+        renderPersonalityList();
+        updatePersonalityBadge();
+        renderZaps(zapsData);
+      };
+    });
+  };
+
+  const z0 = currentZap();
+  areaInput.value = (z0 && z0.area) || '';
+  areaRow.style.display = ((z0 && z0.personality) || 'padrao') === 'especialista' ? 'flex' : 'none';
+  renderPersonalityList();
   updatePersonalityBadge();
 
-  // Salva na hora (persiste mesmo se fechar o app sem clicar em Salvar)
-  const persistPersonality = () => {
-    const z = zapsData.find(x => String(x.id) === String(zapId));
-    if (!z) return;
-    z.personality = personalitySelect.value;
-    z.area = areaInput.value.trim();
+  areaInput.oninput = () => {
+    const zz = currentZap();
+    if (zz) zz.area = areaInput.value.trim();
+    updatePersonalityBadge();
+  };
+  areaInput.onchange = () => {
+    const zz = currentZap();
+    if (!zz) return;
+    zz.area = areaInput.value.trim();
     saveZaps();
     renderZaps(zapsData);
   };
 
-  personalitySelect.onchange = () => {
-    areaRow.style.display = personalitySelect.value === 'especialista' ? 'flex' : 'none';
-    updatePersonalityBadge();
-    persistPersonality();
-  };
-  areaInput.oninput = updatePersonalityBadge;
-  areaInput.onchange = persistPersonality;
+  const addPersonalityBtn = document.getElementById('addPersonalityBtn');
+  if (addPersonalityBtn) {
+    addPersonalityBtn.onclick = () => openPersonalityModal((id) => {
+      const zz = currentZap();
+      if (zz && id) { zz.personality = id; saveZaps(); }
+      renderPersonalityList();
+      updatePersonalityBadge();
+      renderZaps(zapsData);
+    });
+  }
 
   // Connect/Disconnect button
   refreshPanelStatusUI(zapId);
@@ -1340,63 +1476,6 @@ function openZapPanel(zapId) {
   // Log button
   const logBtn = document.getElementById('zapPanelLog');
   logBtn.onclick = () => openLogModal(zap.id, zap.name);
-
-  // Toggle Zap (Ativar/Desativar)
-  const toggleZapBtn = document.getElementById('panelToggleZap');
-  updateToggleZapBtn(zap);
-  toggleZapBtn.onclick = async () => {
-    const z = zapsData.find(x => String(x.id) === String(zapId));
-    if (!z) return;
-
-    const enabling = z.enabled === false;
-    z.enabled = enabling;
-    enabledCb.checked = enabling;
-    enabledLabel.textContent = enabling ? 'Ativo' : 'Desativado';
-    saveZaps();
-
-    if (serverManaged) {
-      try {
-        const r = await window.electronAPI.serverSyncNow();
-        applyRuntimeStatus(z, z.runtimeStatus || 'disconnected');
-        renderZaps(zapsData);
-        refreshPanelStatusUI(zapId);
-        updateToggleZapBtn(z);
-        if (!r || !r.ok) alert('Nao foi possivel enviar ao servidor: ' + ((r && r.error) || 'erro'));
-      } catch (e) {
-        alert('Erro ao enviar ao servidor: ' + e.message);
-      }
-      return;
-    }
-
-    toggleZapBtn.disabled = true;
-    const origText = toggleZapBtn.querySelector('#panelToggleZapText').textContent;
-    toggleZapBtn.querySelector('#panelToggleZapText').textContent = enabling ? 'Ativando...' : 'Desativando...';
-
-    try {
-      if (window.electronAPI) {
-        if (!enabling) {
-          // Disabling: disconnect
-          await window.electronAPI.whatsappDisconnect(zapId.toString());
-          applyRuntimeStatus(z, 'disconnected');
-        } else {
-          // Enabling: try to reconnect with saved session
-          applyRuntimeStatus(z, 'connecting');
-          // Reutiliza a sessão salva existente sem apagar arquivos do disco
-          await window.electronAPI.whatsappConnect(zapId.toString(), z.phone ? z.phone.replace(/\D/g, '') : '', 'qrcode');
-        }
-      }
-      saveZaps();
-      renderZaps(zapsData);
-      refreshPanelStatusUI(zapId);
-    } catch (err) {
-      alert('Erro: ' + err.message);
-      applyRuntimeStatus(z, 'disconnected');
-      refreshPanelStatusUI(zapId);
-    } finally {
-      toggleZapBtn.disabled = false;
-      updateToggleZapBtn(zapsData.find(x => String(x.id) === String(zapId)) || z);
-    }
-  };
 
   // Save & Restart
   const saveRestartBtn = document.getElementById('panelSaveRestart');
@@ -1413,7 +1492,6 @@ function openZapPanel(zapId) {
       return;
     }
     z.autoReply = autoReplyCb.checked;
-    z.enabled = enabledCb.checked;
     if (typeof readWorkHoursForm === 'function') z.workHours = readWorkHoursForm();
     saveZaps();
     renderZaps(zapsData);
@@ -1459,7 +1537,7 @@ function openZapPanel(zapId) {
       applyRuntimeStatus(z, 'disconnected');
     } finally {
       saveRestartBtn.disabled = false;
-      saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Salvar alteraes e reiniciar Zap`;
+      saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Salvar alteracoes`;
       // Refresh panel
       openZapPanel(zapId);
     }
@@ -1477,30 +1555,37 @@ function openZapPanel(zapId) {
   // Contacts
   loadPanelContacts(zapId);
 
-  // Delete
+  // Apagar Zap (confirmacao dupla)
   const deleteBtn = document.getElementById('panelDeleteZap');
   deleteBtn.onclick = () => {
-    if (confirm('Tem certeza que deseja excluir este Zap?')) {
-      closeZapPanel();
-      zapsData = zapsData.filter(z => z.id !== zapId);
-      saveZaps();
-      if (window.electronAPI && window.electronAPI.serverDeleteZapSession) {
-        try {
-          const p = window.electronAPI.serverDeleteZapSession(String(zapId));
-          if (p && p.catch) p.catch(() => {});
-        } catch (e) {}
-      }
-      delete trainingsData[String(zapId)];
-      if (window.electronAPI) {
-        try {
-          const p = window.electronAPI.deleteTrainingsForZap(String(zapId));
-          if (p && p.catch) p.catch(() => {});
-        } catch (e) {}
-      }
-      renderZaps(zapsData);
-      if (window.electronAPI && window.electronAPI.focusWindow) {
-        window.electronAPI.focusWindow();
-      }
+    const target = zapsData.find(x => String(x.id) === String(zapId));
+    const nome = target ? String(target.name) : 'este Zap';
+    if (!confirm(`Apagar "${nome}"? Essa acao nao pode ser desfeita.`)) return;
+    const typed = prompt(`Para confirmar, digite o nome do Zap: ${nome}`);
+    if (typed === null) return;
+    if (typed.trim() !== nome.trim()) {
+      alert('Nome digitado nao confere. O Zap nao foi apagado.');
+      return;
+    }
+    closeZapPanel();
+    zapsData = zapsData.filter(z => z.id !== zapId);
+    saveZaps();
+    if (window.electronAPI && window.electronAPI.serverDeleteZapSession) {
+      try {
+        const p = window.electronAPI.serverDeleteZapSession(String(zapId));
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) {}
+    }
+    delete trainingsData[String(zapId)];
+    if (window.electronAPI) {
+      try {
+        const p = window.electronAPI.deleteTrainingsForZap(String(zapId));
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) {}
+    }
+    renderZaps(zapsData);
+    if (window.electronAPI && window.electronAPI.focusWindow) {
+      window.electronAPI.focusWindow();
     }
   };
 }
@@ -1873,10 +1958,25 @@ function renderPanelModelConfig(zap) {
   entries.forEach(entry => {
     const row = document.createElement('div');
     row.className = 'panel-model-item';
+    const providerKeys = entry.provider.apiKeys && entry.provider.apiKeys.length
+      ? entry.provider.apiKeys
+      : (entry.provider.apiKey ? [entry.provider.apiKey] : []);
+    const keyIdx = (zap.apiKeySelections && zap.apiKeySelections[entry.provider.id] != null)
+      ? zap.apiKeySelections[entry.provider.id]
+      : 0;
+    const keyLabel = (entry.provider.apiKeyNames && entry.provider.apiKeyNames[keyIdx]) || ('Chave ' + (keyIdx + 1));
+    const hasManyKeys = providerKeys.length > 1;
     row.innerHTML = `
       <input type="checkbox" data-key="${entry.key}" ${selected.has(entry.key) ? 'checked' : ''}>
       <div class="panel-model-info">
-        <span class="panel-model-name">${entry.model.name || entry.model.id}</span>
+        <div class="panel-model-name-row">
+          <button type="button" class="panel-model-key-btn ${hasManyKeys ? '' : 'single'}" data-provider="${entry.provider.id}" title="${hasManyKeys ? 'Chave: ' + escapeHtml(keyLabel) + ' (clique para alternar)' : 'Uma unica chave configurada'}">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+            </svg>
+          </button>
+          <span class="panel-model-name">${entry.model.name || entry.model.id}</span>
+        </div>
         <span class="panel-model-provider">${entry.provider.name} &middot; ${entry.model.id}</span>
       </div>
       <button type="button" class="panel-test-btn" data-provider="${entry.provider.id}" data-model="${entry.model.id}" title="Testar modelo">
@@ -1900,6 +2000,27 @@ function renderPanelModelConfig(zap) {
       const model = (provider.models || []).find(m => m.id === btn.dataset.model);
       if (!model) return;
       openTestChatWith(provider, model);
+    });
+  });
+
+  // Icone do provedor: alterna entre as chaves de API configuradas
+  list.querySelectorAll('.panel-model-key-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const provider = providersData.find(p => p.id === btn.dataset.provider);
+      if (!provider) return;
+      const keys = provider.apiKeys && provider.apiKeys.length
+        ? provider.apiKeys
+        : (provider.apiKey ? [provider.apiKey] : []);
+      if (keys.length < 2) return;
+      const z = zapsData.find(x => String(x.id) === String(zap.id));
+      if (!z) return;
+      if (!z.apiKeySelections) z.apiKeySelections = {};
+      const cur = z.apiKeySelections[provider.id] != null ? z.apiKeySelections[provider.id] : 0;
+      z.apiKeySelections[provider.id] = (cur + 1) % keys.length;
+      saveZaps();
+      renderPanelModelConfig(z);
+      renderPanelProviders(z);
     });
   });
 
@@ -3350,6 +3471,13 @@ function initWhatsApp() {
 
   window.electronAPI.onWhatsAppLog((data) => {
     addLog(data.zapId, data.type, data.msg);
+    if (data.type === 'error' && data.zapId != null) {
+      const z = zapsData.find(x => String(x.id) === String(data.zapId));
+      if (z) z.lastErrorAt = Date.now();
+      if (currentPanelZapId != null && String(currentPanelZapId) === String(data.zapId)) {
+        try { refreshPanelStatusUI(data.zapId); } catch (_) {}
+      }
+    }
   });
 
   if (window.electronAPI.onWhatsAppContactsUpdated) {

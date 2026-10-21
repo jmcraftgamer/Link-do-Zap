@@ -245,42 +245,42 @@
 
             <div class="panel-header-card">
               <div class="panel-header-left">
-                <div class="panel-header-icon">
-                  <svg viewBox="0 0 32 32" fill="#111" width="32" height="32">
-                    <path d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
+                <div class="panel-header-icon" id="zapPanelIcon">
+                  <svg class="panel-icon-default" viewBox="0 0 24 24" width="30" height="30">
+                    <path fill="#25D366" d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
                   </svg>
+                  <img class="panel-icon-img" id="zapPanelIconImg" alt="" style="display:none">
+                  <button type="button" class="panel-icon-edit" id="panelEditIcon" title="Trocar icone do Zap">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M17 3a2.83 2.83 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+                    </svg>
+                  </button>
                 </div>
                 <div class="panel-header-main">
                   <div class="panel-header-name-row">
                     <span class="panel-header-name" id="zapPanelName">Nome do Zap</span>
                     <button type="button" class="panel-edit-name" id="panelEditName" title="Editar nome do Zap">
-                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M17 3a2.83 2.83 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
                       </svg>
                     </button>
-                    <div class="zap-card-status" id="zapPanelStatus"><span class="dot"></span> Desconectado</div>
-                    <label class="panel-enabled-toggle">
-                      <input type="checkbox" id="panelEnabled" checked>
-                      <span class="toggle-slider"></span>
-                      <span class="panel-enabled-label" id="panelEnabledLabel">Ativo</span>
-                    </label>
-                  </div>
-                  <div class="panel-header-phone-row">
-                    <span class="panel-header-phone" id="zapPanelPhone">+55 11 99999-9999</span>
-                    <button class="panel-copy-btn" id="copyZapPhone">
-                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                      </svg>
-                      Copiar
-                    </button>
+                    <div class="panel-status-dot" id="zapPanelStatus" title="Status"></div>
                     <label class="panel-auto-reply">
                       <input type="checkbox" id="panelAutoReply" checked>
                       <span>Ativar auto-resposta</span>
                     </label>
                   </div>
+                  <div class="panel-header-phone-row">
+                    <span class="panel-header-phone" id="zapPanelPhone">+55 11 99999-9999</span>
+                    <button class="panel-copy-btn" id="copyZapPhone" title="Copiar numero">
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                      </svg>
+                    </button>
+                  </div>
                   <div class="panel-header-personality-row">
-                    <span class="panel-personality-badge" id="zapPanelPersonality">Padro</span>
+                    <span class="panel-personality-badge" id="zapPanelPersonality">Jovem de 17 anos</span>
                   </div>
                 </div>
               </div>
@@ -304,33 +304,48 @@
                   <polyline points="23 4 23 10 17 10"/>
                   <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
                 </svg>
-                Salvar alteraes e reiniciar Zap
+                Salvar alteracoes
               </button>
-              <button class="btn-toggle-zap" id="panelToggleZap">
+              <button class="btn-delete-zap" id="panelDeleteZap">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-                  <line x1="12" y1="2" x2="12" y2="12"/>
+                  <polyline points="3 6 5 6 21 6"/>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                 </svg>
-                <span id="panelToggleZapText">Desativar Zap</span>
+                Apagar Zap
               </button>
+            </div>
+
+            <!-- Charts -->
+            <div class="panel-section">
+              <div class="panel-section-title">Estatisticas</div>
+              <div class="chart-box">
+                <div class="chart-box-header">
+                  <div class="chart-box-title">Atividade da IA - ultimas 12 horas</div>
+                  <div class="chart-box-value" id="usageValue">0</div>
+                </div>
+                <canvas class="chart-canvas" id="usageChart"></canvas>
+                <div class="chart-tooltip" id="usageTooltip"></div>
+              </div>
             </div>
 
             <!-- Personality -->
             <div class="panel-section">
               <div class="panel-section-title">Personalidade</div>
-              <select class="model-config-select panel-select-full" id="panelPersonality">
-                <option value="padrao">Padro (Jovem 17 anos)</option>
-                <option value="vendedor">Vendedor</option>
-                <option value="atendente">Atendente</option>
-                <option value="especialista">Especialista</option>
-              </select>
+              <div class="panel-personality-list" id="panelPersonalityList"></div>
               <div class="model-config-row panel-area-row" id="panelAreaRow" style="display:none">
                 <div>
-                  <div class="model-config-label">rea de Atuao</div>
+                  <div class="model-config-label">Area de atuacao</div>
                   <div class="model-config-hint">Ex: Psicologia, Dentista, Advogado</div>
                 </div>
-                <input type="text" class="panel-area-input" id="panelArea" placeholder="Sua rea de atuao...">
+                <input type="text" class="panel-area-input" id="panelArea" placeholder="Sua area de atuacao...">
               </div>
+              <button type="button" class="panel-add-personality" id="addPersonalityBtn">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                Adicionar personalidade
+              </button>
             </div>
 
             <!-- Resposta -->
@@ -374,19 +389,6 @@
               <div class="model-config-hint">Fora desse horario a IA nao responde e a mensagem nem e enviada para ela.</div>
             </div>
 
-            <!-- Charts -->
-            <div class="panel-section">
-              <div class="panel-section-title">Estatsticas</div>
-              <div class="chart-box">
-                <div class="chart-box-header">
-                  <div class="chart-box-title">Atividade da IA - ultimas 12 horas</div>
-                  <div class="chart-box-value" id="usageValue">0</div>
-                </div>
-                <canvas class="chart-canvas" id="usageChart"></canvas>
-                <div class="chart-tooltip" id="usageTooltip"></div>
-              </div>
-            </div>
-
             <!-- Providers -->
             <div class="panel-section">
               <div class="panel-section-title">Provedores de IA</div>
@@ -395,7 +397,7 @@
 
             <!-- Response Models -->
             <div class="panel-section">
-              <div class="panel-section-title">Modelos de Resposta</div>
+              <div class="panel-section-title">Modelos de resposta</div>
               <div class="panel-models-header">
                 <span class="panel-models-hint">Modelos de todos os provedores selecionados</span>
                 <label class="panel-select-all" title="Marcar todos os modelos">
@@ -418,16 +420,12 @@
 
             <!-- Contacts -->
             <div class="panel-section">
-              <div class="panel-section-title">Contatos Autorizados</div>
+              <div class="panel-section-title">Contatos autorizados</div>
               <div id="panelContactsList">
                 <p style="font-size:12px;color:#999;">Conecte o Zap para ver os contatos.</p>
               </div>
             </div>
 
-            <!-- Delete -->
-            <div class="panel-delete-section">
-              <button class="btn-delete-zap" id="panelDeleteZap">Excluir Zap</button>
-            </div>
           </div>
         </div>
 
@@ -780,6 +778,31 @@
         <div class="form-actions">
           <button class="btn btn-outline" id="cancelAdd">Cancelar</button>
           <button class="btn btn-primary" id="confirmAdd">Adicionar Zap</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Personality Modal -->
+  <div class="modal-overlay" id="personalityModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>Nova personalidade</h2>
+        <button class="modal-close" id="closePersonalityModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="personalityName">Nome da personalidade</label>
+          <input type="text" id="personalityName" placeholder="Ex: Vendedor de carros">
+        </div>
+        <div class="form-group">
+          <label for="personalityPrompt">Instrucoes</label>
+          <p class="form-hint">Descreva como essa personalidade deve falar e se comportar.</p>
+          <textarea id="personalityPrompt" class="personality-textarea" rows="10" placeholder="Voce e..."></textarea>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-outline" id="cancelPersonality">Cancelar</button>
+          <button class="btn btn-primary" id="savePersonality">Adicionar</button>
         </div>
       </div>
     </div>

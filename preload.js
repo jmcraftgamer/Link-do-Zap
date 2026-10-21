@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsappSendMedia: (zapId, phone, media) => ipcRenderer.invoke('whatsapp-send-media', zapId, phone, media),
   whatsappConversations: (zapId) => ipcRenderer.invoke('whatsapp-conversations', zapId),
   whatsappMessages: (zapId, chatId) => ipcRenderer.invoke('whatsapp-messages', zapId, chatId),
+  pickZapIcon: () => ipcRenderer.invoke('pick-zap-icon'),
 
   // Sincronizacao com o servidor 24h (painel)
   serverInfo: () => ipcRenderer.invoke('server-info'),
