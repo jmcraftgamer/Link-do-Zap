@@ -461,6 +461,20 @@ test('horario: main.js e o painel usam o horario de atendimento', () => {
   assert.ok(appSrc.includes('resolvedOptions'), 'app.js nao grava o fuso (servidor roda em UTC)');
 });
 
+test('apagar zap: fluxo completo sem prompt (Electron nao suporta)', () => {
+  const appSrc = fs.readFileSync(path.join(root, 'src', 'js', 'app.js'), 'utf8');
+  const mainSrc = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  const syncSrc = fs.readFileSync(path.join(root, 'src', 'js', 'server-sync.js'), 'utf8');
+  const html = fs.readFileSync(path.join(root, 'src', 'index.html'), 'utf8');
+  assert.ok(!/[^.\w]prompt\(/.test(appSrc), 'app.js usa prompt(), que nao funciona no Electron');
+  assert.ok(appSrc.includes('deleteZapCompletely'), 'app.js sem fluxo completo de exclusao');
+  assert.ok(appSrc.includes('serverSyncNow()'), 'exclusao nao sincroniza com o servidor');
+  assert.ok(appSrc.includes('serverDeleteZapSession'), 'exclusao nao apaga a sessao');
+  assert.ok(html.includes('deleteZapModal') && html.includes('confirmDeleteZap'), 'modal de exclusao ausente');
+  assert.ok(mainSrc.includes("'server-delete-zap-session'"), 'main.js sem IPC de remocao de sessao');
+  assert.ok(syncSrc.includes("'trainings', id"), 'server-sync nao remove treinos do zap');
+});
+
 // ================= MEMORIA / HISTORICO DE CONVERSAS =================
 const os = require('os');
 const TMP_CONV_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'conv-store-'));

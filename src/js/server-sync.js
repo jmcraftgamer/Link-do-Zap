@@ -289,8 +289,10 @@ class ServerSync {
     const targets = [
       path.join(this.dataDir, 'sessions', id),
       path.join(this.dataDir, 'sessions', `${id}.cache-keep`),
+      path.join(this.dataDir, 'trainings', id),
       path.join(this.sourceDir, 'sessions', id),
-      path.join(this.sourceDir, 'sessions', `${id}.cache-keep`)
+      path.join(this.sourceDir, 'sessions', `${id}.cache-keep`),
+      path.join(this.sourceDir, 'trainings', id)
     ];
     for (const t of targets) {
       if (!fs.existsSync(t)) continue;
@@ -302,8 +304,8 @@ class ServerSync {
       }
     }
     const doCommit = async () => {
-      const rel = path.relative(this.dataDir, path.join(this.dataDir, 'sessions', id)).replace(/\\/g, '/');
-      await run('git', ['add', '-A', '--', 'sessions'], { cwd: this.dataDir });
+      const dirs = ['sessions', 'trainings'].filter((d) => fs.existsSync(path.join(this.dataDir, d)));
+      if (dirs.length) await run('git', ['add', '-A', '--'].concat(dirs), { cwd: this.dataDir });
       const diff = await run('git', ['diff', '--cached', '--quiet'], { cwd: this.dataDir });
       if (diff.code === 0) return { ok: true, unchanged: true };
       await run('git', ['commit', '-m', `app: remove zap ${id}`], { cwd: this.dataDir });

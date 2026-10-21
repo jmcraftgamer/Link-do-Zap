@@ -808,6 +808,28 @@
     </div>
   </div>
 
+  <!-- Delete Zap Modal -->
+  <div class="modal-overlay" id="deleteZapModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>Apagar Zap</h2>
+        <button class="modal-close" id="closeDeleteZapModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="delete-zap-warning" id="deleteZapWarning"></p>
+        <div class="form-group">
+          <label for="deleteZapConfirmInput">Digite o nome do Zap para confirmar</label>
+          <input type="text" id="deleteZapConfirmInput" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-outline" id="cancelDeleteZap">Cancelar</button>
+          <button class="btn btn-danger" id="confirmDeleteZap" disabled>Apagar definitivamente</button>
+        </div>
+        <p class="delete-zap-status" id="deleteZapStatus"></p>
+      </div>
+    </div>
+  </div>
+
   <!-- Provider Config Modal -->
   <div class="modal-overlay" id="providerModal">
     <div class="modal modal-lg">

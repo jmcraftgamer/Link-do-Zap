@@ -514,32 +514,7 @@ function createZapCard(zap) {
 // Delete Zap
 // ============================================
 function deleteZap(id) {
-  if (!confirm('Tem certeza que deseja excluir este Zap?')) return;
-  if (window.electronAPI && window.electronAPI.whatsappDisconnect) {
-    try {
-      const p = window.electronAPI.whatsappDisconnect(String(id));
-      if (p && p.catch) p.catch(() => {});
-    } catch (e) {}
-  }
-  zapsData = zapsData.filter(z => z.id !== id);
-  saveZaps();
-  if (window.electronAPI && window.electronAPI.serverDeleteZapSession) {
-    try {
-      const p = window.electronAPI.serverDeleteZapSession(String(id));
-      if (p && p.catch) p.catch(() => {});
-    } catch (e) {}
-  }
-  delete trainingsData[String(id)];
-  if (window.electronAPI) {
-    try {
-      const p = window.electronAPI.deleteTrainingsForZap(String(id));
-      if (p && p.catch) p.catch(() => {});
-    } catch (e) {}
-  }
-  renderZaps(zapsData);
-  if (window.electronAPI && window.electronAPI.focusWindow) {
-    window.electronAPI.focusWindow();
-  }
+  openDeleteZapModal(id);
 }
 
 // ============================================
@@ -1571,39 +1546,148 @@ function openZapPanel(zapId) {
   // Contacts
   loadPanelContacts(zapId);
 
-  // Apagar Zap (confirmacao dupla)
+  // Apagar Zap (modal de confirmacao)
   const deleteBtn = document.getElementById('panelDeleteZap');
-  deleteBtn.onclick = () => {
-    const target = zapsData.find(x => String(x.id) === String(zapId));
-    const nome = target ? String(target.name) : 'este Zap';
-    if (!confirm(`Apagar "${nome}"? Essa acao nao pode ser desfeita.`)) return;
-    const typed = prompt(`Para confirmar, digite o nome do Zap: ${nome}`);
-    if (typed === null) return;
-    if (typed.trim() !== nome.trim()) {
-      alert('Nome digitado nao confere. O Zap nao foi apagado.');
-      return;
-    }
-    closeZapPanel();
-    zapsData = zapsData.filter(z => z.id !== zapId);
-    saveZaps();
-    if (window.electronAPI && window.electronAPI.serverDeleteZapSession) {
-      try {
-        const p = window.electronAPI.serverDeleteZapSession(String(zapId));
-        if (p && p.catch) p.catch(() => {});
-      } catch (e) {}
-    }
-    delete trainingsData[String(zapId)];
-    if (window.electronAPI) {
-      try {
-        const p = window.electronAPI.deleteTrainingsForZap(String(zapId));
-        if (p && p.catch) p.catch(() => {});
-      } catch (e) {}
-    }
-    renderZaps(zapsData);
-    if (window.electronAPI && window.electronAPI.focusWindow) {
-      window.electronAPI.focusWindow();
+  deleteBtn.onclick = () => openDeleteZapModal(zapId);
+}
+
+let pendingDeleteZapId = null;
+
+function openDeleteZapModal(zapId) {
+  const zap = zapsData.find((z) => String(z.id) === String(zapId));
+  if (!zap) return;
+  const modal = document.getElementById('deleteZapModal');
+  if (!modal) return;
+  pendingDeleteZapId = zap.id;
+
+  const nome = String(zap.name);
+  const warning = document.getElementById('deleteZapWarning');
+  const input = document.getElementById('deleteZapConfirmInput');
+  const confirmBtn = document.getElementById('confirmDeleteZap');
+  const cancelBtn = document.getElementById('cancelDeleteZap');
+  const closeBtn = document.getElementById('closeDeleteZapModal');
+  const status = document.getElementById('deleteZapStatus');
+  if (!warning || !input || !confirmBtn || !cancelBtn || !closeBtn || !status) return;
+
+  warning.textContent = `"${nome}" sera apagado do app e do servidor. O WhatsApp sera desconectado e nao vai mais responder mensagens. Essa acao nao pode ser desfeita.`;
+  input.value = '';
+  status.textContent = '';
+  status.classList.remove('error');
+  confirmBtn.textContent = 'Apagar definitivamente';
+  confirmBtn.disabled = true;
+  delete confirmBtn.dataset.busy;
+  modal.classList.add('active');
+  setTimeout(() => input.focus(), 50);
+
+  const syncBtn = () => {
+    confirmBtn.disabled = confirmBtn.dataset.busy === '1' || input.value.trim() !== nome.trim();
+  };
+  input.oninput = syncBtn;
+
+  const close = () => {
+    if (confirmBtn.dataset.busy === '1') return;
+    modal.classList.remove('active');
+    pendingDeleteZapId = null;
+  };
+  closeBtn.onclick = close;
+  cancelBtn.onclick = close;
+  modal.onclick = (e) => { if (e.target === modal) close(); };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter' && !confirmBtn.disabled) confirmBtn.click();
+  };
+
+  confirmBtn.onclick = async () => {
+    if (confirmBtn.disabled) return;
+    const id = pendingDeleteZapId;
+    if (id == null) return;
+    confirmBtn.dataset.busy = '1';
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Apagando...';
+    status.classList.remove('error');
+    status.textContent = 'Apagando do app e do servidor...';
+    try {
+      const res = await deleteZapCompletely(id);
+      status.textContent = res && res.synced
+        ? 'Zap apagado. O servidor nao vai mais responder por ele.'
+        : 'Zap apagado do app. A sincronizacao com o servidor esta pendente e sera tentada de novo.';
+      delete confirmBtn.dataset.busy;
+      setTimeout(() => {
+        modal.classList.remove('active');
+        pendingDeleteZapId = null;
+      }, res && res.synced ? 1200 : 2600);
+    } catch (e) {
+      status.classList.add('error');
+      status.textContent = 'Falha ao apagar: ' + (e && e.message ? e.message : e);
+      delete confirmBtn.dataset.busy;
+      confirmBtn.textContent = 'Apagar definitivamente';
+      syncBtn();
     }
   };
+}
+
+async function deleteZapCompletely(zapId) {
+  const id = String(zapId);
+  const zap = zapsData.find((z) => String(z.id) === id);
+  if (!zap) throw new Error('Zap nao encontrado');
+  if (!window.electronAPI || !window.electronAPI.saveZaps) throw new Error('IPC saveZaps indisponivel');
+
+  if (currentPanelZapId != null && String(currentPanelZapId) === id) closeZapPanel();
+
+  // Remove da UI e do cache imediatamente
+  zapsData = zapsData.filter((z) => String(z.id) !== id);
+  try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
+  renderZaps(zapsData);
+  if (typeof updateZapSelector === 'function') { try { updateZapSelector(); } catch (_) {} }
+
+  // 1) persiste a remocao no zaps.json (processo principal)
+  const saved = await window.electronAPI.saveZaps(zapsData);
+  if (saved === false) throw new Error('nao foi possivel gravar o zaps.json');
+
+  // 2) desconecta no app (se estiver conectado localmente)
+  if (window.electronAPI.whatsappDisconnect) {
+    try { await window.electronAPI.whatsappDisconnect(id); } catch (_) {}
+  }
+
+  // 3) empurra a config sem o zap; o servidor para de responder ao receber
+  let synced = false;
+  let lastErr = '';
+  if (window.electronAPI.serverSyncNow) {
+    for (let i = 0; i < 3 && !synced; i++) {
+      try {
+        const r = await window.electronAPI.serverSyncNow();
+        if (r && (r.ok || r.disabled)) { synced = true; break; }
+        lastErr = (r && r.error) || 'sincronizacao falhou';
+      } catch (e) {
+        lastErr = e && e.message ? e.message : String(e);
+      }
+      if (!synced) await new Promise((res) => setTimeout(res, 1500));
+    }
+    if (!synced) console.warn('[DELETE] sync imediato falhou:', lastErr);
+  } else {
+    synced = true;
+  }
+
+  // 4) apaga a sessao (repo de dados + pasta local) e os treinamentos
+  if (window.electronAPI.serverDeleteZapSession) {
+    try {
+      const r = await window.electronAPI.serverDeleteZapSession(id);
+      if (r && r.ok === false && !r.disabled) console.warn('[DELETE] sessao:', r.error);
+    } catch (e) {
+      console.warn('[DELETE] sessao:', e && e.message);
+    }
+  }
+  delete trainingsData[id];
+  if (window.electronAPI.deleteTrainingsForZap) {
+    try { await window.electronAPI.deleteTrainingsForZap(id); } catch (_) {}
+  }
+
+  // 5) push final (garante sessao/treinos removidos no repo)
+  if (window.electronAPI.serverSyncNow) {
+    try { await window.electronAPI.serverSyncNow(); } catch (_) {}
+  }
+
+  if (window.electronAPI.focusWindow) { try { window.electronAPI.focusWindow(); } catch (_) {} }
+  return { ok: true, synced };
 }
 
 function closeZapPanel() {

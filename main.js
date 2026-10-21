@@ -1036,6 +1036,8 @@ function startServerReconciler(intervalMs = 15000) {
         console.log(`[SYNC] Zap ${id} removido no painel - desconectando`);
         try { await whatsappManager.disconnectZap(id, 'removido no painel'); } catch (_) {}
         try { fs.rmSync(path.join(getDataDir(), 'sessions', id), { recursive: true, force: true }); } catch (_) {}
+        try { fs.rmSync(path.join(getDataDir(), 'sessions', `${id}.cache-keep`), { recursive: true, force: true }); } catch (_) {}
+        try { fs.rmSync(path.join(getDataDir(), 'trainings', id), { recursive: true, force: true }); } catch (_) {}
         serverKnownZaps.delete(id);
       }
       for (const z of zaps) {
@@ -1721,16 +1723,9 @@ ipcMain.handle('delete-trainings-for-zap', (e, zapId) => {
       }
     }
   }
-  // Delete zap dir if empty
+  // Remove a pasta inteira do zap (imagens/arquivos que sobraram)
   const zapDir = path.join(getDataDir(), 'trainings', zid);
-  if (fs.existsSync(zapDir)) {
-    try {
-      const files = fs.readdirSync(zapDir);
-      if (files.length === 0) fs.rmdirSync(zapDir);
-    } catch (_) {}
-    // Force remove if still has files (all deleted above, but safety)
-    try { if (fs.existsSync(zapDir) && fs.readdirSync(zapDir).length === 0) fs.rmdirSync(zapDir); } catch (_) {}
-  }
+  try { fs.rmSync(zapDir, { recursive: true, force: true }); } catch (_) {}
   delete all[zid];
   fs.writeFileSync(getFilePath('trainings.json'), JSON.stringify(all, null, 2));
   if (serverSync) serverSync.scheduleSync();
@@ -1747,7 +1742,17 @@ ipcMain.handle('server-info', () => ({
 }));
 ipcMain.handle('server-sync-now', () => (serverSync ? serverSync.syncNow() : { ok: false, disabled: true, error: 'sincronizacao desativada' }));
 ipcMain.handle('server-sync-status', () => (serverSync ? serverSync.getStatus() : { enabled: false, state: 'disabled' }));
-ipcMain.handle('server-delete-zap-session', (e, zapId) => (serverSync ? serverSync.deleteZapSession(String(zapId)) : { ok: false, disabled: true }));
+ipcMain.handle('server-delete-zap-session', (e, zapId) => {
+  const id = String(zapId);
+  // Sempre apaga a sessao local, mesmo sem server-sync (modo local)
+  for (const suffix of ['', '.cache-keep']) {
+    try {
+      fs.rmSync(path.join(getDataDir(), 'sessions', id + suffix), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (_) {}
+  }
+  if (serverSync) return serverSync.deleteZapSession(id);
+  return { ok: true, localOnly: true };
+});
 ipcMain.handle('server-status', () => (serverSync ? serverSync.getBotStatus() : null));
 ipcMain.handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
 
