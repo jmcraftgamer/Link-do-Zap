@@ -1,7 +1,7 @@
 // Teste de fluxo do main.js SEM celular e SEM janela:
 // - electron e o whatsapp-manager sao substituidos por stubs
 // - fetch e simulado (nenhuma chamada de rede)
-// - relógio virtual: os 15/25/35s de sorteio e o tempo de digitacao
+// - relógio virtual: os 2/3/5s de sorteio e o tempo de digitacao
 //   passam na hora, mas sao medidos de verdade
 // Cobre: fila por conversa, sorteio de tempo, indicador digitando na
 // ordem certa, nome no prompt, resposta cortada, texto lixo e corte de grupo.
@@ -226,7 +226,7 @@ async function run() {
     assert.ok(sys.includes('NOME DO CLIENTE: Joao Silva'), 'nome do contato ausente no prompt');
 
     const text = newLogs(s);
-    assert.ok(/Sorteio de tempo de resposta: (15|25|35)s/.test(text), 'sorteio 15/25/35s ausente');
+    assert.ok(/Sorteio de tempo de resposta: (2|3|5)s/.test(text), 'sorteio 2/3/5s ausente');
     assert.ok(text.includes('Digitacao realista'), 'log de digitacao realista ausente');
     assert.ok(text.includes('Indicador "digitando" ativado'), 'indicador nao ligou antes da IA');
 
@@ -238,11 +238,11 @@ async function run() {
     assert.ok(comp.t < pause.t, 'paused veio antes do composing');
     assert.ok(pause.t <= sent.t, 'mensagem saiu antes de desligar o digitando');
 
-    // tempo total = sorteio (15/25/35s) + digitacao humana (2,5 chars/s, min 5s)
+    // tempo total = sorteio (2/3/5s) + digitacao humana (2,5 chars/s, min 5s)
     const humanMs = Math.round((sent.text.length / 2.5) * 1000);
     const target = Math.max(5000, humanMs);
     const preDelay = (sent.t - s.t) - target;
-    assert.ok([15000, 25000, 35000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
+    assert.ok([2000, 3000, 5000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
     assert.ok(sent.t - comp.t >= 5000, 'digitando durou menos de 5s');
 
     const typingUi = rendererEvents.slice(s.renderer).filter(e => e.ch === 'whatsapp-typing');
@@ -404,10 +404,10 @@ async function run() {
       }
     }
 
-    // 1o balao espera o sorteio (15/25/35s) + digitacao humana
+    // 1o balao espera o sorteio (2/3/5s) + digitacao humana
     const human = Math.max(5000, Math.round((sent[0].text.length / 2.5) * 1000));
     const preDelay = (sent[0].t - s.t) - human;
-    assert.ok([15000, 25000, 35000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
+    assert.ok([2000, 3000, 5000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
   });
 
   // ---------------------------------------------------------------

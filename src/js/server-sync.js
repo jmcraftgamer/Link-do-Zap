@@ -71,6 +71,7 @@ class ServerSync {
     this._lastCodes = {};
     this._lastQr = {};
     this._lastStatus = {};
+    this._lastRemoteSha = null;
 
     this._onPairingCode = null;
     this._onQr = null;
@@ -320,14 +321,22 @@ class ServerSync {
 
   // Le do servidor: bot-status.json, pairing-codes.json e QR
   async refreshStatus() {
-    if (!this.enabled || this._refreshing) return this.botStatus;
+    // Nao roda junto com um sync (evita git concorrente) nem empilha refreshes.
+    if (!this.enabled || this._refreshing || this._running) return this.botStatus;
     this._refreshing = true;
     try {
       await run('git', ['fetch', '--quiet', 'origin', this.branch], { cwd: this.dataDir, timeout: 30000 });
+      // Se o servidor nao publicou nada novo, nao gasta mais dois `git show`.
+      const head = await run('git', ['rev-parse', `origin/${this.branch}`], { cwd: this.dataDir, timeout: 15000 });
+      const remoteSha = (head.stdout || '').trim();
+      if (remoteSha && remoteSha === this._lastRemoteSha && this.botStatus) {
+        return this.botStatus;
+      }
       const bs = await this._showJson('bot-status.json');
       if (bs) this.botStatus = bs;
       const pc = await this._showJson('pairing-codes.json');
       if (pc) this.pairingCodes = pc;
+      this._lastRemoteSha = remoteSha || null;
       await this._emitChanges();
     } catch (e) {
       if (process.env.LINK_SYNC_DEBUG === '1') console.warn('[SYNC] refreshStatus:', e.message);

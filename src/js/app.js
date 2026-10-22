@@ -269,8 +269,10 @@ function computePanelIndicator(zap, info) {
   return { cls: 'bad', title: info.label || 'Desconectado' };
 }
 
-async function refreshAllZapStatuses() {
+async function refreshAllZapStatuses(force = false) {
   if (!window.electronAPI || !zapsData.length) return;
+  // Janela minimizada/oculta: nao gasta IPC/render/CPU com polling.
+  if (document.hidden && !force) return;
 
   let serverZaps = null;
   if (serverManaged && window.electronAPI.serverStatus) {
@@ -393,8 +395,10 @@ function init() {
   // Detecta se este app e o painel do servidor 24h
   if (window.electronAPI && window.electronAPI.serverInfo) {
     window.electronAPI.serverInfo().then((info) => {
+      const wasServerManaged = serverManaged;
       serverManaged = !!(info && info.enabled);
-      renderZaps(zapsData);
+      // So redesenha se o modo mudou: evita um render extra no boot.
+      if (serverManaged !== wasServerManaged) renderZaps(zapsData);
       if (serverManaged && currentPanelZapId != null) refreshPanelStatusUI(currentPanelZapId);
     }).catch(() => {});
   }
@@ -441,6 +445,10 @@ function init() {
       refreshAllZapStatuses();
       // Poll every 10s (reduced from 5s to lower IPC/disk load), only for enabled zaps
       setInterval(refreshAllZapStatuses, 10000);
+      // Ao voltar a janela, atualiza na hora (o polling fica pausado enquanto oculta)
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshAllZapStatuses(true);
+      });
     }, 800);
   }
 }

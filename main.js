@@ -570,13 +570,13 @@ async function processMessage(messageData) {
   }
   sendLog(zapId, 'info', `${modelsToTry.length} modelo(s) disponivel(is) para tentar`);
 
-  // ---- 1) SORTEIO DO TEMPO ANTES DE COMECAR A RESPONDER (15s, 25s ou 35s) ----
+  // ---- 1) SORTEIO DO TEMPO ANTES DE COMECAR A RESPONDER (2s, 3s ou 5s) ----
   // Simula uma pessoa lendo a mensagem / pensando na resposta. Nesse periodo
   // NADA aparece para o contato (sem "digitando").
   if (zap.instantReply) {
     sendLog(zapId, 'info', 'Resposta instantanea ativada - sorteio de tempo ignorado.');
   } else {
-    const delayOptions = [15000, 25000, 35000];
+    const delayOptions = [2000, 3000, 5000];
     const preDelay = delayOptions[Math.floor(Math.random() * delayOptions.length)];
     sendLog(zapId, 'info', `Sorteio de tempo de resposta: ${(preDelay / 1000)}s antes de comecar a digitar...`);
     await new Promise(resolve => setTimeout(resolve, preDelay));
@@ -1017,7 +1017,7 @@ function autoPairMissingSessions() {
 // Reconciler do servidor: aplica ao vivo o zaps.json alterado no painel
 // (novo zap = conecta/pareia; zap removido/desativado = desconecta)
 // ------------------------------------------------------------
-function startServerReconciler(intervalMs = 15000) {
+function startServerReconciler(intervalMs = 10000) {
   if (!isHeadless() || !whatsappManager) return null;
   const snapshot = () => {
     const map = new Map();
@@ -1447,7 +1447,7 @@ app.whenReady().then(() => {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-status', d);
       });
       serverSync.refreshStatus().catch(() => {});
-      const syncPoll = setInterval(() => serverSync.refreshStatus().catch(() => {}), 15000);
+      const syncPoll = setInterval(() => serverSync.refreshStatus().catch(() => {}), 10000);
       if (syncPoll && typeof syncPoll.unref === 'function') syncPoll.unref();
     } catch (e) {
       console.error('[SYNC] listeners falharam:', e.message);
