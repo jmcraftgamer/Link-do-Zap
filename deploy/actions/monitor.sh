@@ -67,6 +67,5 @@ while true; do
     exit 0
   fi
 
-  # 10s: painel -> servidor (configs) e pareamento com menos latencia
-  sleep 10
+  sleep 15
 done

@@ -1017,7 +1017,7 @@ function autoPairMissingSessions() {
 // Reconciler do servidor: aplica ao vivo o zaps.json alterado no painel
 // (novo zap = conecta/pareia; zap removido/desativado = desconecta)
 // ------------------------------------------------------------
-function startServerReconciler(intervalMs = 10000) {
+function startServerReconciler(intervalMs = 15000) {
   if (!isHeadless() || !whatsappManager) return null;
   const snapshot = () => {
     const map = new Map();
@@ -1447,7 +1447,7 @@ app.whenReady().then(() => {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-status', d);
       });
       serverSync.refreshStatus().catch(() => {});
-      const syncPoll = setInterval(() => serverSync.refreshStatus().catch(() => {}), 10000);
+      const syncPoll = setInterval(() => serverSync.refreshStatus().catch(() => {}), 15000);
       if (syncPoll && typeof syncPoll.unref === 'function') syncPoll.unref();
     } catch (e) {
       console.error('[SYNC] listeners falharam:', e.message);
