@@ -17,7 +17,7 @@ if [ -z "$REPO" ]; then
   exit 1
 fi
 
-HTTP=$(curl -sS -o /tmp/dispatch-body.json -w '%{http_code}' -X POST \
+HTTP=$(curl -sS --connect-timeout 10 --max-time 30 -o /tmp/dispatch-body.json -w '%{http_code}' -X POST \
   -H "Authorization: Bearer $BOT_PAT" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" \
