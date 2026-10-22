@@ -1618,7 +1618,10 @@ ipcMain.handle('agent-chat', async (e, payload) => {
 // ------------------------------------------------------------
 // IPC - Data persistence
 // ------------------------------------------------------------
-ipcMain.handle('load-zaps', () => loadZapsData());
+ipcMain.handle('load-zaps', () => {
+  if (!fs.existsSync(getFilePath('zaps.json'))) return null;
+  return loadZapsData();
+});
 ipcMain.handle('save-zaps', (e, data) => {
   ensureDataDir();
   const p = getFilePath('zaps.json');

@@ -407,7 +407,8 @@ function init() {
   // qualquer escrita; so usa o cache do localStorage se ainda nao houver config.
   if (window.electronAPI) {
     Promise.resolve(window.electronAPI.loadZaps()).then((list) => {
-      if (Array.isArray(list) && list.length) {
+      if (Array.isArray(list)) {
+        // O arquivo de config existe e manda, mesmo quando esta vazio (zap removido).
         zapsData = list;
         zapsData.forEach((zap) => {
           if (zap.enabled !== true) zap.enabled = true;
@@ -416,11 +417,14 @@ function init() {
         try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
         renderZaps(zapsData);
         updateZapSelector();
-      } else {
+      } else if (zapsData.length) {
+        // Primeira execucao (sem arquivo): migra o cache antigo uma unica vez.
         window.electronAPI.saveZaps(zapsData);
       }
     }).catch(() => {
-      try { window.electronAPI.saveZaps(zapsData); } catch (_) {}
+      if (zapsData.length) {
+        try { window.electronAPI.saveZaps(zapsData); } catch (_) {}
+      }
     });
     window.electronAPI.saveProviders(providersData);
 
