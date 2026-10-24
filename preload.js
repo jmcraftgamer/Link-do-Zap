@@ -22,10 +22,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsappConnect: (zapId, phoneNumber, method) => ipcRenderer.invoke('whatsapp-connect', zapId, phoneNumber, method),
   whatsappDisconnect: (zapId) => ipcRenderer.invoke('whatsapp-disconnect', zapId),
   whatsappStatus: (zapId) => ipcRenderer.invoke('whatsapp-status', zapId),
-  whatsappSend: (zapId, phone, text) => ipcRenderer.invoke('whatsapp-send', zapId, phone, text),
+  whatsappSend: (zapId, phone, text, chatId) => ipcRenderer.invoke('whatsapp-send', zapId, phone, text, chatId),
   whatsappSendMedia: (zapId, phone, media) => ipcRenderer.invoke('whatsapp-send-media', zapId, phone, media),
   whatsappConversations: (zapId) => ipcRenderer.invoke('whatsapp-conversations', zapId),
   whatsappMessages: (zapId, chatId) => ipcRenderer.invoke('whatsapp-messages', zapId, chatId),
+  whatsappChatHistory: (zapId, chatId, limit) => ipcRenderer.invoke('whatsapp-chat-history', zapId, chatId, limit),
+  whatsappSetActiveChat: (zapId, chatId) => ipcRenderer.send('whatsapp-set-active-chat', zapId, chatId),
   pickZapIcon: () => ipcRenderer.invoke('pick-zap-icon'),
 
   // Sincronizacao com o servidor 24h (painel)
@@ -35,6 +37,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
   serverDeleteZapSession: (zapId) => ipcRenderer.invoke('server-delete-zap-session', zapId),
   serverStatus: () => ipcRenderer.invoke('server-status'),
   serverPairingCodes: () => ipcRenderer.invoke('server-pairing-codes'),
+
+  // Conexao do Setup ao servidor 24h (repositorio de dados)
+  serverConfigGet: () => ipcRenderer.invoke('server-config-get'),
+  serverConfigPick: () => ipcRenderer.invoke('server-config-pick'),
+  serverConfigClone: (repoUrl, token) => ipcRenderer.invoke('server-config-clone', { repoUrl, token }),
+  serverConfigDisable: () => ipcRenderer.invoke('server-config-disable'),
+  serverRelaunch: () => ipcRenderer.invoke('server-relaunch'),
+
+  // Painel de gerenciamento do servidor (status, power e terminal)
+  serverOverview: () => ipcRenderer.invoke('server-overview'),
+  serverPower: (running) => ipcRenderer.invoke('server-power', running),
+  serverTerminalLogs: () => ipcRenderer.invoke('server-terminal-logs'),
+  serverTerminalClear: () => ipcRenderer.invoke('server-terminal-clear'),
+  serverTerminalExport: () => ipcRenderer.invoke('server-terminal-export'),
+  serverCommand: (text) => ipcRenderer.invoke('server-command', text),
+  onServerTerminalLog: (callback) => ipcRenderer.on('server-terminal-log', (e, data) => callback(data)),
+  onServerTerminalCleared: (callback) => ipcRenderer.on('server-terminal-cleared', () => callback()),
 
   // Mensagem Automatica
   autoMsgState: () => ipcRenderer.invoke('auto-msg-state'),

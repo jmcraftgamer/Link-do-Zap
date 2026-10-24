@@ -9,7 +9,10 @@
     "postinstall": "node scripts/apply-patches.js",
     "start:headless": "electron . --no-sandbox --disable-gpu --disable-dev-shm-usage",
     "start:linux": "xvfb-run -a electron . --no-sandbox --disable-gpu --disable-dev-shm-usage",
-    "test": "node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js",
+    "icon": "electron scripts/make-icon.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis",
+    "test": "node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js && node test/audio.js",
     "test:ai": "node test/ai.js",
     "test:agent": "node test/agent.js",
     "test:ai-live": "node test/ai-live.js",
@@ -19,10 +22,50 @@
   "author": "Link no WhatsApp",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.3.3"
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3"
   },
   "dependencies": {
     "qrcode": "^1.5.4",
     "wwebjs-electron": "^1.34.7"
+  },
+  "build": {
+    "appId": "com.linknowhatsapp.app",
+    "productName": "Link no WhatsApp",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "src/**/*",
+      "scripts/**/*",
+      "!data/**/*",
+      "!test/**/*",
+      "!deploy/**/*",
+      "!dist/**/*",
+      "!build/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Link no WhatsApp"
+    }
   }
 }

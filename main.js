@@ -1,11 +1,16 @@
-const { app, BrowserWindow, ipcMain, dialog, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, nativeImage, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { execFile } = require('child_process');
 const WhatsAppManager = require('./src/js/whatsapp-manager');
 const AIResponder = require('./src/js/ai-responder');
 const { resolveReplyMedia } = require('./src/js/media-resolver');
 const { verifyMessage } = require('./src/js/message-guard');
 const { isWithinWorkHours } = require('./src/js/work-hours');
+
+if (process.platform === 'win32' && typeof app.setAppUserModelId === 'function') {
+  app.setAppUserModelId('com.linknowhatsapp.app');
+}
 
 // Memoria de conversas: historico dos dias anteriores vai junto no prompt da
 // IA e tambem e gravado em .txt (<dados>/memorias/<zapId>/<contato>.txt).
@@ -30,6 +35,7 @@ let appAgent = null;
 let rendererDragging = false;
 let serverSync = null;
 let serverMode = false;
+let serverModeRequested = false;
 let serverKnownZaps = null;
 const zapErrors = new Map();
 
@@ -56,9 +62,227 @@ function formatLogArgs(args) {
 const _log = console.log.bind(console);
 const _err = console.error.bind(console);
 const _warn = console.warn.bind(console);
-console.log = (...a) => { pushLogLine(`${new Date().toISOString()} ${formatLogArgs(a)}`); _log(...a); };
-console.error = (...a) => { pushLogLine(`${new Date().toISOString()} ${formatLogArgs(a)}`); _err(...a); };
-console.warn = (...a) => { pushLogLine(`${new Date().toISOString()} ${formatLogArgs(a)}`); _warn(...a); };
+
+// ------------------------------------------------------------
+// Terminal do servidor (historico persistente + eventos ao vivo)
+// ------------------------------------------------------------
+const TERMINAL_MAX_LINES = 20000;
+const TERMINAL_TRIM_TO = 18000;
+let terminalLog = [];
+let terminalFileLoaded = false;
+let terminalSeq = 0;
+let lastServerError = null;
+const terminalKnownKeys = new Set();
+
+function terminalEntryKey(entry) {
+  return `${entry.ts || ''}|${entry.level || ''}|${entry.source || ''}|${entry.msg || ''}`;
+}
+
+// Eventos internos que nao interessam no painel (sorteio de tempo, typing,
+// cache, bateria etc.). Erros nunca sao filtrados.
+const TERMINAL_NOISE = [
+  /sorteio de tempo/i,
+  /resposta instantanea ativada/i,
+  /digitacao realista/i,
+  /faltam\s+[\d.,]+s\s+com\s+"digitando/i,
+  /indicador\s+"?digitando"?/i,
+  /\[WHATSAPP\].*carregando:/i,
+  /\[WHATSAPP\].*bateria:/i,
+  /\[WHATSAPP\].*state:/i,
+  /contatos persistidos carregados/i,
+  /novos contatos \(total/i,
+  /mensagem de grupo descartada/i,
+  /^save-zaps:/i,
+  /^save-providers:/i,
+  /^save-trainings:/i,
+  /\[CACHE\]/i,
+  /commit sem mudancas/i,
+  /\bheartbeat\b/i
+];
+
+function terminalFilePath() {
+  return getFilePath('server-terminal.jsonl');
+}
+
+function terminalTime(ts) {
+  try {
+    return new Date(ts || Date.now()).toLocaleTimeString('pt-BR', { hour12: false });
+  } catch (_) {
+    return '';
+  }
+}
+
+function normalizeTerminalEntry(input) {
+  const src = input && typeof input === 'object' ? input : { msg: String(input || '') };
+  const ts = src.ts || new Date().toISOString();
+  let source = String(src.source || 'SERVIDOR').trim();
+  if (source.length > 18) source = source.slice(0, 18);
+  const level = String(src.level || 'info').toLowerCase();
+  return {
+    id: src.id || `${ts}-${++terminalSeq}`,
+    ts,
+    time: src.time || terminalTime(ts),
+    level,
+    source,
+    msg: String(src.msg == null ? '' : src.msg),
+    remote: !!src.remote
+  };
+}
+
+function writeTerminalFile() {
+  try {
+    ensureDataDir();
+    const p = terminalFilePath();
+    const tmp = p + '.tmp';
+    const body = terminalLog.map((e) => JSON.stringify(e)).join('\n');
+    fs.writeFileSync(tmp, body ? body + '\n' : '');
+    fs.renameSync(tmp, p);
+  } catch (_) { /* disco indisponivel: mantem so em memoria */ }
+}
+
+function loadTerminalFromDisk() {
+  if (terminalFileLoaded) return;
+  terminalFileLoaded = true;
+  try {
+    ensureDataDir();
+    const p = terminalFilePath();
+    if (!fs.existsSync(p)) return;
+    const raw = fs.readFileSync(p, 'utf8');
+    const entries = [];
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && parsed.msg) entries.push(normalizeTerminalEntry(parsed));
+      } catch (_) { /* linha corrompida */ }
+    }
+    terminalLog = entries.slice(-TERMINAL_MAX_LINES);
+    for (const entry of terminalLog) terminalKnownKeys.add(terminalEntryKey(entry));
+    if (entries.length > TERMINAL_MAX_LINES) writeTerminalFile();
+  } catch (_) { /* sem historico acessivel */ }
+}
+
+function sendTerminalEntry(entry) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('server-terminal-log', entry);
+  }
+}
+
+function appendServerTerminalEntry(input, opts) {
+  const options = opts || {};
+  const entry = normalizeTerminalEntry(input);
+  if (!entry.msg) return null;
+
+  loadTerminalFromDisk();
+  const key = terminalEntryKey(entry);
+  if (terminalKnownKeys.has(key)) return null;
+  terminalKnownKeys.add(key);
+  if (terminalKnownKeys.size > 6000) {
+    const first = terminalKnownKeys.values().next().value;
+    if (first) terminalKnownKeys.delete(first);
+  }
+  if (options.remote) entry.remote = true;
+
+  if (entry.level === 'error') {
+    lastServerError = { msg: entry.msg, at: Date.now(), source: entry.source };
+  }
+
+  terminalLog.push(entry);
+  if (terminalLog.length > TERMINAL_MAX_LINES) {
+    terminalLog = terminalLog.slice(-TERMINAL_TRIM_TO);
+    writeTerminalFile();
+  } else {
+    try {
+      ensureDataDir();
+      fs.appendFileSync(terminalFilePath(), JSON.stringify(entry) + '\n');
+    } catch (_) { /* mantem so em memoria */ }
+  }
+  sendTerminalEntry(entry);
+  return entry;
+}
+
+function clearServerTerminal() {
+  terminalLog = [];
+  terminalKnownKeys.clear();
+  writeTerminalFile();
+  // Marca o momento da limpeza para nao reimportar logs antigos do servidor
+  // 24h no proximo sync/restart.
+  try {
+    ensureDataDir();
+    fs.writeFileSync(getFilePath('server-terminal-clear.at'), new Date().toISOString());
+  } catch (_) {}
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('server-terminal-cleared');
+  }
+  appendServerTerminalEntry({ level: 'info', source: 'PAINEL', msg: 'Terminal limpo.' });
+}
+
+function classifyTerminalLevel(msg) {
+  const text = String(msg || '');
+  if (/\b(error|erro|erros|falha|falhou|failed|failure|exception|rejeitad[oa]|negad[oa]|timeout|travad[oa]|indisponivel|desconectad[oa]|auth_failure|pairing_error)\b/i.test(text)) return 'error';
+  if (/\b(aviso|warning|warn|ignorad[oa]|descartad[oa]|lent[oa]|aguardando|pausad[oa]|pendente)\b/i.test(text)) return 'warn';
+  if (/\b(conectado|autenticado|pronto|sucesso|funcionando|ok)\b/i.test(text)) return 'success';
+  return 'info';
+}
+
+function parseConsoleLine(line) {
+  const raw = String(line || '');
+  if (!raw) return null;
+
+  // Formato dos logs do app: [ISO] [LOG][tipo] Zap 123: mensagem
+  // Formato do whatsapp-manager: [ISO] [HH:MM:SS][LOG][tipo] Zap 123: mensagem
+  const m = raw.match(/^(\d{4}-\d{2}-\d{2}T\S+)\s+(?:\[\d{2}:\d{2}:\d{2}\]\s*)?\[LOG\]\[([^\]]+)\]\s*(?:Zap\s+([^:]+):\s*)?([\s\S]*)$/i);
+  if (m) {
+    const type = String(m[2] || '').toLowerCase();
+    const level = ['error', 'warning', 'warn', 'success', 'incoming', 'outgoing', 'ai', 'debug'].includes(type)
+      ? (type === 'warning' ? 'warn' : type)
+      : 'info';
+    const source = m[3] ? `ZAP ${String(m[3]).trim()}` : 'SERVIDOR';
+    return { ts: m[1], level, source, msg: String(m[4] || '').trim() };
+  }
+
+  const rest = raw.replace(/^\d{4}-\d{2}-\d{2}T\S+\s+/, '');
+  if (!rest) return null;
+  if (rest.startsWith('[LOG]')) return null;
+  const tagMatch = rest.match(/^\[([^\]]+)\]\s*/);
+  const source = tagMatch ? tagMatch[1] : 'SERVIDOR';
+  const msg = tagMatch ? rest.slice(tagMatch[0].length) : rest;
+  if (!msg.trim()) return null;
+  return {
+    ts: (raw.match(/^(\d{4}-\d{2}-\d{2}T\S+)/) || [])[1] || new Date().toISOString(),
+    level: classifyTerminalLevel(msg),
+    source,
+    msg: msg.trim()
+  };
+}
+
+function captureConsoleToTerminal(line) {
+  try {
+    const parsed = parseConsoleLine(line);
+    if (!parsed) return;
+    if (parsed.level !== 'error' && TERMINAL_NOISE.some((re) => re.test(parsed.msg))) return;
+    appendServerTerminalEntry(parsed);
+  } catch (_) { /* nunca deixa o log derrubar o app */ }
+}
+
+console.log = (...a) => {
+  const line = `${new Date().toISOString()} ${formatLogArgs(a)}`;
+  pushLogLine(line);
+  captureConsoleToTerminal(line);
+  _log(...a);
+};
+console.error = (...a) => {
+  const line = `${new Date().toISOString()} ${formatLogArgs(a)}`;
+  pushLogLine(line);
+  captureConsoleToTerminal(line);
+  _err(...a);
+};
+console.warn = (...a) => {
+  const line = `${new Date().toISOString()} ${formatLogArgs(a)}`;
+  pushLogLine(line);
+  captureConsoleToTerminal(line);
+  _warn(...a);
+};
 
 function isHeadless() {
   const v = String(process.env.HEADLESS || '').toLowerCase();
@@ -89,6 +313,112 @@ function ensureDataDir() {
   const dir = getDataDir();
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+
+// ------------------------------------------------------------
+// Configuracao do servidor 24h (painel remoto)
+// ------------------------------------------------------------
+// O Setup instalado nao fica ao lado da pasta `data` do projeto. Este arquivo
+// guarda onde esta o clone do repositorio de dados do servidor, para que o app
+// entre em modo painel e NUNCA conecte o WhatsApp neste PC.
+const SERVER_REPO_CONFIG = 'server-repo.json';
+
+function serverRepoConfigPath() {
+  return getFilePath(SERVER_REPO_CONFIG);
+}
+
+function loadServerRepoConfig() {
+  const cfg = loadJsonFile(SERVER_REPO_CONFIG, null);
+  return cfg && typeof cfg === 'object' ? cfg : null;
+}
+
+function saveServerRepoConfig(cfg) {
+  ensureDataDir();
+  const p = serverRepoConfigPath();
+  const tmp = p + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  fs.renameSync(tmp, p);
+  return cfg;
+}
+
+function encryptServerToken(token) {
+  const raw = String(token || '').trim();
+  if (!raw) return '';
+  try {
+    if (safeStorage && typeof safeStorage.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+      return 'enc:' + safeStorage.encryptString(raw).toString('base64');
+    }
+  } catch (_) {}
+  return 'plain:' + Buffer.from(raw, 'utf8').toString('base64');
+}
+
+function decryptServerToken(value) {
+  const s = String(value || '');
+  try {
+    if (s.startsWith('enc:')) {
+      return safeStorage.decryptString(Buffer.from(s.slice(4), 'base64'));
+    }
+    if (s.startsWith('plain:')) {
+      return Buffer.from(s.slice(6), 'base64').toString('utf8');
+    }
+  } catch (_) {}
+  return '';
+}
+
+function looksLikeGitRepo(dir) {
+  try {
+    return !!dir && fs.existsSync(path.join(dir, '.git'));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Procura o clone do repositorio de dados. Ordem: env (testes/dev), pasta
+// escolhida no painel, clone padrao dentro dos dados do app, pasta data/ do
+// projeto (quando roda pelo codigo-fonte).
+function resolveServerRepoDir() {
+  const localDir = path.resolve(getDataDir());
+  const candidates = [];
+  try {
+    if (process.env.LINK_DATA_REPO_DIR) candidates.push(process.env.LINK_DATA_REPO_DIR);
+  } catch (_) {}
+  const cfg = loadServerRepoConfig();
+  if (cfg && cfg.enabled !== false && cfg.dir) candidates.push(cfg.dir);
+  candidates.push(path.join(localDir, 'server-repo'));
+  candidates.push(path.join(__dirname, 'data'));
+  for (const candidate of candidates) {
+    try {
+      const abs = path.resolve(String(candidate));
+      if (abs === localDir) continue;
+      if (looksLikeGitRepo(abs)) return abs;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function serverModeRequestedByConfig() {
+  try {
+    const cfg = loadServerRepoConfig();
+    if (!cfg) return false;
+    return cfg.enabled !== false;
+  } catch (_) {
+    return false;
+  }
+}
+
+function serverRepoUrlWithToken(url, token) {
+  const raw = String(url || '').trim();
+  const tok = String(token || '').trim();
+  if (!raw || !tok) return raw;
+  try {
+    const u = new URL(raw);
+    u.username = 'x-access-token';
+    u.password = tok;
+    return u.toString();
+  } catch (_) {
+    return raw;
+  }
+}
+
 function loadJsonFile(filename, fallback) {
   const p = getFilePath(filename);
   if (!fs.existsSync(p)) return fallback;
@@ -239,7 +569,7 @@ async function sendErrorToWhatsApp(zapId, chatId, msg) {
     }
   } catch (_) {}
   try {
-    await whatsappManager.sendMessage(String(zapId), chatId, msg);
+    await whatsappManager.sendMessage(String(zapId), chatId, msg, { source: 'ai' });
     sendLog(zapId, 'warning', 'Mensagem de erro enviada ao contato');
   } catch (e) {
     sendLog(zapId, 'error', `Nao foi possivel enviar mensagem de erro: ${e.message}`);
@@ -400,6 +730,13 @@ async function processMessage(messageData) {
     return;
   }
 
+  // Bot desligado pelo painel: recebe a mensagem (e mostra no terminal), mas
+  // nao chama a IA nem envia resposta.
+  if (!serverMode && isServerPaused()) {
+    sendLog(zapId, 'info', 'Servidor desligado pelo painel - IA ignorada.');
+    return;
+  }
+
   if (fromMe) {
     // So mensagens do AUTOCHAT (enviadas para o proprio numero) chegam aqui.
     // As respostas da IA sao bloqueadas no whatsapp-manager (anti-loop).
@@ -515,14 +852,14 @@ async function processMessage(messageData) {
       finalBody = await transcribeAudio(audio, providersData, zapId, zap.apiKeySelections);
       if (!finalBody || !finalBody.trim() || finalBody.trim().length < 2) {
         sendLog(zapId, 'warning', 'Transcricao vazia ou invalida. Pedindo para repetir.');
-        await whatsappManager.sendMessage(String(zapId), chatId, 'Nao consegui entender seu audio, pode repetir?');
+        await whatsappManager.sendMessage(String(zapId), chatId, 'Nao consegui entender seu audio, pode repetir?', { source: 'ai' });
         sendLog(zapId, 'outgoing', 'Mensagem de audio nao compreendido enviada.');
         return;
       }
       // Heuristic invalid transcription check
       if (finalBody.length < 3 || /^\W+$/.test(finalBody)) {
         sendLog(zapId, 'warning', `Transcricao parece invalida: "${finalBody}". Pedindo para repetir.`);
-        await whatsappManager.sendMessage(String(zapId), chatId, 'Nao entendi seu audio, pode mandar de novo?');
+        await whatsappManager.sendMessage(String(zapId), chatId, 'Nao entendi seu audio, pode mandar de novo?', { source: 'ai' });
         sendLog(zapId, 'outgoing', 'Mensagem de audio invalida respondida.');
         return;
       }
@@ -734,7 +1071,7 @@ async function processMessage(messageData) {
       if (i === quoteIndex && typeof whatsappManager.replyMessage === 'function') {
         await whatsappManager.replyMessage(String(zapId), chatId, text, messageData.id);
       } else {
-        await whatsappManager.sendMessage(String(zapId), chatId, text);
+        await whatsappManager.sendMessage(String(zapId), chatId, text, { source: 'ai' });
       }
       const _sendSecs = ((Date.now() - _sendT0) / 1000).toFixed(1);
       sendLog(zapId, 'success', parts.length > 1
@@ -755,7 +1092,7 @@ async function processMessage(messageData) {
     if (!rel) {
       if (found.data) {
         try {
-          await whatsappManager.sendMedia(String(zapId), chatId, { data: found.data, mimeType: found.mimeType || 'image/jpeg', name: found.filename || `${imgId}.jpg` });
+          await whatsappManager.sendMedia(String(zapId), chatId, { data: found.data, mimeType: found.mimeType || 'image/jpeg', name: found.filename || `${imgId}.jpg` }, { source: 'ai' });
           sendLog(zapId, 'success', `Imagem enviada: ${label}`);
           sentImageLabels.push(label);
         } catch (e) {
@@ -773,7 +1110,7 @@ async function processMessage(messageData) {
     }
     try {
       const b64 = fs.readFileSync(abs).toString('base64');
-      await whatsappManager.sendMedia(String(zapId), chatId, { data: b64, mimeType: found.mimeType || 'image/jpeg', name: found.filename || path.basename(abs) });
+      await whatsappManager.sendMedia(String(zapId), chatId, { data: b64, mimeType: found.mimeType || 'image/jpeg', name: found.filename || path.basename(abs) }, { source: 'ai' });
       sendLog(zapId, 'success', `Imagem enviada: ${label}`);
       sentImageLabels.push(label);
     } catch (e) {
@@ -813,6 +1150,7 @@ function createWindow() {
     frame: false,
     titleBarStyle: 'hidden',
     backgroundColor: '#FFFFFF',
+    icon: path.join(__dirname, 'src', 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -925,8 +1263,11 @@ function persistBotStatus() {
       : [];
     const statusData = {
       updatedAt: new Date().toISOString(),
+      startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      pid: process.pid,
       uptimeSeconds: Math.floor(process.uptime()),
       headless: isHeadless(),
+      logLines: terminalLog.length,
       zaps: zaps.map(z => {
         const state = states.find(s => String(s.id) === String(z.id)) || {};
         return {
@@ -1380,20 +1721,25 @@ function ensureCampaignZapConnected() {
 // ------------------------------------------------------------
 app.whenReady().then(() => {
   ensureDataDir();
+  loadTerminalFromDisk();
   if (!isHeadless()) createWindow();
 
   // Modo servidor: o app local e apenas o painel. As configuracoes vao para
   // o clone do repo de dados e o servidor 24h as aplica (nao conectamos o
   // WhatsApp aqui para nao derrubar a sessao do servidor).
   try {
-    const dataRepoDir = process.env.LINK_DATA_REPO_DIR || path.join(__dirname, 'data');
-    const resolvedRepo = path.resolve(dataRepoDir);
     const localDir = path.resolve(getDataDir());
     const syncOff = ['0', 'false', 'no'].includes(String(process.env.LINK_SERVER_SYNC || '').toLowerCase());
     const isElectron = !!process.versions.electron; // falso nos testes (Node puro)
-    if (isElectron && !isHeadless() && !syncOff && resolvedRepo !== localDir && fs.existsSync(path.join(resolvedRepo, '.git'))) {
+    const cfg = loadServerRepoConfig();
+    serverModeRequested = !!process.env.LINK_DATA_REPO_DIR || !!(cfg && cfg.enabled !== false);
+    const resolvedRepo = resolveServerRepoDir();
+    if (isElectron && !isHeadless() && !syncOff && resolvedRepo) {
       serverSync = new ServerSync({ sourceDir: localDir, dataDir: resolvedRepo });
       serverMode = !!serverSync.enabled;
+    }
+    if (isElectron && !isHeadless() && !syncOff && !resolvedRepo && serverModeRequested) {
+      console.error('[SYNC] Servidor 24h configurado, mas o repositorio de dados nao foi encontrado. O WhatsApp NAO sera iniciado neste PC.');
     }
   } catch (e) {
     console.error('[SYNC] init falhou:', e.message);
@@ -1401,7 +1747,24 @@ app.whenReady().then(() => {
   if (serverMode) {
     process.env.LINK_CONNECT_READONLY = '1';
     console.log(`[SYNC] Modo servidor ativo - configs seguem para ${serverSync.dataDir}`);
+  } else if (serverModeRequested && !isHeadless()) {
+    // Nao deixa o PC virar uma segunda instancia por acidente: se o usuario
+    // configurou servidor 24h, a conexao local fica bloqueada mesmo que o
+    // clone tenha sumido.
+    process.env.LINK_CONNECT_READONLY = '1';
   }
+  const bootModeMsg = serverMode
+    ? 'Painel conectado ao servidor 24h. O bot roda no servidor - este PC nao inicia o WhatsApp.'
+    : serverModeRequested
+      ? 'Servidor 24h configurado, mas o repositorio de dados nao foi encontrado. O WhatsApp NAO sera iniciado neste PC; reconecte a pasta em Gerenciar Servidor.'
+      : isHeadless()
+        ? 'Servidor 24h iniciado neste host. O bot conta com o gerenciador de servico para reiniciar sozinho.'
+        : 'Painel local iniciado. ATENCAO: neste modo o bot roda neste PC e para quando o programa fecha.';
+  appendServerTerminalEntry({
+    level: serverMode ? 'success' : (serverModeRequested ? 'error' : 'warn'),
+    source: 'PAINEL',
+    msg: bootModeMsg
+  });
 
   whatsappManager = new WhatsAppManager(mainWindow);
   aiResponder = new AIResponder();
@@ -1446,14 +1809,22 @@ app.whenReady().then(() => {
       serverSync.onStatus((d) => {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-status', d);
       });
+      serverSync.onLog((entry) => {
+        if (!entry || !entry.msg) return;
+        appendServerTerminalEntry(entry, { remote: true });
+      });
       serverSync.refreshStatus().catch(() => {});
       const syncPoll = setInterval(() => serverSync.refreshStatus().catch(() => {}), 15000);
       if (syncPoll && typeof syncPoll.unref === 'function') syncPoll.unref();
     } catch (e) {
       console.error('[SYNC] listeners falharam:', e.message);
     }
-  } else {
+  } else if (serverModeRequested) {
+    console.log('[PAINEL] Conexao local bloqueada: o zap roda no servidor 24h. Corrija a pasta do repositorio em Gerenciar Servidor.');
+  } else if (!isServerPaused()) {
     autoConnectSavedSessions();
+  } else {
+    console.log('[PAINEL] Servidor desligado pelo usuario - reconexao automatica ignorada.');
   }
   if (isHeadless()) {
     autoPairMissingSessions();
@@ -1522,11 +1893,11 @@ ipcMain.on('window-drag-move', (e, dx, dy) => {
 // IPC - WhatsApp
 // ------------------------------------------------------------
 ipcMain.handle('whatsapp-connect', (e, zapId, phone, method) => {
-  if (serverMode) return { status: 'readonly', error: 'zap gerenciado pelo servidor - nao conecte pelo PC' };
+  if (serverMode || serverModeRequested) return { status: 'readonly', error: 'zap gerenciado pelo servidor - nao conecte pelo PC' };
   return whatsappManager.connectZap(String(zapId), phone, method);
 });
 ipcMain.handle('whatsapp-disconnect', (e, zapId) => {
-  if (serverMode) return { ok: false, error: 'zap gerenciado pelo servidor' };
+  if (serverMode || serverModeRequested) return { ok: false, error: 'zap gerenciado pelo servidor' };
   return whatsappManager.disconnectZap(String(zapId));
 });
 ipcMain.handle('whatsapp-status', (e, zapId) => {
@@ -1559,13 +1930,27 @@ ipcMain.handle('pick-zap-icon', async () => {
     return { ok: false, error: e.message };
   }
 });
-ipcMain.handle('whatsapp-send', async (e, zapId, phone, text) => {
-  const r = await whatsappManager.sendMessage(String(zapId), phone, text);
-  whatsappManager.markOwnerReply(String(zapId), phone);
+ipcMain.handle('whatsapp-send', async (e, zapId, phone, text, chatId) => {
+  const target = chatId || phone;
+  const r = await whatsappManager.sendMessage(String(zapId), target, text, { source: 'owner' });
+  // Marca resposta do dono pelo chatId real e pelo numero (a IA cancela a resposta)
+  whatsappManager.markOwnerReply(String(zapId), chatId || phone);
+  if (chatId && phone && chatId !== phone) whatsappManager.markOwnerReply(String(zapId), phone);
   return r;
 });
 ipcMain.handle('whatsapp-conversations', (e, zapId) => whatsappManager.getConversations(String(zapId)));
 ipcMain.handle('whatsapp-messages', (e, zapId, chatId) => whatsappManager.getMessages(String(zapId), chatId));
+ipcMain.handle('whatsapp-chat-history', async (e, zapId, chatId, limit) => {
+  try {
+    return await whatsappManager.fetchChatHistory(String(zapId), chatId, limit);
+  } catch (err) {
+    console.error('[CONV] erro ao buscar historico:', err.message);
+    return whatsappManager.getMessages(String(zapId), chatId);
+  }
+});
+ipcMain.on('whatsapp-set-active-chat', (e, zapId, chatId) => {
+  try { whatsappManager.setActiveChat(zapId, chatId); } catch (_) { /* ignora */ }
+});
 ipcMain.handle('whatsapp-send-media', async (e, zapId, phone, media) => {
   const r = await whatsappManager.sendMedia(String(zapId), phone, media || {});
   whatsappManager.markOwnerReply(String(zapId), phone);
@@ -1626,12 +2011,27 @@ ipcMain.handle('save-zaps', (e, data) => {
   ensureDataDir();
   const p = getFilePath('zaps.json');
   const tmp = p + '.tmp';
+  const before = fs.existsSync(p) ? loadZapsData() : [];
   try {
     const json = JSON.stringify(data, null, 2);
     // Log size for debug
     console.log(`save-zaps: ${json.length} bytes, ${data.length} zaps`);
     fs.writeFileSync(tmp, json);
     fs.renameSync(tmp, p);
+    if (Array.isArray(data)) {
+      const beforeById = new Map((Array.isArray(before) ? before : []).map((z) => [String(z.id), z]));
+      const afterIds = new Set(data.map((z) => String(z.id)));
+      for (const z of data) {
+        if (!beforeById.has(String(z.id))) {
+          appendServerTerminalEntry({ level: 'success', source: 'PAINEL', msg: `Zap adicionado: ${z.name || z.id}` });
+        }
+      }
+      for (const [id, z] of beforeById) {
+        if (!afterIds.has(id)) {
+          appendServerTerminalEntry({ level: 'warn', source: 'PAINEL', msg: `Zap removido: ${z.name || id}` });
+        }
+      }
+    }
   } catch (err) {
     console.error('save-zaps falhou:', err.message, err.code);
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
@@ -1738,6 +2138,144 @@ ipcMain.handle('delete-trainings-for-zap', (e, zapId) => {
 // ------------------------------------------------------------
 // IPC - Sincronizacao com o servidor (painel unificado)
 // ------------------------------------------------------------
+function runGit(args, opts) {
+  return new Promise((resolve) => {
+    execFile('git', args, {
+      cwd: opts && opts.cwd,
+      timeout: (opts && opts.timeout) || 180000,
+      maxBuffer: 8 * 1024 * 1024,
+      windowsHide: true,
+      env: Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: '0' })
+    }, (err, stdout, stderr) => {
+      resolve({
+        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+        stdout: stdout || '',
+        stderr: stderr || (err && err.message ? err.message : '')
+      });
+    });
+  });
+}
+
+function serverConfigPublic() {
+  const cfg = loadServerRepoConfig();
+  const repoDir = resolveServerRepoDir();
+  return {
+    configured: !!(cfg && cfg.enabled !== false),
+    enabled: !!serverMode,
+    repoDir: repoDir || (cfg && cfg.dir) || null,
+    repoUrl: cfg && cfg.repoUrl ? String(cfg.repoUrl) : '',
+    hasToken: !!(cfg && cfg.token),
+    found: !!repoDir,
+    mode: serverMode ? 'server' : (serverModeRequested ? 'server-missing' : (isHeadless() ? 'headless' : 'local')),
+    error: null
+  };
+}
+
+ipcMain.handle('server-config-get', () => serverConfigPublic());
+
+ipcMain.handle('server-config-pick', async () => {
+  try {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Escolha a pasta do repositorio de dados do servidor',
+      properties: ['openDirectory']
+    });
+    if (!res || res.canceled || !res.filePaths || !res.filePaths[0]) {
+      return { ok: false, canceled: true };
+    }
+    const dir = path.resolve(res.filePaths[0]);
+    if (!looksLikeGitRepo(dir)) {
+      return { ok: false, error: 'Essa pasta nao e um clone do repositorio de dados (nao tem .git).' };
+    }
+    const previous = loadServerRepoConfig() || {};
+    saveServerRepoConfig({
+      enabled: true,
+      dir,
+      repoUrl: previous.repoUrl || '',
+      token: previous.token || '',
+      updatedAt: new Date().toISOString()
+    });
+    return { ok: true, repoDir: dir };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('server-config-clone', async (e, payload) => {
+  payload = payload || {};
+  const repoUrl = String(payload.repoUrl || '').trim();
+  const token = String(payload.token || '').trim();
+  if (!repoUrl) return { ok: false, error: 'Informe a URL do repositorio de dados.' };
+  try {
+    const dest = path.join(getDataDir(), 'server-repo');
+    if (fs.existsSync(path.join(dest, '.git'))) {
+      // Ja existe: atualiza e usa
+      const fetch = await runGit(['fetch', '--depth=1', 'origin', 'main'], { cwd: dest });
+      if (fetch.code !== 0) return { ok: false, error: (fetch.stderr || 'falha ao atualizar o clone').trim() };
+    } else {
+      if (fs.existsSync(dest)) {
+        const entries = fs.readdirSync(dest);
+        if (entries.length) return { ok: false, error: `A pasta ${dest} ja existe e nao esta vazia.` };
+      }
+      fs.mkdirSync(dest, { recursive: true });
+      const cloneUrl = serverRepoUrlWithToken(repoUrl, token);
+      const clone = await runGit(['clone', '--depth=1', '--branch', 'main', cloneUrl, dest]);
+      if (clone.code !== 0) {
+        try { fs.rmSync(dest, { recursive: true, force: true }); } catch (_) {}
+        return { ok: false, error: (clone.stderr || 'git clone falhou').trim() };
+      }
+    }
+    const previous = loadServerRepoConfig() || {};
+    saveServerRepoConfig({
+      enabled: true,
+      dir: dest,
+      repoUrl,
+      token: token ? encryptServerToken(token) : (previous.token || ''),
+      updatedAt: new Date().toISOString()
+    });
+    return { ok: true, repoDir: dest };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('server-config-disable', () => {
+  const cfg = loadServerRepoConfig() || {};
+  saveServerRepoConfig(Object.assign({}, cfg, {
+    enabled: false,
+    updatedAt: new Date().toISOString()
+  }));
+  return { ok: true };
+});
+
+ipcMain.handle('server-relaunch', () => {
+  try {
+    app.relaunch();
+    app.exit(0);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('server-terminal-export', async () => {
+  try {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Salvar log do servidor',
+      defaultPath: `log-servidor-${new Date().toISOString().slice(0, 10)}.txt`,
+      filters: [{ name: 'Texto', extensions: ['txt', 'log'] }]
+    });
+    if (!res || res.canceled || !res.filePath) return { ok: false, canceled: true };
+    const text = terminalLog.map((entry) => {
+      const ts = entry.ts ? new Date(entry.ts).toLocaleString('pt-BR') : '';
+      return `${ts} [${entry.source || 'SERVIDOR'}] ${entry.msg || ''}`;
+    }).join('\n');
+    fs.writeFileSync(res.filePath, text + '\n', 'utf8');
+    return { ok: true, filePath: res.filePath };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
 ipcMain.handle('server-info', () => ({
   enabled: serverMode,
   dataDir: serverSync ? serverSync.dataDir : null,
@@ -1758,6 +2296,407 @@ ipcMain.handle('server-delete-zap-session', (e, zapId) => {
 });
 ipcMain.handle('server-status', () => (serverSync ? serverSync.getBotStatus() : null));
 ipcMain.handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
+
+// ------------------------------------------------------------
+// IPC - Painel "Gerenciar Servidor" (status, liga/desliga e terminal)
+// ------------------------------------------------------------
+function isServerPaused() {
+  try {
+    if (serverMode && serverSync) {
+      if (serverSync.remoteStop) return true;
+      return fs.existsSync(path.join(serverSync.dataDir, 'STOP'));
+    }
+    return !!(loadJsonFile('server-paused.json', {}) || {}).paused;
+  } catch (_) {
+    return false;
+  }
+}
+
+function readConnectionStates() {
+  if (serverMode && serverSync) {
+    const bot = serverSync.getBotStatus();
+    if (bot && Array.isArray(bot.zaps)) return bot.zaps;
+    return [];
+  }
+  if (whatsappManager && typeof whatsappManager.listConnectionStates === 'function') {
+    return whatsappManager.listConnectionStates();
+  }
+  return [];
+}
+
+function zapStatusLabel(status) {
+  const map = {
+    ready: 'Funcionando',
+    connecting: 'Conectando',
+    waiting_qr: 'Aguardando QR',
+    waiting_pairing: 'Aguardando pareamento',
+    pairing_accepted: 'Sincronizando',
+    authenticated: 'Autenticado',
+    auth_failure: 'Erro de autenticacao',
+    pairing_error: 'Erro de pareamento',
+    disconnected: 'Desconectado'
+  };
+  return map[status] || status || 'Desconhecido';
+}
+
+function getServerOverview() {
+  const now = Date.now();
+  const zaps = loadZapsData();
+  const states = readConnectionStates();
+  const stateById = new Map(states.map((s) => [String(s.id), s]));
+  const enabledById = new Map();
+  for (const z of zaps) {
+    if (z && z.enabled !== false) enabledById.set(String(z.id), z);
+  }
+  // No modo servidor o bot-status.json e a fonte real: inclui Zaps que
+  // existem no servidor mas ainda nao chegaram no zaps.json local.
+  if (serverMode) {
+    for (const st of states) {
+      const id = String(st.id);
+      if (!enabledById.has(id) && st.enabled !== false) {
+        enabledById.set(id, { id: st.id, name: st.name || id, phone: st.phone || '' });
+      }
+    }
+  }
+  const enabledZaps = [...enabledById.values()];
+  const RECENT_ERROR_MS = 10 * 60 * 1000;
+
+  let connected = 0;
+  let recentErrors = 0;
+  let lastErrorAt = 0;
+  for (const z of enabledZaps) {
+    const id = String(z.id);
+    const st = stateById.get(id) || {};
+    if (st.status === 'ready') connected++;
+    const errAt = Math.max(
+      Number(z.lastErrorAt) || 0,
+      Number(st.lastErrorAt) || 0,
+      Number(zapErrors.get(id)) || 0
+    );
+    if (errAt > lastErrorAt) lastErrorAt = errAt;
+    if (errAt && now - errAt < RECENT_ERROR_MS) recentErrors++;
+  }
+  if (lastServerError && lastServerError.at > lastErrorAt) lastErrorAt = lastServerError.at;
+
+  const bot = serverMode && serverSync ? serverSync.getBotStatus() : null;
+  const syncStatus = serverSync ? serverSync.getStatus() : null;
+  const syncError = !!(syncStatus && syncStatus.state === 'error');
+  const paused = isServerPaused();
+  const remoteMissing = serverModeRequested && !serverMode && !isHeadless();
+  const total = enabledZaps.length;
+  const updatedAt = bot && bot.updatedAt ? bot.updatedAt : null;
+  const remoteAge = updatedAt ? now - new Date(updatedAt).getTime() : Infinity;
+  let uptime = serverMode && bot && bot.uptimeSeconds != null
+    ? Number(bot.uptimeSeconds) || 0
+    : Math.floor(process.uptime());
+  // No modo servidor o status pode chegar com alguns minutos de atraso.
+  // Soma o tempo desde a publicacao para o cronometro nao ficar defasado.
+  if (serverMode && !paused && Number.isFinite(remoteAge) && remoteAge > 0) {
+    uptime += Math.floor(remoteAge / 1000);
+  }
+
+  let level = 'ok';
+  let label = 'Funcionando';
+  let hint = connected ? `${connected} de ${total} Zap(s) conectado(s)` : 'Servidor ativo';
+
+  if (remoteMissing) {
+    level = 'bad';
+    label = 'Servidor 24h sem conexao';
+    hint = 'A pasta do repositorio de dados nao foi encontrada. Use "Conectar servidor" abaixo.';
+  } else if (paused) {
+    level = 'bad';
+    label = 'Desligado';
+    hint = 'O bot esta parado e nao responde mensagens.';
+  } else if (serverMode && !bot) {
+    level = 'warn';
+    label = 'Sem contato com o servidor';
+    hint = 'Aguardando o servidor publicar o status...';
+  } else if (serverMode && Number.isFinite(remoteAge) && remoteAge > 10 * 60 * 1000) {
+    level = 'warn';
+    label = 'Servidor sem atualizacao';
+    hint = 'Aguardando o servidor iniciar ou publicar o status (a execucao roda a cada 15 min).';
+  } else if (recentErrors || syncError) {
+    level = 'warn';
+    label = 'Funcionando com erros';
+    hint = recentErrors
+      ? `${recentErrors} Zap(s) com erro recente`
+      : 'Falha na sincronizacao com o servidor';
+  } else if (total === 0) {
+    level = 'warn';
+    label = 'Nenhum Zap configurado';
+    hint = 'Adicione um Zap para o servidor comecar a responder.';
+  } else if (connected === 0) {
+    level = 'warn';
+    label = 'Nenhum Zap conectado';
+    hint = 'O servidor esta ativo, mas nenhum Zap esta pronto.';
+  }
+
+  return {
+    running: !paused && !remoteMissing,
+    paused,
+    configured: serverModeRequested,
+    remoteMissing,
+    level,
+    label,
+    hint,
+    mode: serverMode ? 'Servidor 24h' : (remoteMissing ? 'Servidor 24h (sem conexao)' : (isHeadless() ? 'Servidor local' : 'Este PC')),
+    serverMode,
+    headless: isHeadless(),
+    uptime,
+    connected: paused ? 0 : connected,
+    total,
+    recentErrors,
+    updatedAt,
+    lastSyncAt: syncStatus ? syncStatus.lastSyncAt : null,
+    lastErrorAt: lastErrorAt || null,
+    lastError: lastServerError ? lastServerError.msg : null,
+    sync: syncStatus,
+    zaps: enabledZaps.map((z) => {
+      const st = stateById.get(String(z.id)) || {};
+      return {
+        id: z.id,
+        name: z.name || String(z.id),
+        phone: z.phone || '',
+        status: paused ? 'disconnected' : (st.status || 'disconnected')
+      };
+    })
+  };
+}
+
+async function setServerRunning(running) {
+  const want = !!running;
+  if (serverModeRequested && !serverMode && !isHeadless()) {
+    return { ok: false, error: 'Repositorio do servidor nao encontrado. Reconecte a pasta em Gerenciar Servidor.' };
+  }
+  if (serverMode && serverSync) {
+    try {
+      const result = await serverSync.setServerRunning(want);
+      if (result && result.ok) {
+        appendServerTerminalEntry({
+          level: 'success',
+          source: 'PAINEL',
+          msg: want
+            ? 'Servidor ligado pelo painel. A execucao sera retomada em ate 15 minutos.'
+            : 'Servidor desligado pelo painel. O bot sera parado em ate 1 minuto.'
+        });
+      } else {
+        appendServerTerminalEntry({
+          level: 'error',
+          source: 'PAINEL',
+          msg: `Falha ao ${want ? 'ligar' : 'desligar'} o servidor: ${(result && result.error) || 'erro desconhecido'}`
+        });
+      }
+      return result;
+    } catch (e) {
+      appendServerTerminalEntry({
+        level: 'error',
+        source: 'PAINEL',
+        msg: `Falha ao ${want ? 'ligar' : 'desligar'} o servidor: ${e.message}`
+      });
+      return { ok: false, error: e.message };
+    }
+  }
+
+  try {
+    ensureDataDir();
+    const file = getFilePath('server-paused.json');
+    fs.writeFileSync(file, JSON.stringify({ paused: !want, at: new Date().toISOString() }, null, 2));
+  } catch (e) {
+    appendServerTerminalEntry({ level: 'error', source: 'PAINEL', msg: `Falha ao gravar estado do servidor: ${e.message}` });
+    return { ok: false, error: e.message };
+  }
+
+  if (want) {
+    appendServerTerminalEntry({ level: 'success', source: 'PAINEL', msg: 'Servidor ligado pelo painel. Reconectando Zaps...' });
+    autoConnectSavedSessions();
+  } else {
+    appendServerTerminalEntry({ level: 'success', source: 'PAINEL', msg: 'Servidor desligado pelo painel. Desconectando Zaps...' });
+    try {
+      if (whatsappManager && typeof whatsappManager.disconnectAll === 'function') {
+        await whatsappManager.disconnectAll();
+      }
+    } catch (e) {
+      appendServerTerminalEntry({ level: 'error', source: 'PAINEL', msg: `Erro ao desconectar Zaps: ${e.message}` });
+    }
+  }
+  return { ok: true, running: want };
+}
+
+function findZapByQuery(query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return null;
+  const digits = q.replace(/\D/g, '');
+  const zaps = loadZapsData();
+  return zaps.find((z) => {
+    if (String(z.id) === q) return true;
+    if ((String(z.name || '')).toLowerCase() === q) return true;
+    if ((String(z.name || '')).toLowerCase().includes(q)) return true;
+    const phone = String(z.phone || '').replace(/\D/g, '');
+    return digits && phone && (phone === digits || phone.includes(digits));
+  }) || null;
+}
+
+async function runServerCommand(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return { ok: false };
+  appendServerTerminalEntry({ level: 'command', source: 'VOCE', msg: raw });
+
+  const parts = raw.split(/\s+/);
+  const cmd = String(parts.shift() || '').toLowerCase();
+  const arg = parts.join(' ').trim();
+  const out = (level, msg) => appendServerTerminalEntry({ level, source: 'PAINEL', msg });
+
+  switch (cmd) {
+    case 'ajuda':
+    case 'help':
+    case '?':
+      out('info', 'Comandos disponiveis:');
+      out('info', '  status                 - estado do servidor em resumo');
+      out('info', '  zaps                   - lista os Zaps e os status');
+      out('info', '  ligar                  - liga o servidor/bot');
+      out('info', '  desligar               - desliga o servidor/bot');
+      out('info', '  conectar <zap>         - conecta um Zap (modo local)');
+      out('info', '  desconectar <zap>      - desconecta um Zap (modo local)');
+      out('info', '  sincronizar            - sincroniza as configuracoes agora');
+      out('info', '  limpar                 - limpa o terminal');
+      out('info', '  ping                   - testa o terminal');
+      break;
+
+    case 'status': {
+      const o = getServerOverview();
+      out(o.level === 'bad' ? 'error' : (o.level === 'warn' ? 'warn' : 'success'), `${o.label} - ${o.hint}`);
+      out('info', `Modo: ${o.mode} | Uptime: ${Math.floor(o.uptime / 60)} min`);
+      out('info', `Zaps conectados: ${o.connected}/${o.total}`);
+      if (o.paused) out('warn', 'O bot esta desligado. Use "ligar" para retomar.');
+      break;
+    }
+
+    case 'zaps':
+    case 'listar': {
+      const o = getServerOverview();
+      if (!o.zaps.length) {
+        out('info', 'Nenhum Zap configurado.');
+      } else {
+        for (const z of o.zaps) {
+          const level = z.status === 'ready' ? 'success' : (['auth_failure', 'pairing_error'].includes(z.status) ? 'error' : 'info');
+          out(level, `- ${z.name}${z.phone ? ` (${z.phone})` : ''}: ${zapStatusLabel(z.status)}`);
+        }
+      }
+      break;
+    }
+
+    case 'ligar':
+    case 'start':
+    case 'on': {
+      const r = await setServerRunning(true);
+      if (r && r.ok === false) out('error', `Nao foi possivel ligar: ${r.error || 'erro desconhecido'}`);
+      break;
+    }
+
+    case 'desligar':
+    case 'stop':
+    case 'off': {
+      const r = await setServerRunning(false);
+      if (r && r.ok === false) out('error', `Nao foi possivel desligar: ${r.error || 'erro desconhecido'}`);
+      break;
+    }
+
+    case 'conectar':
+    case 'connect': {
+      if (serverMode) {
+        out('warn', 'No modo servidor 24h a conexao e feita pelo proprio servidor. Aguarde o pareamento automatico ou use o painel do Zap.');
+        break;
+      }
+      if (isServerPaused()) {
+        out('warn', 'O servidor esta desligado. Use "ligar" antes de conectar um Zap.');
+        break;
+      }
+      const zap = findZapByQuery(arg);
+      if (!zap) {
+        out('error', arg ? `Zap nao encontrado: ${arg}` : 'Informe o nome, numero ou id do Zap. Ex.: conectar Meu Zap');
+        break;
+      }
+      if (!whatsappManager) {
+        out('error', 'Gerenciador do WhatsApp indisponivel.');
+        break;
+      }
+      out('info', `Conectando Zap ${zap.name || zap.id}...`);
+      try {
+        await whatsappManager.connectZap(String(zap.id), String(zap.phone || ''), 'qrcode');
+      } catch (e) {
+        out('error', `Falha ao conectar ${zap.name || zap.id}: ${e.message}`);
+      }
+      break;
+    }
+
+    case 'desconectar':
+    case 'disconnect': {
+      if (serverMode) {
+        out('warn', 'No modo servidor 24h a desconexao e feita pelo proprio servidor.');
+        break;
+      }
+      const zap = findZapByQuery(arg);
+      if (!zap) {
+        out('error', arg ? `Zap nao encontrado: ${arg}` : 'Informe o nome, numero ou id do Zap. Ex.: desconectar Meu Zap');
+        break;
+      }
+      if (!whatsappManager) {
+        out('error', 'Gerenciador do WhatsApp indisponivel.');
+        break;
+      }
+      out('info', `Desconectando Zap ${zap.name || zap.id}...`);
+      try {
+        await whatsappManager.disconnectZap(String(zap.id), 'comando do painel');
+      } catch (e) {
+        out('error', `Falha ao desconectar ${zap.name || zap.id}: ${e.message}`);
+      }
+      break;
+    }
+
+    case 'sincronizar':
+    case 'sync': {
+      if (!serverSync) {
+        out('warn', 'Sincronizacao indisponivel neste modo (servidor local).');
+        break;
+      }
+      out('info', 'Sincronizando configuracoes...');
+      try {
+        const r = await serverSync.syncNow();
+        out(r && r.ok ? 'success' : 'error', r && r.ok
+          ? `Sincronizacao concluida${r.unchanged ? ' (sem alteracoes)' : ''}.`
+          : `Falha na sincronizacao: ${(r && r.error) || 'erro desconhecido'}`);
+      } catch (e) {
+        out('error', `Falha na sincronizacao: ${e.message}`);
+      }
+      break;
+    }
+
+    case 'limpar':
+    case 'clear':
+      clearServerTerminal();
+      break;
+
+    case 'ping':
+      out('success', 'pong');
+      break;
+
+    default:
+      out('error', `Comando desconhecido: ${cmd}. Digite "ajuda" para ver os comandos.`);
+  }
+  return { ok: true };
+}
+
+ipcMain.handle('server-overview', () => getServerOverview());
+ipcMain.handle('server-power', (e, running) => setServerRunning(!!running));
+ipcMain.handle('server-terminal-logs', () => {
+  loadTerminalFromDisk();
+  return terminalLog.slice(-TERMINAL_MAX_LINES);
+});
+ipcMain.handle('server-terminal-clear', () => {
+  clearServerTerminal();
+  return { ok: true };
+});
+ipcMain.handle('server-command', (e, text) => runServerCommand(text));
 
 module.exports = {
   getDataDir,

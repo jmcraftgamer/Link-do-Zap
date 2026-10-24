@@ -34,6 +34,12 @@ sync_down() {
   if git -C "$DATA_DIR" cat-file -e "origin/main:trainings" 2>/dev/null; then
     git -C "$DATA_DIR" checkout origin/main -- trainings >/dev/null 2>&1 || true
   fi
+  # STOP criado/removido pelo painel do PC
+  if git -C "$DATA_DIR" cat-file -e "origin/main:STOP" 2>/dev/null; then
+    git -C "$DATA_DIR" checkout origin/main -- STOP >/dev/null 2>&1 || true
+  else
+    rm -f "$DATA_DIR/STOP"
+  fi
 }
 
 do_backup() {
@@ -53,6 +59,16 @@ while true; do
 
   # Aplica configs enviadas pelo painel (novo zap, auto-resposta, teclas API...)
   sync_down
+
+  # Bot desligado pelo painel do PC (arquivo STOP no repo de dados)
+  if [ -f "$DATA_DIR/STOP" ]; then
+    echo "[MON] STOP encontrado - desligando o bot a pedido do painel"
+    docker stop -t 90 "$CONTAINER" >/dev/null 2>&1 || true
+    do_backup
+    echo "STOPPED=true" >> "$GITHUB_ENV"
+    echo "[MON] Bot desligado. Para religar, use o painel no PC."
+    exit 0
+  fi
 
   if urgent_pairing_dirty || [ $(( NOW - LAST_BACKUP )) -ge 60 ]; then
     do_backup

@@ -430,7 +430,19 @@ function init() {
         try { window.electronAPI.saveZaps(zapsData); } catch (_) {}
       }
     });
-    window.electronAPI.saveProviders(providersData);
+    // O arquivo providers.json do processo principal e a fonte da verdade
+    // (contem as chaves). Nunca sobrescrever com o cache do localStorage no
+    // boot - isso apagava chaves boas quando o cache estava velho.
+    Promise.resolve(window.electronAPI.loadProviders()).then((list) => {
+      if (Array.isArray(list) && list.length) {
+        providersData = list;
+        for (const p of [OPENROUTER_PRECONFIGURED, GOOGLEAI_PRECONFIGURED]) {
+          if (!providersData.some(x => x && x.id === p.id)) providersData.unshift(p);
+        }
+        try { localStorage.setItem('linknozap_providers', JSON.stringify(providersData)); } catch (_) {}
+        try { renderProvidersList(); } catch (_) {}
+      }
+    }).catch(() => {});
 
     window.electronAPI.loadTrainings().then(data => {
       trainingsData = data || {};
@@ -487,8 +499,8 @@ function createZapCard(zap) {
 
   card.innerHTML = `
     <div class="zap-card-icon">
-      <svg viewBox="0 0 32 32" fill="#111">
-        <path d="M16.004 0h-.008C7.174 0 0 7.176 0 16c0 3.5 1.132 6.744 3.054 9.374L1.054 31.25l6.118-1.978A15.912 15.912 0 0016.004 32C24.826 32 32 24.822 32 16S24.826 0 16.004 0zm9.336 22.608c-.39 1.098-1.932 2.01-3.168 2.274-.84.18-1.938.324-5.628-1.206-4.722-1.956-7.758-6.756-7.992-7.068-.228-.312-1.878-2.502-1.878-4.77s1.188-3.39 1.614-3.858c.39-.426.936-.57 1.248-.57.156 0 .294.006.42.012.402.018.6.042.864.654.33.768 1.128 2.748 1.224 2.946.096.198.162.426.036.684-.126.258-.234.414-.462.642-.228.228-.48.51-.684.684-.198.162-.408.342-.174.672.234.33 1.038 1.716 2.226 2.784 1.53 1.374 2.706 1.848 3.18 2.062.372.168.588.138.804-.084.222-.228.756-.882 1.164-1.416.288-.378.648-.426 1.038-.288.396.132 2.496 1.176 2.922 1.392.426.216.714.324.816.504.102.18.102 1.05-.288 2.148z"/>
+      <svg viewBox="0 0 24 24" fill="#000000">
+        <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
       </svg>
     </div>
     <div class="zap-card-info">
@@ -617,6 +629,17 @@ function setupEventListeners() {
   searchInput.addEventListener('input', () => {
     updateSearchClearBtn();
     const value = searchInput.value.trim();
+
+    // Na tela de Conversas a barra superior filtra os contatos em tempo real
+    if (getActivePageId() === 'conversas') {
+      globalSearchQuery = value.toLowerCase();
+      hideSearchDropdown();
+      if (lastRenderedConversations != null) {
+        renderConversations(lastRenderedConversations, lastRenderedConversationsZapId);
+      }
+      return;
+    }
+
     if (!value) {
       hideSearchDropdown();
       if (globalSearchQuery) clearGlobalSearch(false);
@@ -628,6 +651,10 @@ function setupEventListeners() {
 
   searchInput.addEventListener('focus', () => {
     updateSearchClearBtn();
+    if (getActivePageId() === 'conversas') {
+      hideSearchDropdown();
+      return;
+    }
     showSearchDropdown();
     renderSearchDropdown(searchInput.value.trim());
   });
@@ -792,6 +819,7 @@ function navigateTo(page) {
 const SEARCH_PLACEHOLDERS = {
   'dashboard': 'Buscar no dashboard...',
   'adicionar-whatsapp': 'Buscar Zaps, nmeros...',
+  'gerenciar-servidor': 'Buscar no terminal...',
   'contatos': 'Buscar contatos, nmeros...',
   'conversas': 'Buscar conversas...',
   'treinamento': 'Buscar Zaps e treinamentos...',
@@ -993,6 +1021,9 @@ function refreshPageList() {
     }
   } else if (page === 'mensagem-automatica') {
     renderAutoMsgChat();
+  } else if (page === 'gerenciar-servidor') {
+    refreshServerOverview();
+    renderServerTerminal();
   }
 }
 
@@ -1022,6 +1053,7 @@ function clearGlobalSearch(resetInput) {
 }
 
 function resetSearchForPage(page) {
+  const hadQuery = !!globalSearchQuery;
   globalSearchQuery = '';
   if (searchInput) {
     searchInput.value = '';
@@ -1029,6 +1061,7 @@ function resetSearchForPage(page) {
   }
   updateSearchClearBtn();
   hideSearchDropdown();
+  if (hadQuery) refreshPageList();
 }
 
 // ============================================
@@ -3544,7 +3577,11 @@ async function callAIModel(providerName, modelId, apiKey, message) {
 // ============================================
 let selectedConversation = null;
 let currentZapId = null;
+let conversationZapId = null;
 let currentConnectMethod = 'qrcode';
+let renderedMessageKeys = new Set();
+let incomingSoundCtx = null;
+const conversationUnread = new Map();
 
 function initWhatsApp() {
   if (!window.electronAPI) return;
@@ -3613,6 +3650,11 @@ function initWhatsApp() {
 function showTypingIndicator(zapId, chatId, isTyping) {
   const chatMessages = document.getElementById('chatMessages');
   if (!chatMessages) return;
+
+  // Só mostra o indicador se for o Zap/contato que está aberto na tela
+  if (!selectedConversation) return;
+  if (String(conversationZapId) !== String(zapId)) return;
+  if (String(selectedConversation.chatId) !== String(chatId)) return;
 
   // Remove existing typing indicator
   const existing = chatMessages.querySelector('.typing-indicator');
@@ -3928,6 +3970,11 @@ function initConversationsPage() {
   if (zapSelector) {
     zapSelector.addEventListener('change', (e) => {
       const zapId = e.target.value;
+      conversationZapId = zapId || null;
+      selectedConversation = null;
+      renderedMessageKeys = new Set();
+      conversationUnread.clear();
+      setActiveChatOnServer(null);
       if (zapId) {
         loadConversations(zapId);
       } else {
@@ -3947,6 +3994,10 @@ function initConversationsPage() {
         sendChatMessage();
       }
     });
+    chatInput.addEventListener('input', () => {
+      chatInput.style.height = 'auto';
+      chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
+    });
   }
 
   updateZapSelector();
@@ -3956,13 +4007,24 @@ function updateZapSelector() {
   const selector = document.getElementById('zapSelector');
   if (!selector) return;
 
+  const previous = selector.value;
   selector.innerHTML = '<option value="">Selecione um Zap</option>';
   zapsData.forEach(zap => {
     const opt = document.createElement('option');
     opt.value = zap.id;
-    opt.textContent = `${zap.name} (${zap.phone})`;
+    opt.textContent = `${zap.name} — ${zap.phone || 'sem número'}`;
     selector.appendChild(opt);
   });
+  if (previous && zapsData.some(z => String(z.id) === String(previous))) {
+    selector.value = previous;
+  }
+}
+
+function setActiveChatOnServer(chatId) {
+  if (!window.electronAPI || typeof window.electronAPI.whatsappSetActiveChat !== 'function') return;
+  try {
+    window.electronAPI.whatsappSetActiveChat(conversationZapId ? String(conversationZapId) : '', chatId ? String(chatId) : '');
+  } catch (_) { /* ignora */ }
 }
 
 async function loadConversations(zapId) {
@@ -3979,6 +4041,28 @@ async function loadConversations(zapId) {
   }
 }
 
+function isNumericName(value) {
+  const s = String(value || '').trim();
+  if (!s) return true;
+  return /^[\d\s()+\-]*$/.test(s);
+}
+
+// Melhor nome disponível para exibir: prefere o nome salvo, cai para o número
+function contactDisplayName(contact) {
+  if (!contact) return 'Contato';
+  const name = String(contact.name || '').trim();
+  if (name && !isNumericName(name)) return name;
+  return String(contact.number || name || 'Contato');
+}
+
+function contactInitials(contact) {
+  const name = contactDisplayName(contact);
+  if (isNumericName(name)) return name.slice(-2);
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]);
+  return name.slice(0, 2);
+}
+
 function renderConversations(conversations, zapId) {
   const container = document.getElementById('conversationsList');
   if (!container) return;
@@ -3991,14 +4075,19 @@ function renderConversations(conversations, zapId) {
     return;
   }
 
-  const list = globalSearchQuery
-    ? conversations.filter(conv => {
-        const last = conv.lastMessage ? (conv.lastMessage.body || '') : '';
-        return searchMatches(conv.contact ? conv.contact.name : '', globalSearchQuery)
-          || searchMatches(conv.contact ? conv.contact.number : '', globalSearchQuery)
-          || searchMatches(last, globalSearchQuery);
-      })
-    : conversations;
+  const query = globalSearchQuery;
+  const list = conversations.filter(conv => {
+      if (!query) return true;
+      const last = conv.lastMessage ? (conv.lastMessage.body || '') : '';
+      return searchMatches(conv.contact ? conv.contact.name : '', query)
+        || searchMatches(conv.contact ? conv.contact.number : '', query)
+        || searchMatches(last, query);
+    })
+    .sort((a, b) => {
+      const ta = a.lastMessage ? (a.lastMessage.timestamp || 0) : 0;
+      const tb = b.lastMessage ? (b.lastMessage.timestamp || 0) : 0;
+      return tb - ta;
+    });
 
   if (list.length === 0) {
     container.innerHTML = '<div class="conversations-empty"><p>Nenhuma conversa encontrada para a busca</p></div>';
@@ -4012,21 +4101,24 @@ function renderConversations(conversations, zapId) {
     item.dataset.chatId = conv.chatId;
 
     const lastMsg = conv.lastMessage;
-    const lastMsgText = lastMsg ? (lastMsg.body || '').substring(0, 40) : 'Nenhuma mensagem';
+    const preview = lastMsg ? (lastMsg.body || '') : '';
+    let lastMsgText = preview.substring(0, 46) || (lastMsg && lastMsg.hasMedia ? '[mídia]' : 'Nenhuma mensagem');
+    if (lastMsg && lastMsg.fromMe) {
+      lastMsgText = (lastMsg.isReply || lastMsg.origin === 'ai' ? 'IA: ' : 'Você: ') + lastMsgText;
+    }
     const lastMsgTime = lastMsg ? formatTime(lastMsg.timestamp) : '';
+    const unread = conversationUnread.get(conv.chatId) || 0;
 
     item.innerHTML = `
-      <div class="conversation-avatar">
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#666" stroke-width="2">
-          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-          <circle cx="12" cy="7" r="4"/>
-        </svg>
-      </div>
+      <div class="conversation-avatar">${escapeHtml(contactInitials(conv.contact))}</div>
       <div class="conversation-info">
-        <div class="conversation-name">${conv.contact.name}</div>
-        <div class="conversation-last-msg">${lastMsgText}</div>
+        <div class="conversation-name">${escapeHtml(contactDisplayName(conv.contact))}</div>
+        <div class="conversation-last-msg">${escapeHtml(lastMsgText)}</div>
       </div>
-      <div class="conversation-time">${lastMsgTime}</div>
+      <div class="conversation-meta">
+        <div class="conversation-time">${escapeHtml(lastMsgTime)}</div>
+        ${unread > 0 ? `<div class="conversation-badge">${unread > 99 ? '99+' : unread}</div>` : ''}
+      </div>
     `;
 
     item.addEventListener('click', () => openChat(zapId, conv));
@@ -4043,6 +4135,7 @@ function renderConversations(conversations, zapId) {
 function clearConversations() {
   lastRenderedConversations = null;
   lastRenderedConversationsZapId = null;
+  conversationUnread.clear();
   const container = document.getElementById('conversationsList');
   if (container) {
     container.innerHTML = '<div class="conversations-empty"><p>Selecione um Zap para ver as conversas</p></div>';
@@ -4050,25 +4143,58 @@ function clearConversations() {
   clearChat();
 }
 
-async function openChat(zapId, conversation) {
+async function openChat(zapId, conversation, opts) {
+  if (!conversation || !conversation.contact) return;
+  const forceReload = !!(opts && opts.forceReload);
+  const sameChat = selectedConversation && String(selectedConversation.chatId) === String(conversation.chatId);
+
   selectedConversation = conversation;
+  conversationZapId = zapId;
+  conversationUnread.delete(conversation.chatId);
 
-  // Update header
-  document.getElementById('chatContactName').textContent = conversation.contact.name;
-  document.getElementById('chatContactStatus').textContent = `${conversation.contact.number}`;
+  // Header
+  document.getElementById('chatContactName').textContent = contactDisplayName(conversation.contact);
+  const rawNumber = String(conversation.contact.number || '');
+  document.getElementById('chatContactStatus').textContent = rawNumber && !rawNumber.startsWith('+') ? `+${rawNumber}` : rawNumber;
+  const avatar = document.getElementById('chatAvatar');
+  if (avatar) {
+    avatar.classList.add('chat-avatar-initials');
+    avatar.textContent = contactInitials(conversation.contact);
+  }
 
-  // Highlight selected conversation
+  // Highlight selected conversation (e limpa o contador de não lidas)
   document.querySelectorAll('.conversation-item').forEach(item => {
     item.classList.remove('active');
     if (item.dataset.chatId === conversation.chatId) {
       item.classList.add('active');
+      const badge = item.querySelector('.conversation-badge');
+      if (badge) badge.remove();
     }
   });
 
-  // Show input area
+  // Show input area + tell the manager which chat is open (para detecção de "digitando")
   document.getElementById('chatInputArea').style.display = 'flex';
+  setActiveChatOnServer(conversation.chatId);
 
-  // Load messages
+  if (sameChat && !forceReload) return;
+
+  renderedMessageKeys = new Set();
+  const container = document.getElementById('chatMessages');
+  if (container) {
+    container.innerHTML = '<div class="chat-empty"><p>Carregando histórico...</p></div>';
+  }
+
+  // Histórico completo direto do WhatsApp (recebidas, suas e da IA) + cache em memória
+  try {
+    if (window.electronAPI.whatsappChatHistory) {
+      const messages = await window.electronAPI.whatsappChatHistory(zapId.toString(), conversation.chatId, 80);
+      renderChatMessages(messages);
+      return;
+    }
+  } catch (error) {
+    console.error('Erro ao carregar histórico do WhatsApp:', error);
+  }
+
   try {
     const messages = await window.electronAPI.whatsappMessages(zapId.toString(), conversation.chatId);
     renderChatMessages(messages);
@@ -4077,33 +4203,97 @@ async function openChat(zapId, conversation) {
   }
 }
 
+function chatMessageKey(msg) {
+  if (!msg) return '';
+  if (msg.id) return String(msg.id);
+  return `${msg.fromMe ? 'me' : 'them'}-${msg.timestamp || 0}-${String(msg.body || '').slice(0, 24)}`;
+}
+
+function messageClass(msg) {
+  if (msg.isReply || msg.origin === 'ai') return 'ai-reply';
+  if (msg.fromMe) return 'outgoing';
+  return 'incoming';
+}
+
+function messageAuthor(msg) {
+  if (msg.isReply || msg.origin === 'ai') return 'IA';
+  if (msg.fromMe) return 'Você';
+  return '';
+}
+
+function appendChatMessage(msg, opts) {
+  const container = document.getElementById('chatMessages');
+  if (!container) return;
+
+  const placeholder = container.querySelector('.chat-empty');
+  if (placeholder) container.innerHTML = '';
+
+  const key = chatMessageKey(msg);
+  if (key && renderedMessageKeys.has(key)) return;
+  if (key) renderedMessageKeys.add(key);
+
+  const div = document.createElement('div');
+  div.className = `chat-message ${messageClass(msg)}`;
+  if (key) div.dataset.msgId = key;
+
+  const author = messageAuthor(msg);
+  const body = msg.body || (msg.hasMedia ? '[mídia]' : '');
+
+  div.innerHTML = `
+    ${author ? `<div class="chat-message-author">${escapeHtml(author)}</div>` : ''}
+    <div class="chat-message-text">${escapeHtml(body)}</div>
+    <div class="chat-message-time">${escapeHtml(formatTime(msg.timestamp))}</div>
+  `;
+
+  if (opts && opts.beforeTyping) {
+    const typing = container.querySelector('.typing-indicator');
+    if (typing) container.insertBefore(div, typing);
+    else container.appendChild(div);
+  } else {
+    container.appendChild(div);
+  }
+
+  container.scrollTop = container.scrollHeight;
+}
+
 function renderChatMessages(messages) {
   const container = document.getElementById('chatMessages');
   if (!container) return;
 
+  renderedMessageKeys = new Set();
+
   if (!messages || messages.length === 0) {
-    container.innerHTML = '<div class="chat-empty"><p>Nenhuma mensagem</p></div>';
+    container.innerHTML = `
+      <div class="chat-empty">
+        <svg viewBox="0 0 24 24" width="52" height="52" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <p>Nenhuma mensagem ainda</p>
+        <span class="chat-empty-hint">Envie uma mensagem abaixo ou aguarde o contato escrever</span>
+      </div>
+    `;
     return;
   }
 
+  const ordered = messages.slice().sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
   container.innerHTML = '';
-  messages.forEach(msg => {
+  const frag = document.createDocumentFragment();
+  ordered.forEach(msg => {
+    const key = chatMessageKey(msg);
+    if (key) renderedMessageKeys.add(key);
     const div = document.createElement('div');
-    const isOutgoing = msg.fromMe;
-    const isReply = msg.isReply;
-
-    let msgClass = 'incoming';
-    if (isOutgoing) msgClass = 'outgoing';
-    if (isReply) msgClass = 'ai-reply';
-
-    div.className = `chat-message ${msgClass}`;
+    div.className = `chat-message ${messageClass(msg)}`;
+    if (key) div.dataset.msgId = key;
+    const author = messageAuthor(msg);
+    const body = msg.body || (msg.hasMedia ? '[mídia]' : '');
     div.innerHTML = `
-      <div class="chat-message-text">${msg.body}</div>
-      <div class="chat-message-time">${formatTime(msg.timestamp)}</div>
+      ${author ? `<div class="chat-message-author">${escapeHtml(author)}</div>` : ''}
+      <div class="chat-message-text">${escapeHtml(body)}</div>
+      <div class="chat-message-time">${escapeHtml(formatTime(msg.timestamp))}</div>
     `;
-    container.appendChild(div);
+    frag.appendChild(div);
   });
-
+  container.appendChild(frag);
   container.scrollTop = container.scrollHeight;
 }
 
@@ -4112,76 +4302,112 @@ function clearChat() {
   if (container) {
     container.innerHTML = `
       <div class="chat-empty">
-        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#ccc" stroke-width="1.5">
+        <svg viewBox="0 0 24 24" width="52" height="52" fill="none" stroke="currentColor" stroke-width="1.4">
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>
         <p>Selecione uma conversa para visualizar</p>
+        <span class="chat-empty-hint">O histórico completo aparece aqui, com mensagens recebidas, suas e da IA</span>
       </div>
     `;
   }
-  document.getElementById('chatInputArea').style.display = 'none';
+  renderedMessageKeys = new Set();
+  const inputArea = document.getElementById('chatInputArea');
+  if (inputArea) inputArea.style.display = 'none';
+  const avatar = document.getElementById('chatAvatar');
+  if (avatar) {
+    avatar.classList.remove('chat-avatar-initials');
+    avatar.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+  }
+  setActiveChatOnServer(null);
 }
 
 async function sendChatMessage() {
   const input = document.getElementById('chatInput');
   const message = input.value.trim();
-  if (!message || !selectedConversation || !currentZapId) return;
+  if (!message || !selectedConversation || !conversationZapId) return;
 
   input.value = '';
+  input.style.height = 'auto';
 
   try {
+    // Envio manual: o main.js marca como resposta do dono, então a IA não responde por cima.
+    // O manager registra e emite a mensagem, então ela aparece no histórico em tempo real.
+    if (selectedConversation && typeof window.electronAPI.whatsappSetActiveChat === 'function') {
+      window.electronAPI.whatsappSetActiveChat(conversationZapId.toString(), selectedConversation.chatId);
+    }
     await window.electronAPI.whatsappSend(
-      currentZapId.toString(),
+      conversationZapId.toString(),
       selectedConversation.contact.number,
-      message
+      message,
+      selectedConversation.chatId
     );
-
-    // Add message to chat
-    const container = document.getElementById('chatMessages');
-    const div = document.createElement('div');
-    div.className = 'chat-message outgoing';
-    div.innerHTML = `
-      <div class="chat-message-text">${message}</div>
-      <div class="chat-message-time">${formatTime(Date.now() / 1000)}</div>
-    `;
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
   } catch (error) {
     console.error('Erro ao enviar mensagem:', error);
     alert('Erro ao enviar mensagem: ' + error.message);
   }
 }
 
-function handleIncomingMessage(data) {
-  const { zapId, body, from, contact, chat, isReply, reply } = data;
+function playIncomingSound() {
+  try {
+    if (!incomingSoundCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      incomingSoundCtx = new Ctx();
+    }
+    const ctx = incomingSoundCtx;
+    if (ctx.state === 'suspended') ctx.resume();
 
-  // Update conversations list if viewing this zap
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, now);
+    osc.frequency.setValueAtTime(1174.66, now + 0.09);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.3);
+  } catch (_) { /* som indisponivel */ }
+}
+
+function handleIncomingMessage(data) {
+  if (!data) return;
+  const zapId = data.zapId;
+  const chatId = data.chat ? data.chat.id : (data.from || '');
+
   const zapSelector = document.getElementById('zapSelector');
-  if (zapSelector && zapSelector.value == zapId) {
+  const viewingZap = zapSelector && String(zapSelector.value) === String(zapId);
+  const chatOpen = selectedConversation && String(selectedConversation.chatId) === String(chatId);
+
+  // Mensagem recebida de contato: som + contador de não lidas
+  if (!data.fromMe) {
+    playIncomingSound();
+    if (!chatOpen) {
+      conversationUnread.set(chatId, (conversationUnread.get(chatId) || 0) + 1);
+    }
+  }
+
+  // Atualiza a lista de conversas do Zap aberto (ordem, prévia, não lidas)
+  if (viewingZap) {
     loadConversations(zapId);
   }
 
-  // Update chat if viewing this conversation
-  if (selectedConversation && selectedConversation.chatId === chat.id) {
-    const container = document.getElementById('chatMessages');
-    const div = document.createElement('div');
-
-    if (isReply && reply) {
-      div.className = 'chat-message ai-reply';
-      div.innerHTML = `
-        <div class="chat-message-text">${reply}</div>
-        <div class="chat-message-time">${formatTime(data.timestamp)}</div>
-      `;
-    } else {
-      div.className = 'chat-message incoming';
-      div.innerHTML = `
-        <div class="chat-message-text">${body}</div>
-        <div class="chat-message-time">${formatTime(data.timestamp)}</div>
-      `;
-    }
-
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
+  // Atualiza o chat se esta conversa estiver aberta
+  if (chatOpen) {
+    const isAi = data.isReply || data.origin === 'ai';
+    const msg = {
+      id: data.id,
+      body: isAi ? (data.reply || data.body) : data.body,
+      fromMe: !!data.fromMe,
+      isReply: isAi,
+      origin: data.origin,
+      hasMedia: data.hasMedia,
+      timestamp: data.timestamp || (Date.now() / 1000)
+    };
+    appendChatMessage(msg, { beforeTyping: true });
   }
 }
 
@@ -5677,10 +5903,533 @@ function attachDashFile() {
 }
 
 // ============================================
+// Gerenciar Servidor (painel + terminal)
+// ============================================
+let serverTerminalHistory = [];
+let serverTerminalIds = new Set();
+let serverTerminalAtBottom = true;
+let currentServerOverview = null;
+let serverCommandHistory = [];
+let serverCommandHistoryIndex = -1;
+let serverUptimeBase = 0;
+let serverUptimeAt = 0;
+let serverUptimeRunning = false;
+let serverUptimeTimer = null;
+
+function serverClock(ts) {
+  try {
+    return new Date(ts || Date.now()).toLocaleTimeString('pt-BR', { hour12: false });
+  } catch (_) {
+    return '';
+  }
+}
+
+function serverFormatChrono(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return [h, m, s].map((n) => String(n).padStart(2, '0')).join(':');
+}
+
+function renderServerUptime() {
+  const label = document.getElementById('serverUptimeLabel');
+  const value = document.getElementById('serverInfoUptime');
+  if (!value) return;
+  if (!serverUptimeRunning) {
+    if (label) label.textContent = 'Servidor';
+    value.textContent = 'parado';
+    return;
+  }
+  if (label) label.textContent = 'Ativo há';
+  const elapsed = serverUptimeBase + Math.max(0, (Date.now() - serverUptimeAt) / 1000);
+  value.textContent = serverFormatChrono(elapsed);
+}
+
+function buildServerTermLine(entry) {
+  const line = document.createElement('div');
+  const level = String(entry.level || 'info').replace(/[^a-z]/g, '');
+  line.className = `server-term-line level-${level}`;
+
+  const time = document.createElement('span');
+  time.className = 'server-term-time';
+  // Logs de dias anteriores precisam da data; senao parece que tudo aconteceu
+  // "hoje" e o usuario nao consegue ver o historico desde a criacao do zap.
+  let stamp = entry.time || serverClock(entry.ts);
+  try {
+    const d = new Date(entry.ts);
+    if (!Number.isNaN(d.getTime())) {
+      const now = new Date();
+      const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+      if (!sameDay) stamp = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${stamp}`;
+    }
+  } catch (_) {}
+  time.textContent = stamp;
+
+  const tag = document.createElement('span');
+  tag.className = `server-term-tag tag-${level}`;
+  tag.textContent = entry.source || 'SERVIDOR';
+
+  const msg = document.createElement('span');
+  msg.className = 'server-term-msg';
+  msg.textContent = entry.msg == null ? '' : String(entry.msg);
+
+  line.appendChild(time);
+  line.appendChild(tag);
+  line.appendChild(msg);
+  return line;
+}
+
+function clearServerTerminalDom() {
+  const term = document.getElementById('serverTerminal');
+  if (!term) return;
+  term.innerHTML = '<div class="server-terminal-empty" id="serverTerminalEmpty">Nenhum evento ainda. Os eventos do servidor aparecerao aqui.</div>';
+}
+
+function serverTerminalMatches(entry, query) {
+  const q = String(query || '').toLowerCase();
+  if (!q) return true;
+  return `${entry.source || ''} ${entry.msg || ''}`.toLowerCase().includes(q);
+}
+
+function serverTerminalActiveQuery() {
+  if (getActivePageId() !== 'gerenciar-servidor') return '';
+  return String(typeof globalSearchQuery === 'string' ? globalSearchQuery : '').trim();
+}
+
+function renderServerTerminal() {
+  const term = document.getElementById('serverTerminal');
+  if (!term) return;
+  const query = serverTerminalActiveQuery();
+  const list = query
+    ? serverTerminalHistory.filter((e) => serverTerminalMatches(e, query))
+    : serverTerminalHistory;
+
+  term.innerHTML = '';
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'server-terminal-empty';
+    empty.id = 'serverTerminalEmpty';
+    empty.textContent = query
+      ? `Nenhum evento encontrado para "${query}".`
+      : 'Nenhum evento ainda. Os eventos do servidor aparecerao aqui.';
+    term.appendChild(empty);
+    return;
+  }
+  // O historico completo fica em memoria (20k); o DOM recebe so o final para
+  // a tela nao travar. A busca continua percorrendo todo o historico.
+  const visible = list.length > SERVER_TERM_RENDER_MAX ? list.slice(-SERVER_TERM_RENDER_MAX) : list;
+  const frag = document.createDocumentFragment();
+  for (const entry of visible) frag.appendChild(buildServerTermLine(entry));
+  term.appendChild(frag);
+  term.scrollTop = term.scrollHeight;
+  serverTerminalAtBottom = true;
+}
+
+function addServerTerminalEntry(entry) {
+  if (!entry || !entry.msg) return;
+  const id = entry.id || `${entry.ts || ''}|${entry.source || ''}|${entry.msg}`;
+  if (serverTerminalIds.has(id)) return;
+  serverTerminalIds.add(id);
+  if (serverTerminalIds.size > 4000) {
+    const first = serverTerminalIds.values().next().value;
+    if (first) serverTerminalIds.delete(first);
+  }
+
+  serverTerminalHistory.push(entry);
+  if (serverTerminalHistory.length > 20000) serverTerminalHistory.shift();
+
+  const term = document.getElementById('serverTerminal');
+  if (!term) return;
+  const query = serverTerminalActiveQuery();
+  if (query && !serverTerminalMatches(entry, query)) return;
+  const empty = document.getElementById('serverTerminalEmpty');
+  if (empty) empty.remove();
+  term.appendChild(buildServerTermLine(entry));
+  while (term.children.length > SERVER_TERM_RENDER_MAX) term.removeChild(term.firstElementChild);
+  if (serverTerminalAtBottom) term.scrollTop = term.scrollHeight;
+}
+
+function formatServerTerminalText() {
+  return serverTerminalHistory.map((e) => {
+    let stamp = e.time || serverClock(e.ts);
+    try {
+      const d = new Date(e.ts);
+      if (!Number.isNaN(d.getTime())) {
+        stamp = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${stamp}`;
+      }
+    } catch (_) {}
+    return `${stamp} [${e.source || 'SERVIDOR'}] ${e.msg || ''}`;
+  }).join('\n');
+}
+
+async function copyServerTerminal() {
+  const text = formatServerTerminalText();
+  const btn = document.getElementById('serverTerminalCopy');
+  if (!text.trim()) {
+    if (btn) { btn.textContent = 'Vazio'; setTimeout(() => { btn.textContent = 'Copiar'; }, 1200); }
+    return;
+  }
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (_) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      ta.remove();
+    } catch (_) { ok = false; }
+  }
+  if (btn) {
+    btn.textContent = ok ? 'Copiado!' : 'Falhou';
+    setTimeout(() => { btn.textContent = 'Copiar'; }, 1400);
+  }
+}
+
+async function clearServerTerminal() {
+  serverTerminalHistory = [];
+  serverTerminalIds = new Set();
+  clearServerTerminalDom();
+  if (window.electronAPI && window.electronAPI.serverTerminalClear) {
+    try { await window.electronAPI.serverTerminalClear(); } catch (_) {}
+  }
+}
+
+function updateServerOverviewDom(o) {
+  if (!o) return;
+  const running = !!o.running;
+  const cls = !running || o.level === 'bad' ? 'bad' : (o.level === 'warn' ? 'warn' : 'ok');
+
+  const dot = document.getElementById('serverStatusDot');
+  if (dot) {
+    dot.className = `panel-status-dot server-status-dot ${cls}`;
+    dot.title = o.label || 'Status do servidor';
+  }
+
+  const pill = document.getElementById('serverStatusPill');
+  if (pill) pill.title = o.hint || o.label || 'Status do servidor';
+
+  const label = document.getElementById('serverStatusLabel');
+  if (label) {
+    label.textContent = !running
+      ? 'Não funcionando'
+      : (o.level === 'ok' ? 'Funcionando' : 'Funcionando com erros');
+  }
+
+  const btn = document.getElementById('serverPowerBtn');
+  if (btn) {
+    btn.textContent = running ? 'Desligar servidor' : 'Ligar servidor';
+    btn.className = `server-power-btn ${running ? 'stop' : 'start'}`;
+    btn.title = running
+      ? 'Desliga o bot e para as respostas automaticas'
+      : 'Liga o bot e reconecta os Zaps';
+    btn.disabled = false;
+  }
+
+  const total = Math.max(0, Number(o.total) || 0);
+  const zaps = document.getElementById('serverInfoZaps');
+  if (zaps) zaps.textContent = String(total);
+  const zapsLabel = document.getElementById('serverInfoZapsLabel');
+  if (zapsLabel) zapsLabel.textContent = total === 1 ? 'Zap' : 'Zaps';
+
+  serverUptimeBase = Math.max(0, Number(o.uptime) || 0);
+  serverUptimeAt = Date.now();
+  serverUptimeRunning = running;
+  renderServerUptime();
+}
+
+async function refreshServerOverview() {
+  if (!window.electronAPI || !window.electronAPI.serverOverview) return;
+  try {
+    const o = await window.electronAPI.serverOverview();
+    if (!o) return;
+    currentServerOverview = o;
+    updateServerOverviewDom(o);
+  } catch (_) { /* silencioso - o polling tenta de novo */ }
+}
+
+async function toggleServerPower() {
+  if (!window.electronAPI || !window.electronAPI.serverPower) return;
+  const running = currentServerOverview ? !!currentServerOverview.running : true;
+  const willRun = !running;
+  if (!willRun) {
+    const question = 'Desligar o servidor agora? O bot vai parar de responder mensagens ate voce ligar de novo.';
+    const ok = window.electronAPI.nativeConfirm
+      ? window.electronAPI.nativeConfirm(question)
+      : window.confirm(question);
+    if (!ok) return;
+  }
+  const btn = document.getElementById('serverPowerBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = willRun ? 'Ligando...' : 'Desligando...';
+  }
+  try {
+    const r = await window.electronAPI.serverPower(willRun);
+    if (r && r.ok === false) {
+      alert(`Nao foi possivel ${willRun ? 'ligar' : 'desligar'} o servidor: ${r.error || 'erro desconhecido'}`);
+    }
+  } catch (e) {
+    alert(`Nao foi possivel ${willRun ? 'ligar' : 'desligar'} o servidor: ${e.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = willRun ? 'Desligar servidor' : 'Ligar servidor';
+    }
+    refreshServerOverview();
+  }
+}
+
+async function sendServerCommand() {
+  const input = document.getElementById('serverTerminalInput');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  serverCommandHistory.push(text);
+  if (serverCommandHistory.length > 50) serverCommandHistory.shift();
+  serverCommandHistoryIndex = -1;
+  if (!window.electronAPI || !window.electronAPI.serverCommand) return;
+  try {
+    await window.electronAPI.serverCommand(text);
+  } catch (e) {
+    addServerTerminalEntry({
+      level: 'error',
+      source: 'PAINEL',
+      msg: `Falha ao enviar comando: ${e.message}`,
+      ts: new Date().toISOString(),
+      time: serverClock()
+    });
+  }
+  input.focus();
+}
+
+const SERVER_TERM_RENDER_MAX = 5000;
+
+async function refreshServerConnectCard() {
+  if (!window.electronAPI || !window.electronAPI.serverConfigGet) return;
+  const title = document.getElementById('serverConnectTitle');
+  const hint = document.getElementById('serverConnectHint');
+  const pathEl = document.getElementById('serverConnectPath');
+  const pick = document.getElementById('serverConnectPick');
+  const clone = document.getElementById('serverConnectClone');
+  let cfg = null;
+  try { cfg = await window.electronAPI.serverConfigGet(); } catch (_) { cfg = null; }
+  if (!cfg) return;
+
+  if (cfg.mode === 'server') {
+    if (title) title.textContent = 'Servidor 24h conectado';
+    if (hint) hint.textContent = 'O bot roda no servidor, 24 horas. Este PC e apenas o painel: fechar o programa nao para o WhatsApp.';
+    if (pathEl) pathEl.textContent = `Repositorio de dados: ${cfg.repoDir || '?'}`;
+    if (pick) pick.textContent = 'Trocar pasta do repositorio';
+    if (clone) clone.style.display = 'none';
+    pick.disabled = false;
+  } else if (cfg.mode === 'server-missing') {
+    if (title) title.textContent = 'Servidor 24h sem conexao';
+    if (hint) hint.textContent = 'O servidor esta configurado, mas a pasta do repositorio de dados nao foi encontrada. O WhatsApp NAO sera iniciado neste PC.';
+    if (pathEl) pathEl.textContent = cfg.repoDir ? `Ultimo caminho: ${cfg.repoDir}` : '';
+    if (pick) pick.textContent = 'Reconectar pasta do repositorio';
+    if (clone) clone.style.display = '';
+    pick.disabled = false;
+  } else {
+    if (title) title.textContent = 'Este PC esta hospedando o bot';
+    if (hint) hint.textContent = 'Neste modo o bot so funciona enquanto este programa estiver aberto. Para funcionar 24h sem o PC ligado, conecte o servidor abaixo.';
+    if (pathEl) pathEl.textContent = '';
+    if (pick) pick.textContent = 'Usar pasta do repositorio';
+    if (clone) clone.style.display = '';
+    pick.disabled = false;
+  }
+}
+
+async function restartForServerConfig() {
+  try {
+    if (window.electronAPI.serverRelaunch) {
+      await window.electronAPI.serverRelaunch();
+    } else {
+      alert('Feche e abra o programa para aplicar.');
+    }
+  } catch (_) {
+    alert('Feche e abra o programa para aplicar.');
+  }
+}
+
+async function pickServerRepoFolder() {
+  if (!window.electronAPI || !window.electronAPI.serverConfigPick) return;
+  const btn = document.getElementById('serverConnectPick');
+  if (btn) { btn.disabled = true; btn.textContent = 'Abrindo...'; }
+  try {
+    const r = await window.electronAPI.serverConfigPick();
+    if (r && r.ok) {
+      alert('Servidor configurado! O programa vai reiniciar para entrar no modo painel.');
+      await restartForServerConfig();
+      return;
+    }
+    if (r && !r.canceled) alert(r.error || 'Nao foi possivel usar essa pasta.');
+  } catch (e) {
+    alert('Erro ao escolher a pasta: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    refreshServerConnectCard();
+  }
+}
+
+async function cloneServerRepo() {
+  if (!window.electronAPI || !window.electronAPI.serverConfigClone) return;
+  const url = document.getElementById('serverRepoUrl');
+  const token = document.getElementById('serverRepoToken');
+  const btn = document.getElementById('serverCloneGo');
+  if (!url || !url.value.trim()) { alert('Informe a URL do repositorio de dados.'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Clonando...'; }
+  try {
+    const r = await window.electronAPI.serverConfigClone(url.value.trim(), token ? token.value.trim() : '');
+    if (r && r.ok) {
+      alert('Repositorio clonado e servidor conectado! O programa vai reiniciar.');
+      await restartForServerConfig();
+      return;
+    }
+    alert((r && r.error) || 'Nao foi possivel clonar o repositorio.');
+  } catch (e) {
+    alert('Erro ao clonar: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Clonar e conectar'; }
+  }
+}
+
+function initServerPage() {
+  if (!window.electronAPI || !window.electronAPI.serverOverview) return;
+
+  const term = document.getElementById('serverTerminal');
+  if (term) {
+    term.addEventListener('scroll', () => {
+      serverTerminalAtBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 45;
+    });
+  }
+
+  if (window.electronAPI.onServerTerminalLog) {
+    window.electronAPI.onServerTerminalLog((entry) => addServerTerminalEntry(entry));
+  }
+  if (window.electronAPI.onServerTerminalCleared) {
+    window.electronAPI.onServerTerminalCleared(() => {
+      serverTerminalHistory = [];
+      serverTerminalIds = new Set();
+      clearServerTerminalDom();
+    });
+  }
+
+  if (window.electronAPI.serverTerminalLogs) {
+    window.electronAPI.serverTerminalLogs().then((list) => {
+      if (!Array.isArray(list)) return;
+      const known = new Set(serverTerminalHistory.map((e) => e.id));
+      for (const entry of list) {
+        if (!entry || !entry.msg) continue;
+        const id = entry.id || `${entry.ts || ''}|${entry.source || ''}|${entry.msg}`;
+        if (known.has(id) || serverTerminalIds.has(id)) continue;
+        serverTerminalIds.add(id);
+        serverTerminalHistory.push(entry);
+      }
+      if (serverTerminalHistory.length > 20000) serverTerminalHistory = serverTerminalHistory.slice(-20000);
+      renderServerTerminal();
+    }).catch(() => {});
+  }
+
+  const powerBtn = document.getElementById('serverPowerBtn');
+  if (powerBtn) powerBtn.addEventListener('click', toggleServerPower);
+
+  const clearBtn = document.getElementById('serverTerminalClear');
+  if (clearBtn) clearBtn.addEventListener('click', clearServerTerminal);
+
+  const copyBtn = document.getElementById('serverTerminalCopy');
+  if (copyBtn) copyBtn.addEventListener('click', copyServerTerminal);
+
+  const downloadBtn = document.getElementById('serverTerminalDownload');
+  if (downloadBtn) {
+    downloadBtn.addEventListener('click', async () => {
+      if (!window.electronAPI || !window.electronAPI.serverTerminalExport) return;
+      try {
+        const r = await window.electronAPI.serverTerminalExport();
+        if (r && r.ok) downloadBtn.textContent = 'Salvo!';
+        else if (r && !r.canceled) alert(r.error || 'Nao foi possivel salvar o log.');
+      } catch (e) {
+        alert('Erro ao salvar o log: ' + e.message);
+      }
+      setTimeout(() => { downloadBtn.textContent = 'Baixar'; }, 1600);
+    });
+  }
+
+  const connectPick = document.getElementById('serverConnectPick');
+  if (connectPick) connectPick.addEventListener('click', pickServerRepoFolder);
+
+  const connectClone = document.getElementById('serverConnectClone');
+  const clonePanel = document.getElementById('serverClonePanel');
+  if (connectClone && clonePanel) {
+    connectClone.addEventListener('click', () => {
+      clonePanel.style.display = clonePanel.style.display === 'none' ? '' : 'none';
+    });
+  }
+  const cloneGo = document.getElementById('serverCloneGo');
+  if (cloneGo) cloneGo.addEventListener('click', cloneServerRepo);
+  const cloneCancel = document.getElementById('serverCloneCancel');
+  if (cloneCancel && clonePanel) cloneCancel.addEventListener('click', () => { clonePanel.style.display = 'none'; });
+
+  refreshServerConnectCard();
+
+  const form = document.getElementById('serverTerminalForm');
+  if (form) {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      sendServerCommand();
+    });
+  }
+
+  const input = document.getElementById('serverTerminalInput');
+  if (input) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowUp') {
+        if (!serverCommandHistory.length) return;
+        e.preventDefault();
+        if (serverCommandHistoryIndex === -1) serverCommandHistoryIndex = serverCommandHistory.length - 1;
+        else if (serverCommandHistoryIndex > 0) serverCommandHistoryIndex--;
+        input.value = serverCommandHistory[serverCommandHistoryIndex] || '';
+        input.setSelectionRange(input.value.length, input.value.length);
+      } else if (e.key === 'ArrowDown') {
+        if (serverCommandHistoryIndex === -1) return;
+        e.preventDefault();
+        if (serverCommandHistoryIndex < serverCommandHistory.length - 1) {
+          serverCommandHistoryIndex++;
+          input.value = serverCommandHistory[serverCommandHistoryIndex] || '';
+        } else {
+          serverCommandHistoryIndex = -1;
+          input.value = '';
+        }
+      }
+    });
+  }
+
+  renderServerUptime();
+  if (!serverUptimeTimer) {
+    serverUptimeTimer = setInterval(() => {
+      if (!document.hidden) renderServerUptime();
+    }, 1000);
+  }
+
+  refreshServerOverview();
+  setInterval(() => {
+    if (getActivePageId() === 'gerenciar-servidor' && !document.hidden) refreshServerOverview();
+  }, 5000);
+}
+
+// ============================================
 // Start App
 // ============================================
 document.addEventListener('DOMContentLoaded', () => {
   try { init(); } catch (e) { console.error('Erro no init:', e); }
   try { initWhatsApp(); } catch (e) { console.error('Erro no initWhatsApp:', e); }
+  try { initServerPage(); } catch (e) { console.error('Erro em initServerPage:', e); }
   try { setupTrainingListeners(); } catch (e) { console.error('Erro em setupTrainingListeners:', e); }
 });
