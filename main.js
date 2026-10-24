@@ -1355,6 +1355,62 @@ function autoPairMissingSessions() {
 }
 
 // ------------------------------------------------------------
+// Watchdog de conexao (servidor headless)
+// ------------------------------------------------------------
+// Um zap pode cair por erro transitorio do Chromium/WhatsApp Web (por exemplo
+// "Execution context was destroyed" durante o boot). Sem isso ele ficava
+// "disconnected" para sempre, porque o reconciler so conecta zaps novos.
+function startConnectionWatchdog(intervalMs = 60000) {
+  if (!isHeadless() || !whatsappManager) return null;
+  const attempts = new Map();
+  const inFlight = new Set();
+  const BUSY = ['ready', 'connecting', 'initializing', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated'];
+  const autoPair = ['1', 'true', 'yes'].includes(String(process.env.LINK_AUTO_PAIR || '').toLowerCase());
+
+  const timer = setInterval(async () => {
+    try {
+      if (isServerPaused()) return;
+      for (const z of loadZapsData()) {
+        if (!z || z.enabled === false) continue;
+        const id = String(z.id);
+        if (inFlight.has(id)) continue;
+        const st = (whatsappManager.getStatus(id) || { status: 'disconnected' });
+        if (BUSY.includes(st.status)) {
+          // Conectou: zera o backoff para uma proxima queda ser tratada rapido.
+          if (st.status === 'ready') attempts.delete(id);
+          continue;
+        }
+        const sessionDir = path.join(getDataDir(), 'sessions', id);
+        const hasSession = fs.existsSync(sessionDir);
+        const phone = String(z.phone || '').replace(/\D/g, '');
+        if (!hasSession && !(autoPair && phone)) continue;
+
+        const rec = attempts.get(id) || { last: 0, n: 0 };
+        const delay = Math.min(10 * 60 * 1000, 30000 * Math.pow(2, Math.min(5, rec.n)));
+        if (Date.now() - rec.last < delay) continue;
+        rec.last = Date.now();
+        rec.n += 1;
+        attempts.set(id, rec);
+        inFlight.add(id);
+        console.log(`[WATCHDOG] Zap ${id} esta ${st.status || 'desconectado'} - tentando reconectar (tentativa ${rec.n})...`);
+        try {
+          await whatsappManager.connectZap(id, hasSession ? '' : phone, hasSession ? 'qrcode' : 'pairing');
+        } catch (e) {
+          console.error(`[WATCHDOG] Falha ao reconectar zap ${id}: ${e.message}`);
+        } finally {
+          inFlight.delete(id);
+        }
+      }
+    } catch (e) {
+      console.error('[WATCHDOG] falhou:', e.message);
+    }
+  }, intervalMs);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  console.log(`[WATCHDOG] Ativo (a cada ${Math.round(intervalMs / 1000)}s)`);
+  return timer;
+}
+
+// ------------------------------------------------------------
 // Reconciler do servidor: aplica ao vivo o zaps.json alterado no painel
 // (novo zap = conecta/pareia; zap removido/desativado = desconecta)
 // ------------------------------------------------------------
@@ -1829,6 +1885,7 @@ app.whenReady().then(() => {
   if (isHeadless()) {
     autoPairMissingSessions();
     startServerReconciler();
+    startConnectionWatchdog();
   }
   const statusTimer = setInterval(persistBotStatus, 30000);
   if (statusTimer && typeof statusTimer.unref === 'function') statusTimer.unref();
