@@ -14,7 +14,7 @@ START=$(date +%s)
 GRACE=$(( MAX_MINUTES * 60 - 120 ))
 [ "$GRACE" -lt 60 ] && GRACE=60
 LAST_QUICK=0
-LAST_FULL=0
+LAST_FULL=$START
 READY_BACKED=0
 FULL_EVERY=21600   # sessao completa a cada 6h (e sempre no fim da execucao)
 
