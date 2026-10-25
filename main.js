@@ -87,6 +87,13 @@ const TERMINAL_NOISE = [
   /faltam\s+[\d.,]+s\s+com\s+"digitando/i,
   /indicador\s+"?digitando"?/i,
   /\[WHATSAPP\].*carregando:/i,
+  /carregando:\s*\d+%/i,
+  /^Zap\s+.*state:/i,
+  /estado do socket:/i,
+  /QR Code gerado/i,
+  /Codigo de pareamento gerado/i,
+  /Codigo do zap .*gravado em/i,
+  /Codigo pronto em/i,
   /\[WHATSAPP\].*bateria:/i,
   /\[WHATSAPP\].*state:/i,
   /contatos persistidos carregados/i,
@@ -1314,7 +1321,7 @@ function autoConnectSavedSessions(staggerMs = 2000) {
                     .catch((err) => console.error(`[AUTO-PAIR] Falha no pareamento do zap ${zapId}: ${err.message}`));
                 }
               }
-            }, 12000);
+            }, 45000);
           }
         })
         .catch((e) => console.error(`[AUTO] Falha ao reconectar ${zapId}: ${e.message}`));
@@ -2008,6 +2015,15 @@ ipcMain.handle('whatsapp-chat-history', async (e, zapId, chatId, limit) => {
 ipcMain.on('whatsapp-set-active-chat', (e, zapId, chatId) => {
   try { whatsappManager.setActiveChat(zapId, chatId); } catch (_) { /* ignora */ }
 });
+// Midia de uma mensagem do historico (audio para tocar, imagem/figurinha para exibir)
+ipcMain.handle('whatsapp-chat-media', async (e, zapId, chatId, msgId, hint) => {
+  try {
+    return await whatsappManager.fetchMessageMedia(String(zapId), chatId, msgId, hint || {});
+  } catch (err) {
+    console.error('[CONV] erro ao baixar midia da conversa:', err.message);
+    return { success: false, error: err.message };
+  }
+});
 ipcMain.handle('whatsapp-send-media', async (e, zapId, phone, media) => {
   const r = await whatsappManager.sendMedia(String(zapId), phone, media || {});
   whatsappManager.markOwnerReply(String(zapId), phone);
@@ -2353,6 +2369,21 @@ ipcMain.handle('server-delete-zap-session', (e, zapId) => {
 });
 ipcMain.handle('server-status', () => (serverSync ? serverSync.getBotStatus() : null));
 ipcMain.handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
+
+// QR/codigo atual do servidor para a tela de conexao do painel.
+ipcMain.handle('server-current-qr', async (e, zapId) => {
+  if (!serverMode || !serverSync) return { ok: false, error: 'modo servidor inativo' };
+  const id = String(zapId || '');
+  let dataUrl = null;
+  try { dataUrl = await serverSync.getQrDataUrl(id); } catch (_) {}
+  const st = serverSync.getZapStatus(id) || {};
+  return {
+    ok: true,
+    dataUrl,
+    status: st.status || 'disconnected',
+    pairingCode: st.pairingCode || null
+  };
+});
 
 // ------------------------------------------------------------
 // IPC - Painel "Gerenciar Servidor" (status, liga/desliga e terminal)

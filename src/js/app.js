@@ -3834,13 +3834,27 @@ async function connectZapWithMethod(zapId, phone, method) {
   if (!window.electronAPI) { alert('Integracao com WhatsApp nao disponivel.'); return; }
 
   if (serverManaged) {
-    // Nao conecta pelo PC: o servidor gera codigo/QR e o painel recebe por evento.
+    // Nao conecta pelo PC: o servidor gera codigo/QR e o painel so exibe.
     const cp = document.getElementById('connectProgress');
     if (cp) cp.style.display = 'none';
     const ps = document.getElementById('pairingStatus');
     if (ps) {
-      ps.textContent = 'O servidor esta gerando o codigo/QR. Ele aparece aqui em instantes...';
+      ps.textContent = 'Buscando o QR/codigo atual no servidor...';
       ps.className = 'connect-status';
+    }
+    try {
+      const info = window.electronAPI.serverCurrentQr
+        ? await window.electronAPI.serverCurrentQr(zapId)
+        : null;
+      if (info && info.pairingCode) {
+        showPairingCode(zapId, info.pairingCode);
+      } else if (info && info.dataUrl) {
+        showQRCode(zapId, null, info.dataUrl);
+      } else if (ps) {
+        ps.textContent = 'O servidor esta gerando o codigo/QR. Ele aparece aqui em instantes...';
+      }
+    } catch (_) {
+      if (ps) ps.textContent = 'O servidor esta gerando o codigo/QR. Ele aparece aqui em instantes...';
     }
     if (window.electronAPI.serverSyncNow) {
       try { await window.electronAPI.serverSyncNow(); } catch (e) {}
@@ -4101,8 +4115,7 @@ function renderConversations(conversations, zapId) {
     item.dataset.chatId = conv.chatId;
 
     const lastMsg = conv.lastMessage;
-    const preview = lastMsg ? (lastMsg.body || '') : '';
-    let lastMsgText = preview.substring(0, 46) || (lastMsg && lastMsg.hasMedia ? '[mídia]' : 'Nenhuma mensagem');
+    let lastMsgText = conversationPreviewText(lastMsg);
     if (lastMsg && lastMsg.fromMe) {
       lastMsgText = (lastMsg.isReply || lastMsg.origin === 'ai' ? 'IA: ' : 'Você: ') + lastMsgText;
     }
@@ -4178,6 +4191,7 @@ async function openChat(zapId, conversation, opts) {
 
   if (sameChat && !forceReload) return;
 
+  stopChatMediaPlayback();
   renderedMessageKeys = new Set();
   const container = document.getElementById('chatMessages');
   if (container) {
@@ -4221,6 +4235,440 @@ function messageAuthor(msg) {
   return '';
 }
 
+// --- Midia no historico da conversa (audio, imagem, figurinha, video) ---
+// O historico so trazia o texto "[midia]". Agora cada mensagem de midia vira um
+// card: audio com play + linha de progresso e imagem/figurinha aparecendo.
+const chatMediaCache = new Map();   // chave da mensagem -> Promise<{ url, mimetype }>
+const chatMediaBlobs = [];          // blob: URLs criadas (para revogar)
+const chatAudioPlayers = new Set(); // <audio> ativos (pausados ao trocar de conversa)
+let chatMediaObserver = null;
+
+function base64ToBytes(b64) {
+  const bin = atob(String(b64 || ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function sniffMediaBytes(bytes) {
+  if (!bytes || bytes.length < 12) return '';
+  const b = bytes;
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+  if (b[0] === 0x4f && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return 'audio/ogg';
+  if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return 'video/mp4';
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+  return '';
+}
+
+function normalizeChatMediaMime(mime, type, bytes) {
+  const clean = String(mime || '').split(';')[0].trim().toLowerCase();
+  const sniffed = sniffMediaBytes(bytes);
+  if (clean && clean !== 'application/octet-stream') {
+    // O tipo "de verdade" manda: se o mime veio trocado (audio x imagem),
+    // o navegador nao conseguiria exibir o conteudo.
+    if (sniffed && sniffed.split('/')[0] !== clean.split('/')[0]) return sniffed;
+    return clean;
+  }
+  if (sniffed) return sniffed;
+  const t = String(type || '').toLowerCase();
+  if (t === 'image') return 'image/jpeg';
+  if (t === 'sticker') return 'image/webp';
+  if (t === 'video' || t === 'gif') return 'video/mp4';
+  return 'audio/ogg';
+}
+
+function formatMediaDuration(value) {
+  const total = Math.max(0, Math.round(Number(value) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+// Tipo de midia da mensagem (vazio = sem midia exibivel: texto/documento)
+function chatMediaKind(msg) {
+  if (!msg) return '';
+  const t = String(msg.type || '').toLowerCase();
+  if (t === 'ptt' || t === 'audio') return 'audio';
+  if (t === 'image') return 'image';
+  if (t === 'sticker') return 'sticker';
+  if (t === 'video' || t === 'gif') return 'video';
+  const mime = String(msg.mimetype || '').toLowerCase();
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime === 'image/webp') return 'sticker';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (!msg.hasMedia) return '';
+  const body = String(msg.body || '').trim().toUpperCase();
+  if (body === '[AUDIO]' || body === '[ÁUDIO]') return 'audio';
+  return '';
+}
+
+const CHAT_MEDIA_PLACEHOLDER_RE = /^\[(audio|áudio|midia|mídia|imagem|figurinha|sticker|vídeo|video|documento)\]$/i;
+
+function chatMessageText(msg, kind) {
+  const body = String(msg.body || '').trim();
+  if (kind && (!body || CHAT_MEDIA_PLACEHOLDER_RE.test(body))) return '';
+  if (!body) return msg.hasMedia ? '[mídia]' : '';
+  return body;
+}
+
+// Texto curto para a lista de conversas (imagem/audio/figurinha viram rotulo)
+function conversationPreviewText(msg) {
+  if (!msg) return 'Nenhuma mensagem';
+  const body = String(msg.body || '').trim();
+  const kind = chatMediaKind(msg);
+  if (kind) {
+    const label = kind === 'audio' ? 'Áudio'
+      : kind === 'image' ? 'Imagem'
+        : kind === 'sticker' ? 'Figurinha'
+          : 'Vídeo';
+    if (!body || CHAT_MEDIA_PLACEHOLDER_RE.test(body)) return label;
+    return body.substring(0, 46);
+  }
+  return body.substring(0, 46) || (msg.hasMedia ? '[mídia]' : 'Nenhuma mensagem');
+}
+
+// Baixa a midia uma unica vez por mensagem e devolve uma blob: URL local
+function fetchChatMediaUrl(msg) {
+  const key = chatMessageKey(msg);
+  if (!key) return Promise.reject(new Error('Mensagem sem identificador.'));
+  const cached = chatMediaCache.get(key);
+  if (cached) return cached;
+
+  const chatId = selectedConversation ? selectedConversation.chatId : '';
+  const promise = (async () => {
+    if (!window.electronAPI || !window.electronAPI.whatsappChatMedia) {
+      throw new Error('Versao sem suporte a midia no historico.');
+    }
+    const res = await window.electronAPI.whatsappChatMedia(
+      String(conversationZapId || ''),
+      chatId,
+      key,
+      { type: msg.type || '', mimetype: msg.mimetype || '', fromMe: !!msg.fromMe }
+    );
+    if (!res || !res.success || !res.data) {
+      throw new Error((res && res.error) || 'Nao foi possivel carregar esta midia.');
+    }
+    const bytes = base64ToBytes(res.data);
+    const mime = normalizeChatMediaMime(res.mimetype || msg.mimetype, msg.type || res.type, bytes);
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    chatMediaBlobs.push(url);
+    trimChatMediaCache();
+    return { url, mimetype: mime };
+  })();
+
+  chatMediaCache.set(key, promise);
+  promise.catch(() => { chatMediaCache.delete(key); });
+  return promise;
+}
+
+function trimChatMediaCache() {
+  if (chatMediaCache.size <= 150) return;
+  chatMediaCache.clear();
+  chatMediaBlobs.forEach((url) => { try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ } });
+  chatMediaBlobs.length = 0;
+}
+
+function stopChatMediaPlayback() {
+  chatAudioPlayers.forEach((audio) => { try { audio.pause(); } catch (_) { /* ignore */ } });
+  chatAudioPlayers.clear();
+}
+
+// Carrega a midia visual so quando o card chega perto da area visivel
+function observeChatMedia(el, load) {
+  if (typeof IntersectionObserver !== 'function') { load(); return; }
+  if (!chatMediaObserver) {
+    const root = document.getElementById('chatMessages');
+    chatMediaObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        const fn = entry.target.__chatMediaLoad;
+        try { chatMediaObserver.unobserve(entry.target); } catch (_) { /* ignore */ }
+        if (typeof fn === 'function') fn();
+      });
+    }, { root: root || null, rootMargin: '300px 0px', threshold: 0 });
+  }
+  el.__chatMediaLoad = load;
+  chatMediaObserver.observe(el);
+}
+
+const CHAT_ICON_PLAY = '<svg class="chat-audio-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.53.85l10.28-6.86a1 1 0 0 0 0-1.7L9.53 4.29A1 1 0 0 0 8 5.14z"/></svg>';
+const CHAT_ICON_PAUSE = '<svg class="chat-audio-svg" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="4.5" width="4" height="15" rx="1.2"/><rect x="14" y="4.5" width="4" height="15" rx="1.2"/></svg>';
+
+// Card de audio: play/pause, linha com ponto que anda com a reproducao
+function buildChatAudioCard(msg) {
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-audio';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'chat-audio-play';
+  btn.title = 'Reproduzir áudio';
+  btn.setAttribute('aria-label', 'Reproduzir áudio');
+  btn.innerHTML = `<span class="chat-audio-icon">${CHAT_ICON_PLAY}</span><span class="chat-audio-spinner" aria-hidden="true"></span>`;
+
+  const main = document.createElement('div');
+  main.className = 'chat-audio-main';
+
+  const track = document.createElement('div');
+  track.className = 'chat-audio-track';
+  track.tabIndex = 0;
+  track.setAttribute('role', 'slider');
+  track.setAttribute('aria-label', 'Progresso do áudio');
+  track.setAttribute('aria-valuemin', '0');
+  track.setAttribute('aria-valuemax', '100');
+  track.setAttribute('aria-valuenow', '0');
+  track.innerHTML = '<div class="chat-audio-rail"></div><div class="chat-audio-progress"></div><div class="chat-audio-dot"></div>';
+
+  const meta = document.createElement('div');
+  meta.className = 'chat-audio-meta';
+  const status = document.createElement('span');
+  status.className = 'chat-audio-status';
+  status.textContent = 'Áudio';
+  const time = document.createElement('span');
+  time.className = 'chat-audio-time';
+  time.textContent = '0:00';
+  meta.appendChild(status);
+  meta.appendChild(time);
+
+  main.appendChild(track);
+  main.appendChild(meta);
+  wrap.appendChild(btn);
+  wrap.appendChild(main);
+
+  const progress = track.querySelector('.chat-audio-progress');
+  const dot = track.querySelector('.chat-audio-dot');
+  const icon = btn.querySelector('.chat-audio-icon');
+
+  let audio = null;
+  let loading = false;
+
+  const paint = () => {
+    const duration = (audio && isFinite(audio.duration) && audio.duration > 0) ? audio.duration : 0;
+    const current = audio ? Math.min(audio.currentTime || 0, duration || (audio.currentTime || 0)) : 0;
+    const pct = duration > 0 ? Math.max(0, Math.min(100, (current / duration) * 100)) : 0;
+    progress.style.width = pct + '%';
+    dot.style.left = pct + '%';
+    track.setAttribute('aria-valuenow', String(Math.round(pct)));
+    time.textContent = duration > 0
+      ? `${formatMediaDuration(current)} / ${formatMediaDuration(duration)}`
+      : formatMediaDuration(current);
+  };
+
+  const setState = (state) => {
+    btn.classList.toggle('is-playing', state === 'playing');
+    btn.classList.toggle('is-loading', state === 'loading');
+    btn.disabled = state === 'loading';
+    icon.innerHTML = state === 'playing' ? CHAT_ICON_PAUSE : CHAT_ICON_PLAY;
+    btn.title = state === 'playing' ? 'Pausar áudio' : 'Reproduzir áudio';
+    btn.setAttribute('aria-label', btn.title);
+  };
+
+  const fail = (text) => {
+    loading = false;
+    if (audio) {
+      try { audio.pause(); } catch (_) { /* ignore */ }
+      chatAudioPlayers.delete(audio);
+      audio = null;
+    }
+    setState('idle');
+    wrap.classList.add('chat-audio-error');
+    status.textContent = text || 'Áudio indisponível';
+    btn.title = 'Tentar carregar o áudio novamente';
+    btn.setAttribute('aria-label', btn.title);
+  };
+
+  const ensureAudio = async () => {
+    if (audio) return audio;
+    loading = true;
+    setState('loading');
+    status.textContent = 'Carregando áudio...';
+    try {
+      const { url } = await fetchChatMediaUrl(msg);
+      const el = new Audio(url);
+      el.preload = 'metadata';
+      el.addEventListener('timeupdate', paint);
+      el.addEventListener('loadedmetadata', () => {
+        status.textContent = 'Áudio';
+        paint();
+      });
+      el.addEventListener('play', () => setState('playing'));
+      el.addEventListener('pause', () => setState('idle'));
+      el.addEventListener('ended', () => { setState('idle'); paint(); });
+      el.addEventListener('error', () => fail('Áudio indisponível'));
+      chatAudioPlayers.add(el);
+      audio = el;
+      loading = false;
+      wrap.classList.remove('chat-audio-error');
+      setState('idle');
+      status.textContent = 'Áudio';
+      return audio;
+    } catch (e) {
+      fail('Áudio indisponível');
+      return null;
+    }
+  };
+
+  btn.addEventListener('click', async () => {
+    if (loading) return;
+    const el = await ensureAudio();
+    if (!el) return;
+    try {
+      if (el.paused) {
+        if (el.ended || (isFinite(el.duration) && el.duration > 0 && el.currentTime >= el.duration - 0.05)) {
+          el.currentTime = 0;
+        }
+        await el.play();
+      } else {
+        el.pause();
+      }
+    } catch (_) {
+      status.textContent = 'Não foi possível reproduzir';
+    }
+  });
+
+  const seekTo = (clientX) => {
+    if (!audio || !isFinite(audio.duration) || audio.duration <= 0) return;
+    const rect = track.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+    audio.currentTime = ratio * audio.duration;
+    paint();
+  };
+
+  let dragging = false;
+  track.addEventListener('pointerdown', (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    if (!audio) { btn.click(); return; }
+    dragging = true;
+    try { track.setPointerCapture(event.pointerId); } catch (_) { /* ignore */ }
+    seekTo(event.clientX);
+  });
+  track.addEventListener('pointermove', (event) => { if (dragging) seekTo(event.clientX); });
+  track.addEventListener('pointerup', (event) => {
+    dragging = false;
+    try { track.releasePointerCapture(event.pointerId); } catch (_) { /* ignore */ }
+  });
+  track.addEventListener('pointercancel', () => { dragging = false; });
+  track.addEventListener('keydown', (event) => {
+    if (!audio) return;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+      const delta = event.key === 'ArrowRight' ? 5 : -5;
+      const duration = isFinite(audio.duration) ? audio.duration : 0;
+      audio.currentTime = Math.max(0, Math.min(duration || 0, (audio.currentTime || 0) + delta));
+      paint();
+      event.preventDefault();
+    } else if (event.key === ' ' || event.key === 'Enter') {
+      btn.click();
+      event.preventDefault();
+    }
+  });
+
+  return wrap;
+}
+
+// Imagem, figurinha e video aparecem no proprio historico
+function buildChatVisualMedia(msg, kind) {
+  const wrap = document.createElement('div');
+  wrap.className = `chat-media chat-media-${kind} is-loading`;
+
+  const skel = document.createElement('div');
+  skel.className = 'chat-media-skel';
+  wrap.appendChild(skel);
+
+  let el = null;
+  const showError = (text) => {
+    loadingDone();
+    if (el && el.parentNode) el.remove();
+    wrap.classList.add('is-error');
+    const err = document.createElement('span');
+    err.className = 'chat-media-error';
+    err.textContent = text;
+    wrap.appendChild(err);
+  };
+  const loadingDone = () => {
+    wrap.classList.remove('is-loading');
+    if (skel.parentNode) skel.remove();
+  };
+
+  const load = async () => {
+    try {
+      const { url } = await fetchChatMediaUrl(msg);
+      if (kind === 'video') {
+        const video = document.createElement('video');
+        video.className = 'chat-media-video';
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = 'metadata';
+        video.addEventListener('loadeddata', loadingDone);
+        video.addEventListener('error', () => showError('Vídeo indisponível'));
+        video.src = url;
+        el = video;
+        wrap.appendChild(video);
+      } else {
+        const img = document.createElement('img');
+        img.className = kind === 'sticker' ? 'chat-sticker-img' : 'chat-media-img';
+        img.alt = kind === 'sticker' ? 'Figurinha' : 'Imagem';
+        img.decoding = 'async';
+        img.addEventListener('load', loadingDone);
+        img.addEventListener('error', () => showError(kind === 'sticker' ? 'Figurinha indisponível' : 'Imagem indisponível'));
+        img.src = url;
+        el = img;
+        wrap.appendChild(img);
+      }
+    } catch (e) {
+      showError(kind === 'sticker' ? 'Figurinha indisponível' : (kind === 'video' ? 'Vídeo indisponível' : 'Imagem indisponível'));
+    }
+  };
+
+  observeChatMedia(wrap, load);
+  return wrap;
+}
+
+function buildChatMediaEl(msg, kind) {
+  if (kind === 'audio') return buildChatAudioCard(msg);
+  return buildChatVisualMedia(msg, kind);
+}
+
+// Monta a bolha inteira (autor, midia, texto e hora)
+function buildChatMessageEl(msg) {
+  const div = document.createElement('div');
+  const kind = chatMediaKind(msg);
+  const key = chatMessageKey(msg);
+  div.className = `chat-message ${messageClass(msg)}`;
+  if (kind === 'sticker') div.classList.add('chat-message-sticker');
+  if (key) div.dataset.msgId = key;
+
+  const author = messageAuthor(msg);
+  if (author) {
+    const authorEl = document.createElement('div');
+    authorEl.className = 'chat-message-author';
+    authorEl.textContent = author;
+    div.appendChild(authorEl);
+  }
+
+  if (kind) div.appendChild(buildChatMediaEl(msg, kind));
+
+  const text = chatMessageText(msg, kind);
+  if (text) {
+    const textEl = document.createElement('div');
+    textEl.className = 'chat-message-text';
+    textEl.textContent = text;
+    div.appendChild(textEl);
+  }
+
+  const timeEl = document.createElement('div');
+  timeEl.className = 'chat-message-time';
+  timeEl.textContent = formatTime(msg.timestamp);
+  div.appendChild(timeEl);
+
+  return div;
+}
+
 function appendChatMessage(msg, opts) {
   const container = document.getElementById('chatMessages');
   if (!container) return;
@@ -4232,25 +4680,14 @@ function appendChatMessage(msg, opts) {
   if (key && renderedMessageKeys.has(key)) return;
   if (key) renderedMessageKeys.add(key);
 
-  const div = document.createElement('div');
-  div.className = `chat-message ${messageClass(msg)}`;
-  if (key) div.dataset.msgId = key;
-
-  const author = messageAuthor(msg);
-  const body = msg.body || (msg.hasMedia ? '[mídia]' : '');
-
-  div.innerHTML = `
-    ${author ? `<div class="chat-message-author">${escapeHtml(author)}</div>` : ''}
-    <div class="chat-message-text">${escapeHtml(body)}</div>
-    <div class="chat-message-time">${escapeHtml(formatTime(msg.timestamp))}</div>
-  `;
+  const el = buildChatMessageEl(msg);
 
   if (opts && opts.beforeTyping) {
     const typing = container.querySelector('.typing-indicator');
-    if (typing) container.insertBefore(div, typing);
-    else container.appendChild(div);
+    if (typing) container.insertBefore(el, typing);
+    else container.appendChild(el);
   } else {
-    container.appendChild(div);
+    container.appendChild(el);
   }
 
   container.scrollTop = container.scrollHeight;
@@ -4260,6 +4697,11 @@ function renderChatMessages(messages) {
   const container = document.getElementById('chatMessages');
   if (!container) return;
 
+  stopChatMediaPlayback();
+  if (chatMediaObserver) {
+    try { chatMediaObserver.disconnect(); } catch (_) { /* ignore */ }
+    chatMediaObserver = null;
+  }
   renderedMessageKeys = new Set();
 
   if (!messages || messages.length === 0) {
@@ -4281,17 +4723,7 @@ function renderChatMessages(messages) {
   ordered.forEach(msg => {
     const key = chatMessageKey(msg);
     if (key) renderedMessageKeys.add(key);
-    const div = document.createElement('div');
-    div.className = `chat-message ${messageClass(msg)}`;
-    if (key) div.dataset.msgId = key;
-    const author = messageAuthor(msg);
-    const body = msg.body || (msg.hasMedia ? '[mídia]' : '');
-    div.innerHTML = `
-      ${author ? `<div class="chat-message-author">${escapeHtml(author)}</div>` : ''}
-      <div class="chat-message-text">${escapeHtml(body)}</div>
-      <div class="chat-message-time">${escapeHtml(formatTime(msg.timestamp))}</div>
-    `;
-    frag.appendChild(div);
+    frag.appendChild(buildChatMessageEl(msg));
   });
   container.appendChild(frag);
   container.scrollTop = container.scrollHeight;
@@ -4311,6 +4743,11 @@ function clearChat() {
     `;
   }
   renderedMessageKeys = new Set();
+  stopChatMediaPlayback();
+  if (chatMediaObserver) {
+    try { chatMediaObserver.disconnect(); } catch (_) { /* ignore */ }
+    chatMediaObserver = null;
+  }
   const inputArea = document.getElementById('chatInputArea');
   if (inputArea) inputArea.style.display = 'none';
   const avatar = document.getElementById('chatAvatar');
@@ -4405,6 +4842,8 @@ function handleIncomingMessage(data) {
       isReply: isAi,
       origin: data.origin,
       hasMedia: data.hasMedia,
+      type: data.type,
+      mimetype: data.mimetype,
       timestamp: data.timestamp || (Date.now() / 1000)
     };
     appendChatMessage(msg, { beforeTyping: true });
@@ -6106,20 +6545,20 @@ function updateServerOverviewDom(o) {
   const running = !!o.running;
   const cls = !running || o.level === 'bad' ? 'bad' : (o.level === 'warn' ? 'warn' : 'ok');
 
+  const statusText = !running
+    ? 'Não funcionando'
+    : (o.level === 'ok' ? 'Funcionando' : 'Funcionando com erros');
+
   const dot = document.getElementById('serverStatusDot');
   if (dot) {
     dot.className = `panel-status-dot server-status-dot ${cls}`;
-    dot.title = o.label || 'Status do servidor';
+    dot.title = o.label || statusText;
   }
 
   const pill = document.getElementById('serverStatusPill');
-  if (pill) pill.title = o.hint || o.label || 'Status do servidor';
-
-  const label = document.getElementById('serverStatusLabel');
-  if (label) {
-    label.textContent = !running
-      ? 'Não funcionando'
-      : (o.level === 'ok' ? 'Funcionando' : 'Funcionando com erros');
+  if (pill) {
+    pill.title = o.hint || o.label || statusText;
+    pill.dataset.status = statusText;
   }
 
   const btn = document.getElementById('serverPowerBtn');

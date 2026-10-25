@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   whatsappConversations: (zapId) => ipcRenderer.invoke('whatsapp-conversations', zapId),
   whatsappMessages: (zapId, chatId) => ipcRenderer.invoke('whatsapp-messages', zapId, chatId),
   whatsappChatHistory: (zapId, chatId, limit) => ipcRenderer.invoke('whatsapp-chat-history', zapId, chatId, limit),
+  whatsappChatMedia: (zapId, chatId, msgId, hint) => ipcRenderer.invoke('whatsapp-chat-media', zapId, chatId, msgId, hint),
   whatsappSetActiveChat: (zapId, chatId) => ipcRenderer.send('whatsapp-set-active-chat', zapId, chatId),
   pickZapIcon: () => ipcRenderer.invoke('pick-zap-icon'),
 
@@ -37,6 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   serverDeleteZapSession: (zapId) => ipcRenderer.invoke('server-delete-zap-session', zapId),
   serverStatus: () => ipcRenderer.invoke('server-status'),
   serverPairingCodes: () => ipcRenderer.invoke('server-pairing-codes'),
+  serverCurrentQr: (zapId) => ipcRenderer.invoke('server-current-qr', zapId),
 
   // Conexao do Setup ao servidor 24h (repositorio de dados)
   serverConfigGet: () => ipcRenderer.invoke('server-config-get'),

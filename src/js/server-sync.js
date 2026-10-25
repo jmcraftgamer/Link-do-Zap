@@ -565,6 +565,12 @@ class ServerSync {
     } catch (_) { return null; }
   }
 
+  // QR atual publicado pelo servidor (usado ao abrir a tela de conexao)
+  async getQrDataUrl(zapId) {
+    if (!this.enabled) return null;
+    return this._showPngDataUrl(`qr-${String(zapId)}.png`);
+  }
+
   async _emitChanges() {
     // Codigos de pareamento novos/alterados
     try {
