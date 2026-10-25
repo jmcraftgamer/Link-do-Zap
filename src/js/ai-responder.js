@@ -647,7 +647,7 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
         ]
       }],
       generationConfig: {
-        maxOutputTokens: 1024,
+        maxOutputTokens: 4096,
         temperature: 0
       }
     };

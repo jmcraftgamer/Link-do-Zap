@@ -13,6 +13,8 @@ class WhatsAppManager {
     this.onMessageCallback = null;
     // Zaps em reconexao forcada (pagina morta durante envio)
     this._reconnecting = new Set();
+    // Fila por chat para garantir ordem de chegada (evita audio lento processar depois de texto rapido)
+    this._chatQueues = new Map();
     // LINK_DATA_DIR tem prioridade (servidor Linux); senao Electron userData
     let baseDir;
     if (process.env.LINK_DATA_DIR) {
@@ -487,8 +489,19 @@ class WhatsAppManager {
         }
       }
 
-      // Processa a mensagem (popula conversas para a UI + chama IA se for nova)
-      await this.handleMessage(zapId, msg);
+      // Fila por chat: garante ordem de chegada (evita audio lento processar depois de texto rapido)
+      // usa msg.from pois e 1:1 (grupo/canal ja foi filtrado acima)
+      const chatJid = msg.from || '';
+      const queueKey = `${zapId}|${chatJid}`;
+      const prev = this._chatQueues.get(queueKey) || Promise.resolve();
+      const run = prev
+        .catch(() => {})
+        .then(() => this.handleMessage(zapId, msg))
+        .catch(e => console.error(`[WHATSAPP] Erro em handleMessage (zap ${zapId}):`, e));
+      this._chatQueues.set(queueKey, run);
+      run.then(() => {
+        if (this._chatQueues.get(queueKey) === run) this._chatQueues.delete(queueKey);
+      });
     });
 
     // ============================================================
@@ -800,6 +813,9 @@ class WhatsAppManager {
         timestamp: msg.timestamp,
         fromMe: msg.fromMe,
         selfChat: isSelfChat,
+        hasMedia: !!msg.hasMedia,
+        type: msg.type || '',
+        mimetype: rawMime || '',
         audio: audioInfo,
         audioFailed: audioFailed,
         contact: {
@@ -1213,12 +1229,19 @@ class WhatsAppManager {
     return { buffer: null, errors };
   }
 
-  // Baixa a midia de um audio. O downloadMedia do wwebjs chama evaluate e pode
-  // ficar esperando um mediaStage FETCHING que nunca resolve. Por isso a busca
-  // na pagina nao faz download nenhum: so revela os metadados. Depois o host
-  // baixa a CDN e descriptografa; se isso falhar, tenta o DownloadManager da
-  // pagina com AbortController e timeout curto.
-  async _downloadAudio(zapId, msg, rawMime) {
+  // Baixa a midia de uma mensagem (audio, imagem, figurinha, video, documento).
+  // O downloadMedia do wwebjs chama evaluate e pode ficar esperando um
+  // mediaStage FETCHING que nunca resolve. Por isso a busca na pagina nao faz
+  // download nenhum: so revela os metadados. Depois o host baixa a CDN e
+  // descriptografa; se isso falhar, tenta o DownloadManager da pagina com
+  // AbortController e timeout curto.
+  // `kind`: audio | image | sticker | video | document (define os mimetypes
+  // tentados no download direto). `opts.silent` evita log de sucesso quando o
+  // download vem da UI (historico), que pode baixar varias midias de uma vez.
+  async _downloadMedia(zapId, msg, rawMime, kind, opts) {
+    const mediaKind = kind || 'audio';
+    const silent = !!(opts && opts.silent);
+    const label = (opts && opts.label) || 'Midia';
     const clientData = this.clients.get(zapId);
     const page = clientData && clientData.client ? clientData.client.pupPage : null;
     if (!page) return null;
@@ -1398,10 +1421,13 @@ class WhatsAppManager {
         if (fetched.buffer) {
           try {
             const decrypted = decryptWhatsAppMedia(fetched.buffer, meta.mediaKey, meta.type);
-            this.logToApp(zapId, 'success', `Audio baixado pela CDN e descriptografado (${decrypted.length} bytes). Sera transcrito pela IA.`);
+            const sniffed = this._sniffMediaMime(decrypted);
+            if (!silent) {
+              this.logToApp(zapId, 'success', `${label} baixada pela CDN e descriptografada (${decrypted.length} bytes).`);
+            }
             return {
               data: decrypted.toString('base64'),
-              mimetype,
+              mimetype: sniffed || mimetype,
               size: decrypted.length,
             };
           } catch (e) {
@@ -1416,7 +1442,7 @@ class WhatsAppManager {
           }
         } else {
           const errTxt = fetched.errors.join(' | ').slice(0, 800);
-          this.logToApp(zapId, 'warning', `CDN do audio falhou: ${errTxt}`);
+          this.logToApp(zapId, 'warning', `CDN da midia falhou: ${errTxt}`);
           diag = {
             ...meta,
             ok: false,
@@ -1467,18 +1493,42 @@ class WhatsAppManager {
 
           const raw = String(m.mimetype || p.mimetype || '').trim();
           const base = raw.split(';')[0].trim();
+          const kind = String(p.kind || 'audio');
           const mimes = [];
           const addMime = (v) => { if (v && mimes.indexOf(v) === -1) mimes.push(v); };
           addMime(raw);
           addMime(base);
-          addMime('audio/ogg');
-          addMime('audio/mp4');
-          addMime('audio/aac');
+          if (kind === 'image') {
+            addMime('image/jpeg');
+            addMime('image/png');
+            addMime('image/webp');
+          } else if (kind === 'sticker') {
+            addMime('image/webp');
+          } else if (kind === 'video') {
+            addMime('video/mp4');
+            addMime('video/3gpp');
+          } else if (kind === 'document') {
+            addMime('application/octet-stream');
+          } else {
+            addMime('audio/ogg');
+            addMime('audio/mp4');
+            addMime('audio/aac');
+          }
           const types = [];
           const addType = (v) => { if (v && types.indexOf(v) === -1) types.push(v); };
           addType(m.type || p.type);
-          addType('audio');
-          addType('ptt');
+          if (kind === 'audio') {
+            addType('audio');
+            addType('ptt');
+          } else if (kind === 'image') {
+            addType('image');
+          } else if (kind === 'sticker') {
+            addType('sticker');
+          } else if (kind === 'video') {
+            addType('video');
+          } else if (kind === 'document') {
+            addType('document');
+          }
 
           const pairs = [];
           for (const mime of mimes) {
@@ -1486,7 +1536,7 @@ class WhatsAppManager {
           }
 
           const tried = [];
-          for (let i = 0; i < pairs.length && i < 4; i++) {
+          for (let i = 0; i < pairs.length && i < 6; i++) {
             const { mime, typ } = pairs[i];
             const ac = new AbortController();
             const timer = setTimeout(() => ac.abort(), 10000);
@@ -1536,11 +1586,14 @@ class WhatsAppManager {
         key: meta.key || keyParts.serialized,
         mimetype,
         type: meta.type,
+        kind: mediaKind,
       });
 
       if (direct && direct.ok) {
         const viaTxt = direct.via ? ` via ${direct.via}` : '';
-        this.logToApp(zapId, 'success', `Audio baixado (${direct.size || 0} bytes${viaTxt}). Sera transcrito pela IA.`);
+        if (!silent) {
+          this.logToApp(zapId, 'success', `${label} baixada (${direct.size || 0} bytes${viaTxt}).`);
+        }
         return {
           data: direct.data,
           mimetype: direct.mimetype || mimetype,
@@ -1563,9 +1616,129 @@ class WhatsAppManager {
     const dErr = diag ? diag.error : 'sem detalhe';
     const dStage = diag && diag.stage ? ` stage=${diag.stage}` : '';
     const dDet = diag && diag.detail ? ` | ${diag.detail}` : '';
-    console.error(`[AUDIO] Diagnostico: passo=${dStep} erro=${dErr}${dStage}`);
-    this.logToApp(zapId, 'warning', `Diagnostico download: passo=${dStep} erro=${dErr}${dStage}${dDet}`);
+    console.error(`[MIDIA] Diagnostico: passo=${dStep} erro=${dErr}${dStage}`);
+    if (!silent) {
+      this.logToApp(zapId, 'warning', `Diagnostico download: passo=${dStep} erro=${dErr}${dStage}${dDet}`);
+    }
     return null;
+  }
+
+  // Compatibilidade: audio continua sendo o caso padrao (transcricao pela IA).
+  _downloadAudio(zapId, msg, rawMime) {
+    return this._downloadMedia(zapId, msg, rawMime, 'audio', { label: 'Audio' });
+  }
+
+  // Tipo de midia a partir do `type` do WhatsApp e/ou do mimetype.
+  _mediaKindFor(type, mimetype) {
+    const t = String(type || '').toLowerCase();
+    if (t === 'ptt' || t === 'audio') return 'audio';
+    if (t === 'image') return 'image';
+    if (t === 'sticker') return 'sticker';
+    if (t === 'video' || t === 'gif') return 'video';
+    if (t === 'document') return 'document';
+    const mime = String(mimetype || '').toLowerCase();
+    if (mime.startsWith('audio/')) return 'audio';
+    if (mime.startsWith('image/webp')) return 'sticker';
+    if (mime.startsWith('image/')) return 'image';
+    if (mime.startsWith('video/')) return 'video';
+    if (mime) return 'document';
+    return 'audio';
+  }
+
+  _defaultMimeFor(kind) {
+    switch (String(kind || '')) {
+      case 'image': return 'image/jpeg';
+      case 'sticker': return 'image/webp';
+      case 'video': return 'video/mp4';
+      case 'document': return 'application/octet-stream';
+      default: return 'audio/ogg';
+    }
+  }
+
+  // Descobre o mimetype pelos bytes (o WhatsApp nem sempre manda o mimetype e
+  // mensagens antigas chegam sem `type`, entao o sniff evita <img>/<audio> quebrado).
+  _sniffMediaMime(buf) {
+    try {
+      if (!buf || !buf.length) return '';
+      const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+      if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+      if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+      if (b.length > 12 && b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WEBP') return 'image/webp';
+      if (b.length > 4 && b.slice(0, 4).toString() === 'OggS') return 'audio/ogg';
+      if (b.length > 8 && b.slice(4, 8).toString() === 'ftyp') return 'video/mp4';
+      if (b.length > 4 && b.slice(0, 4).toString() === 'GIF8') return 'image/gif';
+      if (b.length > 5 && b.slice(0, 5).toString() === '%PDF-') return 'application/pdf';
+    } catch (_) { /* sem sniff */ }
+    return '';
+  }
+
+  // Guarda a midia ja baixada para nao baixar de novo ao reabrir o historico.
+  _cacheMedia(key, entry) {
+    if (!this._mediaCache) {
+      this._mediaCache = new Map();
+      this._mediaCacheBytes = 0;
+    }
+    const size = Number(entry.size) || Math.ceil(String(entry.data || '').length * 0.75);
+    if (size > 6 * 1024 * 1024) return; // grande demais para manter em memoria
+    const prev = this._mediaCache.get(key);
+    if (prev) this._mediaCacheBytes -= Number(prev.size) || 0;
+    this._mediaCache.set(key, { ...entry, size });
+    this._mediaCacheBytes += size;
+    while (this._mediaCache.size > 40 || this._mediaCacheBytes > 64 * 1024 * 1024) {
+      const oldest = this._mediaCache.keys().next();
+      if (oldest.done || this._mediaCache.size <= 1) break;
+      const old = this._mediaCache.get(oldest.value);
+      if (old) this._mediaCacheBytes -= Number(old.size) || 0;
+      this._mediaCache.delete(oldest.value);
+    }
+  }
+
+  // Midia de UMA mensagem do historico para a UI (audio para tocar, imagem e
+  // figurinha para aparecer na conversa). Baixa na hora do primeiro uso.
+  async fetchMessageMedia(zapId, chatId, msgId, hint) {
+    const zid = String(zapId);
+    const h = hint || {};
+    const serialized = String(msgId || '');
+    if (!serialized) return { success: false, error: 'Mensagem sem identificador.' };
+
+    const cd = this.clients.get(zid);
+    if (!cd || !cd.client || !cd.client.pupPage) {
+      return { success: false, error: 'WhatsApp desconectado: conecte o Zap para carregar a midia.' };
+    }
+
+    if (!this._mediaCache) { this._mediaCache = new Map(); this._mediaCacheBytes = 0; }
+    const cacheKey = `${zid}|${serialized}`;
+    const cached = this._mediaCache.get(cacheKey);
+    if (cached) return { success: true, data: cached.data, mimetype: cached.mimetype, size: cached.size, type: cached.type, cached: true };
+
+    // A chave do WhatsApp e fromMe_remote_id (remote pode ter @c.us/@lid).
+    const parts = serialized.split('_');
+    const hasParts = parts.length >= 3;
+    const idPart = hasParts ? parts[parts.length - 1] : serialized;
+    const fromMe = hasParts ? parts[0] === 'true' : !!h.fromMe;
+    const remote = hasParts ? parts.slice(1, -1).join('_').replace(/:\d+@/, '@') : '';
+    const chat = String(chatId || remote || '');
+
+    const kind = this._mediaKindFor(h.type, h.mimetype);
+    const synthetic = {
+      id: { _serialized: serialized, id: idPart, fromMe, remote: remote || chat },
+      fromMe,
+      from: chat,
+      to: chat,
+      type: h.type || '',
+    };
+
+    const res = await this._downloadMedia(zid, synthetic, h.mimetype || '', kind, {
+      silent: true,
+      label: 'Midia',
+    });
+    if (!res || !res.data) {
+      return { success: false, error: 'Nao foi possivel baixar esta midia do WhatsApp.' };
+    }
+    const mimetype = res.mimetype || this._defaultMimeFor(kind);
+    const entry = { data: res.data, mimetype, size: res.size || 0, type: h.type || kind };
+    this._cacheMedia(cacheKey, entry);
+    return { success: true, ...entry };
   }
 
   _errText(e) {
@@ -1875,7 +2048,7 @@ class WhatsAppManager {
         d2.aiSentIds.add(sid);
       }
       this.logToApp(zapId, 'success', `Midia enviada para ${targetId}: ${mediaData.name}`);
-      this._recordOutgoing(zapId, targetId, mediaData.name || '[mídia]', source, sentMsg, { hasMedia: true });
+      this._recordOutgoing(zapId, targetId, mediaData.name || '[mídia]', source, sentMsg, { hasMedia: true, mimetype: mediaData.mimeType || '' });
       return mediaData.returnId ? { success: true, msgId: sid || null } : { success: true };
     } catch (e) {
       console.error(`[WHATSAPP] Erro ao enviar midia:`, e);
@@ -1894,7 +2067,7 @@ class WhatsAppManager {
       if (lastMsg) {
         await lastMsg.reply(media);
         this.logToApp(zapId, 'success', `Midia enviada via reply para ${targetId}: ${mediaData.name}`);
-        this._recordOutgoing(zapId, targetId, mediaData.name || '[mídia]', source, null, { hasMedia: true });
+        this._recordOutgoing(zapId, targetId, mediaData.name || '[mídia]', source, null, { hasMedia: true, mimetype: mediaData.mimeType || '' });
         return mediaData.returnId ? { success: true, msgId: null } : { success: true };
       }
       this.logToApp(zapId, 'error', `Falha ao enviar midia: ${e.message}`);
@@ -2336,6 +2509,10 @@ class WhatsAppManager {
       const { conv, chatId } = this._ensureConversation(zapId, (e.chatId || target), e);
       const number = this._normNum(target) || (conv.contact && conv.contact.number) || '';
       const id = (sentMsg && this._ensureMsgKey(sentMsg)) || `out-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const mediaMime = String(e.mimetype || '').toLowerCase();
+      const mediaType = e.type || (mediaMime.startsWith('image/') ? 'image'
+        : mediaMime.startsWith('audio/') ? 'audio'
+          : mediaMime.startsWith('video/') ? 'video' : '');
       const msg = {
         zapId,
         id,
@@ -2347,6 +2524,8 @@ class WhatsAppManager {
         isReply: source === 'ai',
         origin: source,
         hasMedia: !!e.hasMedia,
+        type: mediaType,
+        mimetype: e.mimetype || '',
         contact: {
           id: `${number}@s.whatsapp.net`,
           name: conv.contact.name,
@@ -2405,6 +2584,8 @@ class WhatsAppManager {
               fromMe: !!m.fromMe,
               timestamp: m.timestamp || 0,
               hasMedia: !!m.hasMedia,
+              type: m.type || '',
+              mimetype: (m.mimetype || (m._data && m._data.mimetype) || ''),
               origin: undefined
             }));
           break;
@@ -2426,6 +2607,8 @@ class WhatsAppManager {
         existing.origin = m.origin;
         existing.isReply = m.isReply;
         if (!existing.body && m.body) existing.body = m.body;
+        if (!existing.type && m.type) existing.type = m.type;
+        if (!existing.mimetype && m.mimetype) existing.mimetype = m.mimetype;
       } else if (m.id) {
         byId.set(m.id, m);
       } else {
