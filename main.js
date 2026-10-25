@@ -1371,7 +1371,6 @@ function startConnectionWatchdog(intervalMs = 60000) {
   if (!isHeadless() || !whatsappManager) return null;
   const attempts = new Map();
   const inFlight = new Set();
-  const qrRefresh = new Map();
   const BUSY = ['ready', 'connecting', 'initializing', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated'];
   const autoPair = ['1', 'true', 'yes'].includes(String(process.env.LINK_AUTO_PAIR || '').toLowerCase());
 
@@ -1384,31 +1383,12 @@ function startConnectionWatchdog(intervalMs = 60000) {
         if (inFlight.has(id)) continue;
         const st = (whatsappManager.getStatus(id) || { status: 'disconnected' });
 
-        // QR do WhatsApp expira em ~20s. Se ninguem escaneou, renova a pagina
-        // a cada 2 min para o painel nunca exibir um QR vencido.
-        if (st.status === 'waiting_qr') {
-          const last = qrRefresh.get(id) || 0;
-          if (Date.now() - last < 120000) continue;
-          qrRefresh.set(id, Date.now());
-          inFlight.add(id);
-          console.log(`[WATCHDOG] Renovando QR do zap ${id}...`);
-          try {
-            await whatsappManager.disconnectZap(id, 'renovando QR');
-            await whatsappManager.connectZap(id, '', 'qrcode');
-          } catch (e) {
-            console.error(`[WATCHDOG] Falha ao renovar QR do zap ${id}: ${e.message}`);
-          } finally {
-            inFlight.delete(id);
-          }
-          continue;
-        }
-        if (st.status === 'waiting_pairing' || st.status === 'pairing_accepted' || st.status === 'authenticated') {
-          continue;
-        }
-
+        // O proprio WhatsApp Web renova o QR a cada ~20s (evento 'qr').
+        // Nao desconecte aqui: reconectar no meio da navegacao derrubava o
+        // contexto do Chromium e impedia o QR de ser publicado.
         if (BUSY.includes(st.status)) {
           // Conectou: zera o backoff para uma proxima queda ser tratada rapido.
-          if (st.status === 'ready') { attempts.delete(id); qrRefresh.delete(id); }
+          if (st.status === 'ready') attempts.delete(id);
           continue;
         }
         const sessionDir = path.join(getDataDir(), 'sessions', id);
