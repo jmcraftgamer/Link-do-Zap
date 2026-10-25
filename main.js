@@ -1315,10 +1315,10 @@ function autoConnectSavedSessions(staggerMs = 2000) {
               if (st && st.status === 'waiting_qr') {
                 const phone = String(z.phone || '').replace(/\D/g, '');
                 if (phone) {
-                  console.log(`[AUTO-PAIR] Sessao salva do zap ${zapId} expirou (caiu em QR). Limpando sessao e gerando codigo de pareamento...`);
+                  console.log(`[AUTO-PAIR] Sessao salva do zap ${zapId} expirou (caiu em QR). Limpando sessao e gerando QR novo...`);
                   try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}
-                  whatsappManager.connectZap(zapId, phone, 'pairing')
-                    .catch((err) => console.error(`[AUTO-PAIR] Falha no pareamento do zap ${zapId}: ${err.message}`));
+                  whatsappManager.connectZap(zapId, '', 'qrcode')
+                    .catch((err) => console.error(`[AUTO-PAIR] Falha ao gerar QR do zap ${zapId}: ${err.message}`));
                 }
               }
             }, 45000);
@@ -1332,10 +1332,10 @@ function autoConnectSavedSessions(staggerMs = 2000) {
   return count;
 }
 
-// Pareamento automatico no boot (GitHub Actions / servidor): com
+// Conexao automatica no boot (GitHub Actions / servidor): com
 // LINK_AUTO_PAIR=1, zaps SEM sessao salva e com telefone no zaps.json
-// recebem connectZap(pairing) sem interface grafica. O codigo e gravado em
-// $LINK_CODE_FILE pelo whatsapp-manager e o monitor envia ao repo de dados.
+// recebem connectZap(qrcode). O QR e renovado pelo proprio WhatsApp Web a
+// cada ~20s e publicado no repo de dados; o painel exibe o QR atual.
 function autoPairMissingSessions() {
   try {
     const flag = String(process.env.LINK_AUTO_PAIR || '').toLowerCase();
@@ -1351,12 +1351,12 @@ function autoPairMissingSessions() {
     if (fs.existsSync(sessionDir)) return;
     count++;
     setTimeout(() => {
-      console.log(`[AUTO-PAIR] Zap ${zapId} sem sessao salva - gerando codigo de pareamento...`);
-      Promise.resolve(whatsappManager.connectZap(zapId, phone, 'pairing'))
-        .catch((e) => console.error(`[AUTO-PAIR] Falha no pareamento do zap ${zapId}: ${e.message}`));
+      console.log(`[AUTO-PAIR] Zap ${zapId} sem sessao salva - gerando QR...`);
+      Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
+        .catch((e) => console.error(`[AUTO-PAIR] Falha ao gerar QR do zap ${zapId}: ${e.message}`));
     }, 5000 + i * 3000);
   });
-  if (count) console.log(`[AUTO-PAIR] ${count} zap(s) aguardando pareamento (codigo em $LINK_CODE_FILE).`);
+  if (count) console.log(`[AUTO-PAIR] ${count} zap(s) aguardando leitura do QR.`);
   else console.log('[AUTO-PAIR] Nenhum zap precisa de pareamento agora.');
   return count;
 }
@@ -1405,7 +1405,7 @@ function startConnectionWatchdog(intervalMs = 60000) {
         inFlight.add(id);
         console.log(`[WATCHDOG] Zap ${id} esta ${st.status || 'desconectado'} - tentando reconectar (tentativa ${rec.n})...`);
         try {
-          await whatsappManager.connectZap(id, hasSession ? '' : phone, hasSession ? 'qrcode' : 'pairing');
+          await whatsappManager.connectZap(id, '', 'qrcode');
         } catch (e) {
           console.error(`[WATCHDOG] Falha ao reconectar zap ${id}: ${e.message}`);
         } finally {
@@ -1467,9 +1467,9 @@ function startServerReconciler(intervalMs = 15000) {
             Promise.resolve(whatsappManager.connectZap(id, '', 'qrcode'))
               .catch((e) => console.error(`[SYNC] connectZap(${id}) falhou: ${e.message}`));
           } else if (autoPair && phone) {
-            console.log(`[SYNC] Novo zap ${id} sem sessao - gerando pareamento`);
-            Promise.resolve(whatsappManager.connectZap(id, phone, 'pairing'))
-              .catch((e) => console.error(`[SYNC] pairing(${id}) falhou: ${e.message}`));
+            console.log(`[SYNC] Novo zap ${id} sem sessao - gerando QR`);
+            Promise.resolve(whatsappManager.connectZap(id, '', 'qrcode'))
+              .catch((e) => console.error(`[SYNC] qrcode(${id}) falhou: ${e.message}`));
           }
         }
         serverKnownZaps.set(id, { enabled: z.enabled !== false });
