@@ -13,7 +13,10 @@ BACKUP_SCRIPT="$(cd "$(dirname "$0")" && pwd)/backup.sh"
 START=$(date +%s)
 GRACE=$(( MAX_MINUTES * 60 - 120 ))
 [ "$GRACE" -lt 60 ] && GRACE=60
-LAST_BACKUP=0
+LAST_QUICK=0
+LAST_FULL=0
+READY_BACKED=0
+FULL_EVERY=21600   # sessao completa a cada 6h (e sempre no fim da execucao)
 
 urgent_pairing_dirty() {
   [ -d "$DATA_DIR/.git" ] || return 1
@@ -43,7 +46,19 @@ sync_down() {
 }
 
 do_backup() {
-  DATA_DIR="$DATA_DIR" bash "$BACKUP_SCRIPT" || echo "[MON] aviso: backup falhou"
+  QUICK="${1:-0}" DATA_DIR="$DATA_DIR" bash "$BACKUP_SCRIPT" || echo "[MON] aviso: backup falhou"
+}
+
+# Quando o zap fica pronto, salva a sessao imediatamente. Sem isso um crash
+# antes do backup de 6h faria o usuario parear de novo.
+backup_if_ready() {
+  [ "$READY_BACKED" = "1" ] && return 0
+  [ -f "$DATA_DIR/bot-status.json" ] || return 0
+  if grep -q '"status": *"ready"' "$DATA_DIR/bot-status.json" 2>/dev/null; then
+    echo "[MON] Zap pronto - salvando sessao completa agora"
+    do_backup 0
+    READY_BACKED=1
+  fi
 }
 
 while true; do
@@ -52,7 +67,7 @@ while true; do
 
   if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "[MON] Container '$CONTAINER' parou inesperadamente em ${ELAPSED}s"
-    do_backup
+    do_backup 0
     docker logs "$CONTAINER" --tail 50 2>/dev/null || true
     exit 1
   fi
@@ -64,21 +79,30 @@ while true; do
   if [ -f "$DATA_DIR/STOP" ]; then
     echo "[MON] STOP encontrado - desligando o bot a pedido do painel"
     docker stop -t 90 "$CONTAINER" >/dev/null 2>&1 || true
-    do_backup
+    do_backup 0
     echo "STOPPED=true" >> "$GITHUB_ENV"
     echo "[MON] Bot desligado. Para religar, use o painel no PC."
     exit 0
   fi
 
-  if urgent_pairing_dirty || [ $(( NOW - LAST_BACKUP )) -ge 60 ]; then
-    do_backup
-    LAST_BACKUP=$NOW
+  backup_if_ready
+
+  # Status/QR/log a cada 30s (ou imediatamente se o pareamento mudou).
+  if urgent_pairing_dirty || [ $(( NOW - LAST_QUICK )) -ge 30 ]; then
+    do_backup 1
+    LAST_QUICK=$NOW
+  fi
+
+  # Sessao completa so a cada 6h (e no fim da execucao).
+  if [ $(( NOW - LAST_FULL )) -ge "$FULL_EVERY" ]; then
+    do_backup 0
+    LAST_FULL=$NOW
   fi
 
   if [ "$ELAPSED" -ge "$GRACE" ]; then
     echo "[MON] Tempo maximo (${MAX_MINUTES}min) atingido em ${ELAPSED}s - parando graceful"
     docker stop -t 90 "$CONTAINER" >/dev/null 2>&1 || true
-    do_backup
+    do_backup 0
     echo "[MON] Parada normal concluida"
     exit 0
   fi
