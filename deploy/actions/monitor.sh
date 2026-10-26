@@ -15,6 +15,7 @@ GRACE=$(( MAX_MINUTES * 60 - 120 ))
 [ "$GRACE" -lt 60 ] && GRACE=60
 LAST_QUICK=0
 LAST_FULL=$START
+LAST_SYNC=0
 READY_BACKED=0
 FULL_EVERY=21600   # sessao completa a cada 6h (e sempre no fim da execucao)
 
@@ -27,19 +28,21 @@ urgent_pairing_dirty() {
 # So toca nos arquivos de configuracao - nunca em sessoes/bot-status.
 sync_down() {
   [ -d "$DATA_DIR/.git" ] || return 0
-  timeout 30 git -C "$DATA_DIR" fetch --quiet origin main >/dev/null 2>&1 || return 0
+  # timeout -k: se o git travar no fetch de um repo grande, mata de verdade e
+  # nao deixa lock para tras. O fetch roda no maximo 1x por minuto.
+  timeout -k 5 20 git -C "$DATA_DIR" fetch --quiet origin main >/dev/null 2>&1 || return 0
   local f
   for f in zaps.json providers.json trainings.json; do
     if git -C "$DATA_DIR" cat-file -e "origin/main:$f" 2>/dev/null; then
-      git -C "$DATA_DIR" checkout origin/main -- "$f" >/dev/null 2>&1 || true
+      timeout -k 5 20 git -C "$DATA_DIR" checkout origin/main -- "$f" >/dev/null 2>&1 || true
     fi
   done
   if git -C "$DATA_DIR" cat-file -e "origin/main:trainings" 2>/dev/null; then
-    git -C "$DATA_DIR" checkout origin/main -- trainings >/dev/null 2>&1 || true
+    timeout -k 5 20 git -C "$DATA_DIR" checkout origin/main -- trainings >/dev/null 2>&1 || true
   fi
   # STOP criado/removido pelo painel do PC
   if git -C "$DATA_DIR" cat-file -e "origin/main:STOP" 2>/dev/null; then
-    git -C "$DATA_DIR" checkout origin/main -- STOP >/dev/null 2>&1 || true
+    timeout -k 5 20 git -C "$DATA_DIR" checkout origin/main -- STOP >/dev/null 2>&1 || true
   else
     rm -f "$DATA_DIR/STOP"
   fi
@@ -72,8 +75,11 @@ while true; do
     exit 1
   fi
 
-  # Aplica configs enviadas pelo painel (novo zap, auto-resposta, teclas API...)
-  sync_down
+  # Aplica configs enviadas pelo painel (no maximo 1x por minuto).
+  if [ $(( NOW - LAST_SYNC )) -ge 60 ]; then
+    sync_down
+    LAST_SYNC=$NOW
+  fi
 
   # Bot desligado pelo painel do PC (arquivo STOP no repo de dados)
   if [ -f "$DATA_DIR/STOP" ]; then
