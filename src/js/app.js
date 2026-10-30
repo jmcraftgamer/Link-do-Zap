@@ -2481,22 +2481,13 @@ async function openZapContactsModal(zapId, zapName) {
 
   document.getElementById('zapContactsModalTitle').textContent = `Contatos - ${zapName}`;
   
-  // Botão de cadeado para desativar todos os contatos
-  const titleEl = document.getElementById('zapContactsModalTitle');
-  if (titleEl) {
-    const lockBtn = document.createElement('button');
-    lockBtn.type = 'button';
-    lockBtn.title = 'Desativar todos os contatos';
-    lockBtn.style.cssText = 'background:none;border:none;cursor:pointer;vertical-align:middle;margin-right:8px;color:#e74c3c;';
-    lockBtn.innerHTML = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-    </svg>`;
-    lockBtn.onclick = () => {
+  // Evento do cadeado (botão já existe no HTML)
+  const btnLock = document.getElementById('lockAllContactsBtn');
+  if (btnLock) {
+    btnLock.onclick = () => {
       const zap = zapsData.find(z => String(z.id) === String(zapId));
       if (!zap) return;
       if (!zap.blockedContacts) zap.blockedContacts = [];
-      // Adiciona todos os contatos da lista ao blockedContacts
       const checkboxes = listContainer.querySelectorAll('.contact-auth-checkbox');
       let added = 0;
       checkboxes.forEach(cb => {
@@ -2510,7 +2501,6 @@ async function openZapContactsModal(zapId, zapName) {
       saveZaps();
       alert('Todos os contatos foram desativados (' + added + ' desativados).');
     };
-    titleEl.insertBefore(lockBtn, titleEl.firstChild);
   }
   
   modal.classList.add('active');
