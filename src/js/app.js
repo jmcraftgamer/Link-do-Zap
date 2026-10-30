@@ -2335,6 +2335,7 @@ function renderContactsPage() {
           <div class="contact-zap-name">${escapeHtml(zap.name)}</div>
           <div class="contact-zap-phone">${escapeHtml(zap.phone || '')}</div>
         </div>
+        <button class="contact-zap-lock-btn" data-zap="${zap.id}" title="Desativar todos os contatos">🔒</button>
         <span class="contact-zap-chevron">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 18 15 12 9 6"/>
@@ -2347,6 +2348,27 @@ function renderContactsPage() {
 
     item.querySelector('.contact-zap-card').addEventListener('click', () => {
       item.classList.toggle('collapsed');
+    });
+
+    item.querySelector('.contact-zap-lock-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const z = zapsData.find(x => String(x.id) === String(zap.id));
+      if (!z) return;
+      if (!z.blockedContacts) z.blockedContacts = [];
+      try {
+        const conversations = await window.electronAPI.whatsappConversations(String(zap.id));
+        const blocked = z.blockedContacts || [];
+        const contacts = (conversations || []).filter(c => c && c.contact && c.contact.id && !c.contact.id.includes('@g.us'));
+        contacts.forEach(c => {
+          if (!blocked.includes(c.contact.id)) blocked.push(c.contact.id);
+        });
+        z.blockedContacts = blocked;
+        saveZaps();
+        alert('Todos os contatos do Zap "' + zap.name + '" foram desativados!');
+        loadContactsForZap(z, item.querySelector('.contact-zap-contacts'));
+      } catch (err) {
+        alert('Erro ao desativar: ' + err.message);
+      }
     });
 
     loadContactsForZap(zap, item.querySelector('.contact-zap-contacts'));

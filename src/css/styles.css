@@ -3750,6 +3750,20 @@ input, textarea, select {
   flex-shrink: 0;
 }
 
+.contact-zap-lock-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #e74c3c;
+  padding: 4px 8px;
+  font-size: 16px;
+  line-height: 1;
+  transition: transform 0.1s;
+}
+.contact-zap-lock-btn:hover {
+  transform: scale(1.15);
+}
+
 /* Lista de contatos do Zap (aberta por padrao) */
 .contact-zap-contacts {
   display: flex;
