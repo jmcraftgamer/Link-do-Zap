@@ -108,8 +108,9 @@ function appendLogEntry(container, entry) {
   container.appendChild(div);
 }
 
-// Chaves de IA vem do ambiente (preload -> env), nunca hardcoded no repositorio
-const BOOTSTRAP_KEYS = (window.electronAPI && window.electronAPI.bootstrapKeys) || {};
+// Chaves de IA removidas do renderer. Toda chamada de IA passa pelo processo
+// principal; chaves vêm de providers.json (gerenciado pelo main) e safeStorage.
+const BOOTSTRAP_KEYS = {};
 
 // Pre-configured OpenRouter provider
 const OPENROUTER_PRECONFIGURED = {
@@ -231,7 +232,7 @@ function getZapStatusInfo(zap) {
   const map = {
     ready: { label: 'Funcionando', className: 'online', online: true },
     connecting: { label: 'Conectando...', className: 'connecting', online: false },
-    waiting_qr: { label: 'Aguardando QR', className: 'connecting', online: false },
+    waiting_qr: { label: 'Aguardando código', className: 'connecting', online: false },
     waiting_pairing: { label: 'Aguardando pareamento', className: 'connecting', online: false },
     pairing_accepted: { label: 'Sincronizando...', className: 'connecting', online: false },
     authenticated: { label: 'Autenticado', className: 'connecting', online: false },
@@ -339,9 +340,16 @@ function refreshPanelStatusUI(zapId) {
   const connectBtn = document.getElementById('zapPanelConnect');
   if (serverManaged) {
     connectBtn.disabled = false;
-    connectBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M5 12h14"/><path d="M12 5v14"/></svg> Gerenciado pelo servidor`;
-    connectBtn.className = 'zap-panel-connect-btn';
-    connectBtn.onclick = () => { openConnectModal(zap.id, zap.name, zap.phone); };
+    if (info.online) {
+      connectBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="20 6 9 17 4 12"/></svg> Conectado`;
+      connectBtn.className = 'zap-panel-connect-btn connected';
+      // Abre a tela sem pedir um codigo novo: o zap ja esta funcionando.
+      connectBtn.onclick = () => { openConnectModal(zap.id, zap.name, zap.phone, { skipPair: true }); };
+    } else {
+      connectBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M5 12h14"/><path d="M12 5v14"/></svg> Conectar`;
+      connectBtn.className = 'zap-panel-connect-btn';
+      connectBtn.onclick = () => { openConnectModal(zap.id, zap.name, zap.phone); };
+    }
     return;
   }
   if (info.online) {
@@ -358,17 +366,73 @@ function refreshPanelStatusUI(zapId) {
 // ============================================
 // Save / Load
 // ============================================
-function saveZaps() {
-  localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData));
-  if (window.electronAPI && window.electronAPI.saveZaps) {
-    window.electronAPI.saveZaps(zapsData);
-  }
+function showConfigError(message) {
+  try {
+    let el = document.getElementById('configErrorToast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'configErrorToast';
+      el.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:99999;' +
+        'background:#7f1d1d;color:#fff;padding:14px 20px;border-radius:10px;font-size:14px;' +
+        'max-width:560px;box-shadow:0 8px 24px rgba(0,0,0,.4);line-height:1.4;';
+      document.body.appendChild(el);
+    }
+    el.textContent = message;
+    el.style.display = 'block';
+    clearTimeout(showConfigError._t);
+    showConfigError._t = setTimeout(() => { el.style.display = 'none'; }, 12000);
+  } catch (_) {}
+  console.error('[CONFIG]', message);
 }
 
-function saveProviders() {
-  localStorage.setItem('linknozap_providers', JSON.stringify(providersData));
-  if (window.electronAPI && window.electronAPI.saveProviders) {
-    window.electronAPI.saveProviders(providersData);
+let saveZapsInFlight = null;
+let saveZapsQueued = false;
+
+// Salva os Zaps e AVISA quando falha. Antes a falha era silenciosa: a pessoa
+// achava que tinha salvo e o arquivo continuava o antigo.
+async function saveZaps(opts) {
+  try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
+  if (!window.electronAPI || !window.electronAPI.saveZaps) return true;
+  if (saveZapsInFlight) {
+    // Ja existe uma gravacao em andamento: agenda outra com o estado mais novo.
+    saveZapsQueued = true;
+    return saveZapsInFlight;
+  }
+  const run = (async () => {
+    try {
+      const res = await window.electronAPI.saveZaps(zapsData, opts);
+      if (res === false) {
+        showConfigError('Nao foi possivel salvar os Zaps. O zaps.json NAO foi alterado. ' +
+          'Verifique espaco em disco/antivirus e tente de novo.');
+        return false;
+      }
+      return true;
+    } catch (e) {
+      showConfigError('Falha ao salvar os Zaps: ' + (e && e.message ? e.message : e) +
+        '. O arquivo anterior foi preservado.');
+      return false;
+    } finally {
+      saveZapsInFlight = null;
+      if (saveZapsQueued) { saveZapsQueued = false; saveZaps(); }
+    }
+  })();
+  saveZapsInFlight = run;
+  return run;
+}
+
+async function saveProviders() {
+  try { localStorage.setItem('linknozap_providers', JSON.stringify(providersData)); } catch (_) {}
+  if (!window.electronAPI || !window.electronAPI.saveProviders) return true;
+  try {
+    const res = await window.electronAPI.saveProviders(providersData);
+    if (res === false) {
+      showConfigError('Nao foi possivel salvar os provedores. O providers.json NAO foi alterado.');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    showConfigError('Falha ao salvar os provedores: ' + (e && e.message ? e.message : e));
+    return false;
   }
 }
 
@@ -423,12 +487,14 @@ function init() {
         updateZapSelector();
       } else if (zapsData.length) {
         // Primeira execucao (sem arquivo): migra o cache antigo uma unica vez.
-        window.electronAPI.saveZaps(zapsData);
+        saveZaps();
       }
-    }).catch(() => {
-      if (zapsData.length) {
-        try { window.electronAPI.saveZaps(zapsData); } catch (_) {}
-      }
+    }).catch((err) => {
+      // NUNCA sobrescreve o arquivo quando a leitura falha: pode ser corrupcao.
+      // O cache local continua na tela e o zaps.json fica intacto para recuperar.
+      showConfigError('Nao foi possivel ler o zaps.json: ' +
+        (err && err.message ? err.message : err) +
+        '. Seus Zaps foram preservados e o arquivo NAO sera sobrescrito.');
     });
     // O arquivo providers.json do processo principal e a fonte da verdade
     // (contem as chaves). Nunca sobrescrever com o cache do localStorage no
@@ -1513,6 +1579,12 @@ function openZapPanel(zapId) {
   const logBtn = document.getElementById('zapPanelLog');
   logBtn.onclick = () => openLogModal(zap.id, zap.name);
 
+  // Bloquear contatos existentes
+  const blockAllBtn = document.getElementById('panelBlockAll');
+  if (blockAllBtn) {
+    blockAllBtn.onclick = null; // removido
+  }
+
   // Save & Restart
   const saveRestartBtn = document.getElementById('panelSaveRestart');
   saveRestartBtn.onclick = async () => {
@@ -1532,50 +1604,43 @@ function openZapPanel(zapId) {
     saveZaps();
     renderZaps(zapsData);
 
-    if (serverManaged) {
-      // O zap roda no servidor: so enviamos as configs (sem reiniciar local)
-      saveRestartBtn.disabled = true;
-      const origHtml = saveRestartBtn.innerHTML;
-      saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Enviando ao servidor...`;
-      try {
-        const r = await window.electronAPI.serverSyncNow();
-        if (r && r.ok) alert('Alteracoes salvas e enviadas ao servidor!');
-        else alert('Nao foi possivel enviar ao servidor: ' + ((r && r.error) || 'erro'));
-      } catch (e) {
-        alert('Erro ao enviar ao servidor: ' + e.message);
-      } finally {
-        saveRestartBtn.disabled = false;
-        saveRestartBtn.innerHTML = origHtml;
-        openZapPanel(zapId);
-      }
-      return;
-    }
-
-    // Restart: disconnect then reconnect
     saveRestartBtn.disabled = true;
-    saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Reiniciando...`;
+    const originalHTML = saveRestartBtn.innerHTML;
+    saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> Salvando...`;
 
     try {
-      if (window.electronAPI && z.enabled !== false) {
-        const wasOnline = getZapStatusInfo(z).online;
-        if (wasOnline) {
-          await window.electronAPI.whatsappDisconnect(zapId.toString());
+      if (serverManaged) {
+        // O zap roda no servidor: so enviamos as configs (sem reiniciar local)
+        saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#2ecc71" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Enviando...`;
+        const r = await window.electronAPI.serverSyncNow();
+        if (r && r.ok) {
+          saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#2ecc71" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Salvo!`;
+          setTimeout(() => { saveRestartBtn.innerHTML = originalHTML; saveRestartBtn.disabled = false; openZapPanel(zapId); }, 1500);
+          return;
+        } else {
+          throw new Error((r && r.error) || 'erro');
         }
-        // Always reconnect if enabled (even if wasn't online - user wants it working)
-        applyRuntimeStatus(z, 'connecting');
-        refreshPanelStatusUI(zapId);
-        await window.electronAPI.whatsappConnect(zapId.toString(), z.phone.replace(/\D/g, ''), 'qrcode');
+      } else {
+        // Restart: disconnect then reconnect
+        saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Reiniciando...`;
+        if (window.electronAPI && z.enabled !== false) {
+          const wasOnline = getZapStatusInfo(z).online;
+          if (wasOnline) {
+            await window.electronAPI.whatsappDisconnect(zapId.toString());
+          }
+          applyRuntimeStatus(z, 'connecting');
+          refreshPanelStatusUI(zapId);
+          await window.electronAPI.whatsappConnect(zapId.toString(), (z.phone || '').replace(/\D/g, ''), 'pairing');
+        }
+        saveZaps();
+        saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#2ecc71" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Salvo!`;
+        setTimeout(() => { saveRestartBtn.innerHTML = originalHTML; saveRestartBtn.disabled = false; openZapPanel(zapId); }, 1500);
       }
-      saveZaps();
-      alert('Alteraes salvas!' + (z.enabled !== false ? ' Zap reiniciado.' : ''));
     } catch (err) {
-      alert('Erro ao reiniciar: ' + err.message);
+      saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#e74c3c" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> Erro!`;
+      setTimeout(() => { saveRestartBtn.innerHTML = originalHTML; saveRestartBtn.disabled = false; }, 2000);
+      alert('Erro ao salvar/reiniciar: ' + err.message);
       applyRuntimeStatus(z, 'disconnected');
-    } finally {
-      saveRestartBtn.disabled = false;
-      saveRestartBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Salvar alteracoes`;
-      // Refresh panel
-      openZapPanel(zapId);
     }
   };
 
@@ -1685,7 +1750,7 @@ async function deleteZapCompletely(zapId) {
   if (typeof updateZapSelector === 'function') { try { updateZapSelector(); } catch (_) {} }
 
   // 1) persiste a remocao no zaps.json (processo principal)
-  const saved = await window.electronAPI.saveZaps(zapsData);
+  const saved = await window.electronAPI.saveZaps(zapsData, { allowEmpty: true });
   if (saved === false) throw new Error('nao foi possivel gravar o zaps.json');
 
   // 2) desconecta no app (se estiver conectado localmente)
@@ -2415,6 +2480,38 @@ async function openZapContactsModal(zapId, zapName) {
   if (!modal || !listContainer) return;
 
   document.getElementById('zapContactsModalTitle').textContent = `Contatos - ${zapName}`;
+  
+  // Botão de cadeado para desativar todos os contatos
+  const titleEl = document.getElementById('zapContactsModalTitle');
+  if (titleEl) {
+    const lockBtn = document.createElement('button');
+    lockBtn.type = 'button';
+    lockBtn.title = 'Desativar todos os contatos';
+    lockBtn.style.cssText = 'background:none;border:none;cursor:pointer;vertical-align:middle;margin-right:8px;color:#e74c3c;';
+    lockBtn.innerHTML = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    </svg>`;
+    lockBtn.onclick = () => {
+      const zap = zapsData.find(z => String(z.id) === String(zapId));
+      if (!zap) return;
+      if (!zap.blockedContacts) zap.blockedContacts = [];
+      // Adiciona todos os contatos da lista ao blockedContacts
+      const checkboxes = listContainer.querySelectorAll('.contact-auth-checkbox');
+      let added = 0;
+      checkboxes.forEach(cb => {
+        const cid = cb.dataset.contact;
+        if (cid && !zap.blockedContacts.includes(cid)) {
+          zap.blockedContacts.push(cid);
+          cb.checked = false;
+          added++;
+        }
+      });
+      saveZaps();
+      alert('Todos os contatos foram desativados (' + added + ' desativados).');
+    };
+    titleEl.insertBefore(lockBtn, titleEl.firstChild);
+  }
   
   modal.classList.add('active');
   listContainer.innerHTML = '<div class="spinner" style="margin: 20px auto;"></div>';
@@ -3578,18 +3675,13 @@ async function callAIModel(providerName, modelId, apiKey, message) {
 let selectedConversation = null;
 let currentZapId = null;
 let conversationZapId = null;
-let currentConnectMethod = 'qrcode';
+let currentConnectMethod = 'pairing';
 let renderedMessageKeys = new Set();
 let incomingSoundCtx = null;
 const conversationUnread = new Map();
 
 function initWhatsApp() {
   if (!window.electronAPI) return;
-
-  window.electronAPI.onWhatsAppQR((data) => {
-    const { zapId, qr, dataUrl } = data;
-    showQRCode(zapId, qr, dataUrl);
-  });
 
   window.electronAPI.onWhatsAppPairingCode((data) => {
     const { zapId, code } = data;
@@ -3679,273 +3771,343 @@ function showTypingIndicator(zapId, chatId, isTyping) {
 // ============================================
 // Connection Modal
 // ============================================
+let pairingPollTimer = null;
+
+function stopPairingPoll() {
+  if (pairingPollTimer) {
+    clearTimeout(pairingPollTimer);
+    pairingPollTimer = null;
+  }
+}
+
 function initConnectModal() {
   const modal = document.getElementById('connectModal');
   const closeBtn = document.getElementById('closeConnectModal');
-  const tabs = document.querySelectorAll('.connect-tab');
-  const generateBtn = document.getElementById('generatePairingCode');
   const copyBtn = document.getElementById('copyPairingCode');
+  const phoneInput = document.getElementById('pairingPhone');
 
   if (closeBtn) closeBtn.addEventListener('click', closeConnectModal);
   if (modal) modal.addEventListener('click', (e) => { if (e.target === modal) closeConnectModal(); });
 
-  tabs.forEach(tab => {
-    tab.addEventListener('click', () => {
-      const method = tab.dataset.method;
-      currentConnectMethod = method;
-      tabs.forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      document.querySelectorAll('.connect-tab-content').forEach(c => c.classList.remove('active'));
-      document.getElementById(method === 'qrcode' ? 'tabQrcode' : 'tabPairing').classList.add('active');
-    });
-  });
-
-  if (generateBtn) generateBtn.addEventListener('click', generatePairingCode);
   if (copyBtn) {
     copyBtn.addEventListener('click', () => {
       const code = document.getElementById('pairingCodeValue').textContent;
+      if (!code) return;
       navigator.clipboard.writeText(code).then(() => {
         copyBtn.textContent = 'Copiado!';
-        setTimeout(() => { copyBtn.textContent = 'Copiar Cdigo'; }, 2000);
+        setTimeout(() => { copyBtn.textContent = 'Copiar Código'; }, 2000);
       });
+    });
+  }
+
+  if (phoneInput) {
+    // Gera o codigo automaticamente assim que o numero fica completo.
+    let debounce = null;
+    const schedule = () => {
+      const digits = phoneInput.value.replace(/\D/g, '');
+      if (debounce) clearTimeout(debounce);
+      if (digits.length < 10) {
+        stopPairingPoll();
+        const progress = document.getElementById('connectProgress');
+        if (progress) progress.style.display = 'none';
+        const st = document.getElementById('pairingStatus');
+        if (st) {
+          st.textContent = digits.length
+            ? 'Digite o número completo (DDI + DDD + número).'
+            : 'Digite o número do celular para gerar o código.';
+          st.className = 'connect-status';
+        }
+        return;
+      }
+      debounce = setTimeout(() => {
+        if (!currentZapId) return;
+        autoGeneratePairingCode(currentZapId, digits);
+      }, 700);
+    };
+    phoneInput.addEventListener('input', schedule);
+    phoneInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (debounce) clearTimeout(debounce);
+        const digits = phoneInput.value.replace(/\D/g, '');
+        if (currentZapId && digits.length >= 10) autoGeneratePairingCode(currentZapId, digits);
+      }
     });
   }
 }
 
-function openConnectModal(zapId, zapName, zapPhone) {
+function openConnectModal(zapId, zapName, zapPhone, opts) {
   currentZapId = zapId;
   const modal = document.getElementById('connectModal');
+  const nameEl = document.getElementById('connectZapNamePair');
+  if (nameEl) nameEl.textContent = zapName || '';
 
-  document.getElementById('connectZapNameQr').textContent = zapName;
-  document.getElementById('connectZapNamePair').textContent = zapName;
+  stopPairingPoll();
 
-  document.getElementById('qrLoading').style.display = 'flex';
-  document.getElementById('qrImage').style.display = 'none';
-  document.getElementById('qrStatus').textContent = 'Aguardando QR Code...';
-  document.getElementById('qrStatus').className = 'connect-status';
+  // Reset UI
+  const codeDisplay = document.getElementById('pairingCodeDisplay');
+  if (codeDisplay) codeDisplay.style.display = 'none';
+  const codeValue = document.getElementById('pairingCodeValue');
+  if (codeValue) codeValue.textContent = '';
+  const status = document.getElementById('pairingStatus');
+  if (status) { status.textContent = ''; status.className = 'connect-status'; }
+  const progress = document.getElementById('connectProgress');
+  if (progress) progress.style.display = 'flex';
+  const progressText = document.getElementById('connectProgressText');
+  if (progressText) progressText.textContent = 'Gerando código de pareamento...';
 
-  document.getElementById('pairingForm').style.display = 'block';
-  document.getElementById('pairingCodeDisplay').style.display = 'none';
-  document.getElementById('pairingStatus').textContent = '';
-  document.getElementById('pairingPhone').value = zapPhone ? zapPhone.replace(/\D/g, '') : '';
+  const phoneInput = document.getElementById('pairingPhone');
+  const cleanPhone = zapPhone ? String(zapPhone).replace(/\D/g, '') : '';
+  if (phoneInput) phoneInput.value = cleanPhone;
 
-  document.getElementById('connectProgress').style.display = 'none';
-
-  document.querySelectorAll('.connect-tab').forEach(t => t.classList.remove('active'));
-  document.querySelector('.connect-tab[data-method="qrcode"]').classList.add('active');
-  document.querySelectorAll('.connect-tab-content').forEach(c => c.classList.remove('active'));
-  document.getElementById('tabQrcode').classList.add('active');
-  currentConnectMethod = 'qrcode';
-
+  currentConnectMethod = 'pairing';
   modal.classList.add('active');
+
+  if (cleanPhone.length >= 10 && !(opts && opts.skipPair)) {
+    // O codigo comeca a ser gerado imediatamente, sem clique em botao.
+    autoGeneratePairingCode(zapId, cleanPhone);
+  } else if (opts && opts.skipPair) {
+    if (progress) progress.style.display = 'none';
+    if (status) {
+      status.textContent = 'Este Zap já está conectado. Altere o número para parear outro dispositivo.';
+      status.className = 'connect-status ready';
+    }
+  } else {
+    if (progress) progress.style.display = 'none';
+    if (status) status.textContent = 'Digite o número do celular para gerar o código.';
+    if (phoneInput) setTimeout(() => phoneInput.focus(), 50);
+  }
 }
 
 function closeConnectModal() {
-  document.getElementById('connectModal').classList.remove('active');
+  stopPairingPoll();
+  const modal = document.getElementById('connectModal');
+  if (modal) modal.classList.remove('active');
   currentZapId = null;
 }
 
-function showQRCode(zapId, qr, dataUrl) {
-  if (currentZapId != zapId && currentZapId != String(zapId)) return;
-
-  const qrLoading = document.getElementById('qrLoading');
-  const qrImage = document.getElementById('qrImage');
-  const qrStatus = document.getElementById('qrStatus');
-  const connectProgress = document.getElementById('connectProgress');
-
-  connectProgress.style.display = 'none';
-  qrLoading.style.display = 'none';
-  qrImage.style.display = 'block';
-  qrImage.innerHTML = '';
-
-  const img = document.createElement('img');
-  // Prefer dataUrl generated locally in main process (privacy, no external request)
-  if (dataUrl && dataUrl.startsWith('data:')) {
-    img.src = dataUrl;
-  } else {
-    // Fallback: generate via canvas using a tiny inline QR if possible, otherwise use remote (last resort)
-    // Try to use browser's own generation if we have raw qr string - fallback to remote
-    img.src = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qr)}`;
-    img.onerror = () => { qrStatus.textContent = 'Falha ao carregar QR. Tente reconectar.'; qrStatus.className='connect-status error'; };
-  }
-  img.alt = 'QR Code';
-  img.style.width = '180px'; img.style.height = '180px';
-  qrImage.appendChild(img);
-
-  qrStatus.textContent = 'Escaneie o QR Code com seu WhatsApp';
-  qrStatus.className = 'connect-status';
-}
-
 function showPairingCode(zapId, code) {
-  if (currentZapId != zapId) return;
+  if (currentZapId == null) return;
+  if (String(currentZapId) !== String(zapId)) return;
 
-  // Clear progress interval
-  const connectProgress = document.getElementById('connectProgress');
-  if (connectProgress.dataset.interval) {
-    clearInterval(parseInt(connectProgress.dataset.interval));
-    delete connectProgress.dataset.interval;
+  stopPairingPoll();
+
+  const progress = document.getElementById('connectProgress');
+  if (progress) progress.style.display = 'none';
+  const pairingForm = document.getElementById('pairingForm');
+  // Mantem o campo do numero visivel para permitir corrigir e gerar outro.
+  if (pairingForm) pairingForm.style.display = 'block';
+  const codeDisplay = document.getElementById('pairingCodeDisplay');
+  if (codeDisplay) codeDisplay.style.display = 'block';
+  const codeValue = document.getElementById('pairingCodeValue');
+  if (codeValue) codeValue.textContent = code;
+  const status = document.getElementById('pairingStatus');
+  if (status) {
+    status.textContent = 'Código gerado! Copie e use no celular.';
+    status.className = 'connect-status';
   }
-
-  document.getElementById('pairingForm').style.display = 'none';
-  document.getElementById('pairingCodeDisplay').style.display = 'block';
-  document.getElementById('pairingCodeValue').textContent = code;
-  document.getElementById('pairingStatus').textContent = 'Digite o cdigo no seu celular';
-  document.getElementById('pairingStatus').className = 'connect-status';
-  connectProgress.style.display = 'none';
 }
 
-function generatePairingCode() {
-  const phone = document.getElementById('pairingPhone').value.trim();
-  if (!phone) { alert('Por favor, insira o nmero do celular.'); return; }
+function autoGeneratePairingCode(zapId, zapPhone) {
+  const cleanPhone = zapPhone ? String(zapPhone).replace(/\D/g, '') : '';
+  const status = document.getElementById('pairingStatus');
+  const progress = document.getElementById('connectProgress');
+  const progressText = document.getElementById('connectProgressText');
 
-  const cleanPhone = phone.replace(/\D/g, '');
+  stopPairingPoll();
 
-  if (!/^\d+$/.test(cleanPhone)) { alert('Use apenas nmeros, sem espacos ou traos.'); return; }
-  if (cleanPhone.length < 10) { alert('Numero muito curto. Use o formato: cdigo do pas + DDD + numero (ex: 5511999999999)'); return; }
-  if (cleanPhone.length > 15) { alert('Numero muito longo. Verifique o numero.'); return; }
-
-  // Show progress with time estimate
-  const pairingStatus = document.getElementById('pairingStatus');
-  const connectProgress = document.getElementById('connectProgress');
-  const connectProgressText = document.getElementById('connectProgressText');
-
-  connectProgress.style.display = 'flex';
-  connectProgressText.textContent = 'Iniciando WhatsApp Web... (pode levar 30-60 segundos)';
-
-  let elapsed = 0;
-  const progressInterval = setInterval(() => {
-    elapsed += 5;
-    if (elapsed < 30) {
-      connectProgressText.textContent = `Carregando WhatsApp Web... (${elapsed}s)`;
-    } else if (elapsed < 60) {
-      connectProgressText.textContent = `Gerando cdigo de pareamento... (${elapsed}s)`;
-    } else {
-      connectProgressText.textContent = `Ainda processando... (${elapsed}s) - pode demorar um pouco mais`;
-    }
-  }, 5000);
-
-  // Store interval so we can clear it later
-  connectProgress.dataset.interval = progressInterval;
-
-  connectZapWithMethod(currentZapId, cleanPhone, 'pairing');
-}
-
-async function connectZapWithMethod(zapId, phone, method) {
-  if (!window.electronAPI) { alert('Integracao com WhatsApp nao disponivel.'); return; }
-
-  if (serverManaged) {
-    // Nao conecta pelo PC: o servidor gera codigo/QR e o painel so exibe.
-    const cp = document.getElementById('connectProgress');
-    if (cp) cp.style.display = 'none';
-    const ps = document.getElementById('pairingStatus');
-    if (ps) {
-      ps.textContent = 'Buscando o QR/codigo atual no servidor...';
-      ps.className = 'connect-status';
-    }
-    try {
-      const info = window.electronAPI.serverCurrentQr
-        ? await window.electronAPI.serverCurrentQr(zapId)
-        : null;
-      if (info && info.pairingCode) {
-        showPairingCode(zapId, info.pairingCode);
-      } else if (info && info.dataUrl) {
-        showQRCode(zapId, null, info.dataUrl);
-      } else if (ps) {
-        ps.textContent = 'O servidor esta gerando o codigo/QR. Ele aparece aqui em instantes...';
-      }
-    } catch (_) {
-      if (ps) ps.textContent = 'O servidor esta gerando o codigo/QR. Ele aparece aqui em instantes...';
-    }
-    if (window.electronAPI.serverSyncNow) {
-      try { await window.electronAPI.serverSyncNow(); } catch (e) {}
+  if (cleanPhone.length < 10) {
+    if (progress) progress.style.display = 'none';
+    if (status) {
+      status.textContent = 'Digite o número do celular (DDI + DDD + número) para gerar o código.';
+      status.className = 'connect-status';
     }
     return;
   }
 
-  const connectProgress = document.getElementById('connectProgress');
-  const connectProgressText = document.getElementById('connectProgressText');
+  // Esconde um codigo antigo enquanto o novo e gerado.
+  const codeDisplay = document.getElementById('pairingCodeDisplay');
+  if (codeDisplay) codeDisplay.style.display = 'none';
+  if (progress) progress.style.display = 'flex';
+  if (progressText) progressText.textContent = 'Gerando código de pareamento...';
+  if (status) { status.textContent = 'Aguarde enquanto o código é gerado...'; status.className = 'connect-status'; }
 
-  connectProgress.style.display = 'flex';
-  connectProgressText.textContent = method === 'pairing' ? 'Gerando cdigo...' : 'Iniciando conexo...';
+  let elapsed = 0;
+  const tick = () => {
+    elapsed += 5;
+    if (!progress || progress.style.display === 'none') return;
+    if (elapsed < 30) {
+      if (progressText) progressText.textContent = `Iniciando WhatsApp Web... (${elapsed}s)`;
+    } else if (elapsed < 60) {
+      if (progressText) progressText.textContent = `Gerando código de pareamento... (${elapsed}s)`;
+    } else {
+      if (progressText) progressText.textContent = `Ainda processando... (${elapsed}s) - pode demorar um pouco mais`;
+    }
+    pairingPollTimer = setTimeout(tick, 5000);
+  };
+  pairingPollTimer = setTimeout(tick, 5000);
+
+  connectZapWithMethod(zapId, cleanPhone, 'pairing');
+}
+
+
+async function connectZapWithMethod(zapId, phone, method) {
+  if (!window.electronAPI) { alert('Integração com WhatsApp não disponível.'); return; }
+
+  const cleanPhone = phone ? String(phone).replace(/\D/g, '') : '';
+  if (!cleanPhone) {
+    const status = document.getElementById('pairingStatus');
+    if (status) {
+      status.textContent = 'Informe o número do celular para gerar o código.';
+      status.className = 'connect-status error';
+    }
+    return;
+  }
+
+  if (serverManaged) {
+    // No modo servidor o PC nao abre o WhatsApp: pedimos ao servidor que
+    // pareie este zap e consultamos o codigo publicado no repo de dados.
+    stopPairingPoll();
+
+    const progress = document.getElementById('connectProgress');
+    const progressText = document.getElementById('connectProgressText');
+    const status = document.getElementById('pairingStatus');
+    if (progress) progress.style.display = 'flex';
+    if (progressText) progressText.textContent = 'Solicitando código ao servidor...';
+    if (status) { status.textContent = 'Conectando ao servidor 24h...'; status.className = 'connect-status'; }
+
+    try {
+      if (window.electronAPI.serverConnectZap) {
+        await window.electronAPI.serverConnectZap(zapId, cleanPhone);
+      }
+      if (window.electronAPI.serverSyncNow) {
+        try { await window.electronAPI.serverSyncNow(); } catch (_) {}
+      }
+    } catch (_) {}
+
+    // Polling: o servidor publica o codigo em pairing-codes.json e o app
+    // sincroniza esse arquivo periodicamente. Consulta ate aparecer.
+    const deadline = Date.now() + 5 * 60 * 1000;
+    const poll = async () => {
+      if (currentZapId == null || String(currentZapId) !== String(zapId)) return;
+      try {
+        const info = window.electronAPI.serverCurrentQr
+          ? await window.electronAPI.serverCurrentQr(zapId)
+          : null;
+        if (info && info.pairingCode) {
+          showPairingCode(zapId, info.pairingCode);
+          return;
+        }
+        if (info && info.status === 'ready') {
+          if (progress) progress.style.display = 'none';
+          if (status) { status.textContent = 'Este Zap já está conectado.'; status.className = 'connect-status ready'; }
+          return;
+        }
+      } catch (_) {}
+
+      if (Date.now() > deadline) {
+        if (progress) progress.style.display = 'none';
+        if (status) {
+          status.textContent = 'O servidor ainda não publicou o código. Confira se o Zap está ativo no servidor e tente novamente.';
+          status.className = 'connect-status error';
+        }
+        return;
+      }
+      if (status) status.textContent = 'O servidor está gerando o código. Ele aparecerá aqui em instantes...';
+      pairingPollTimer = setTimeout(poll, 3000);
+    };
+    poll();
+    return;
+  }
+
+  const progress = document.getElementById('connectProgress');
+  const progressText = document.getElementById('connectProgressText');
+  if (progress) progress.style.display = 'flex';
+  if (progressText) progressText.textContent = 'Gerando código...';
 
   try {
-    const result = await window.electronAPI.whatsappConnect(zapId.toString(), phone, method);
-    // Save connect method for restart
+    const result = await window.electronAPI.whatsappConnect(zapId.toString(), cleanPhone, 'pairing');
     const zap = zapsData.find(z => String(z.id) === String(zapId));
     if (zap) {
-      zap.lastConnectMethod = method;
+      if (cleanPhone && !zap.phone) zap.phone = cleanPhone;
+      zap.lastConnectMethod = 'pairing';
       saveZaps();
     }
-    if (result.status === 'already_connected') {
-      alert('Este Zap ja esta conectado.');
-      closeConnectModal();
-    } else if (result.status === 'error') {
-      alert('Erro ao conectar: ' + result.error);
-      connectProgress.style.display = 'none';
+    if (result && result.status === 'already_connected') {
+      stopPairingPoll();
+      if (progress) progress.style.display = 'none';
+      const status = document.getElementById('pairingStatus');
+      if (status) { status.textContent = 'Este Zap já está conectado.'; status.className = 'connect-status ready'; }
+      setTimeout(closeConnectModal, 1200);
+    } else if (result && (result.status === 'error' || result.status === 'readonly')) {
+      stopPairingPoll();
+      if (progress) progress.style.display = 'none';
+      const status = document.getElementById('pairingStatus');
+      if (status) {
+        status.textContent = (result.status === 'readonly' ? '' : 'Erro: ') + (result.error || 'não foi possível gerar o código');
+        status.className = 'connect-status error';
+      }
     }
   } catch (error) {
     console.error('Erro ao conectar:', error);
-    alert('Erro ao conectar: ' + error.message);
-    connectProgress.style.display = 'none';
+    stopPairingPoll();
+    if (progress) progress.style.display = 'none';
+    const status = document.getElementById('pairingStatus');
+    if (status) { status.textContent = 'Erro ao gerar código: ' + error.message; status.className = 'connect-status error'; }
   }
 }
 
 function updateZapStatus(zapId, status, error) {
   if (currentZapId == zapId) {
     const connectProgress = document.getElementById('connectProgress');
-    const qrStatus = document.getElementById('qrStatus');
     const pairingStatus = document.getElementById('pairingStatus');
-
-    // Clear progress interval on any status change
-    if (connectProgress.dataset.interval) {
-      clearInterval(parseInt(connectProgress.dataset.interval));
-      delete connectProgress.dataset.interval;
-    }
 
     if (status === 'connecting') {
       connectProgress.style.display = 'flex';
       document.getElementById('connectProgressText').textContent = 'Conectando...';
     } else if (status === 'waiting_qr' || status === 'waiting_pairing') {
-      connectProgress.style.display = 'none';
+      // O codigo chegou (ou esta chegando) por outro canal: mantem o spinner
+      // ate showPairingCode exibir o codigo.
+      if (!document.getElementById('pairingCodeValue').textContent) {
+        connectProgress.style.display = 'flex';
+      }
     } else if (status === 'pairing_accepted') {
-      // Celular ja aceitou o codigo - só falta sincronizar (watchdog de pareamento)
+      stopPairingPoll();
+      // Celular ja aceitou o codigo - so falta sincronizar (watchdog de pareamento)
       connectProgress.style.display = 'none';
-      pairingStatus.textContent = 'Codigo aceito! Sincronizando conversas...';
+      pairingStatus.textContent = 'Código aceito! Sincronizando conversas...';
       pairingStatus.className = 'connect-status';
     } else if (status === 'authenticated') {
+      stopPairingPoll();
       connectProgress.style.display = 'none';
       pairingStatus.textContent = 'Autenticado! Preparando sistema...';
       pairingStatus.className = 'connect-status';
-      qrStatus.textContent = 'Autenticado! Preparando sistema...';
-      qrStatus.className = 'connect-status';
     } else if (status === 'ready') {
+      stopPairingPoll();
       connectProgress.style.display = 'none';
-      qrStatus.textContent = 'Conectado com sucesso!';
-      qrStatus.className = 'connect-status ready';
       pairingStatus.textContent = 'Conectado com sucesso!';
       pairingStatus.className = 'connect-status ready';
       setTimeout(closeConnectModal, 1500);
-    } else if (status === 'auth_failure') {
+    } else if (status === 'auth_failure' || status === 'pairing_error') {
+      stopPairingPoll();
       connectProgress.style.display = 'none';
-      let friendlyMsg = error || 'Autenticacao negada';
+      let friendlyMsg = error || 'Autenticação negada';
 
       if (error && (error.includes('query_link') || error.includes('not allowed') || error.includes('linked'))) {
-        friendlyMsg = 'Nao foi possivel vincular. Verifique:\n1. O numero esta correto?\n2. O WhatsApp esta aberto no celular?\n3. Ja existe outro dispositivo vinculado?';
+        friendlyMsg = 'Não foi possível vincular. Verifique:\n1. O número está correto?\n2. O WhatsApp está aberto no celular?\n3. Já existe outro dispositivo vinculado?';
       }
 
-      if (currentConnectMethod === 'pairing') {
-        pairingStatus.textContent = 'Erro: ' + friendlyMsg;
-        pairingStatus.className = 'connect-status error';
-        document.getElementById('pairingForm').style.display = 'block';
-        document.getElementById('pairingCodeDisplay').style.display = 'none';
-      } else {
-        qrStatus.textContent = 'Erro: ' + friendlyMsg;
-        qrStatus.className = 'connect-status error';
-      }
+      pairingStatus.textContent = 'Erro: ' + friendlyMsg;
+      pairingStatus.className = 'connect-status error';
+      const form = document.getElementById('pairingForm');
+      if (form) form.style.display = 'block';
+      const codeDisplay = document.getElementById('pairingCodeDisplay');
+      if (codeDisplay) codeDisplay.style.display = 'none';
     } else if (status === 'disconnected') {
+      stopPairingPoll();
       connectProgress.style.display = 'none';
-      qrStatus.textContent = 'Desconectado'; qrStatus.className = 'connect-status error';
-      pairingStatus.textContent = 'Desconectado'; pairingStatus.className = 'connect-status error';
+      pairingStatus.textContent = 'Desconectado';
+      pairingStatus.className = 'connect-status error';
     }
   }
 
@@ -5687,7 +5849,6 @@ function autoMsgConnect() {
   if (!zap) { alert('Escolha uma conta no botao > (canto inferior esquerdo).'); return; }
   if (getZapStatusInfo(zap).online) { alert('Esta conta ja esta conectada.'); return; }
   openConnectModal(zap.id, zap.name, zap.phone);
-  connectZapWithMethod(zap.id, (zap.phone || '').replace(/\D/g, ''), 'qrcode');
 }
 
 // --- Historico da conversa ---
@@ -6560,6 +6721,15 @@ function updateServerOverviewDom(o) {
     pill.title = o.hint || o.label || statusText;
     pill.dataset.status = statusText;
   }
+  // Visibilidade de erros recentes do servidor
+  const errBox = document.getElementById('serverRecentErrors');
+  if (errBox && Array.isArray(o.errors) && o.errors.length) {
+    errBox.innerHTML = '<strong>Ultimos erros:</strong> ' + o.errors.map(e => `<span style="color:#c00">• ${String(e || '').slice(0, 80)}</span>`).join(' ');
+    errBox.style.display = 'block';
+  } else if (errBox) {
+    errBox.style.display = 'none';
+    errBox.innerHTML = '';
+  }
 
   const btn = document.getElementById('serverPowerBtn');
   if (btn) {
@@ -6871,4 +7041,10 @@ document.addEventListener('DOMContentLoaded', () => {
   try { initWhatsApp(); } catch (e) { console.error('Erro no initWhatsApp:', e); }
   try { initServerPage(); } catch (e) { console.error('Erro em initServerPage:', e); }
   try { setupTrainingListeners(); } catch (e) { console.error('Erro em setupTrainingListeners:', e); }
+  if (window.electronAPI && window.electronAPI.onServerPowerUpdated) {
+    window.electronAPI.onServerPowerUpdated((data) => {
+      console.log('Server power updated:', data);
+      refreshServerOverview();
+    });
+  }
 });

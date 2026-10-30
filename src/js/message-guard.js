@@ -56,6 +56,7 @@ const PROMPT_LEAK_RE = new RegExp(
 const META_RE = /\bas an ai\b|\blanguage model\b|sou uma (?:ia|intelig[êe]ncia artificial)|como (?:uma )?(?:ia|intelig[êe]ncia artificial)|i (?:cannot|can't|am unable to) help/i;
 
 const PT_ACCENT_RE = /[áàâãéêíóôõúüçÁÀÂÃÉÊÍÓÔÕÚÜÇ]/;
+const ALLOWLIST_MARKER_RE = /\[((AUDIO|IMAGEM?|FOTO|VIDEO|LINK|PROMO[ÇC]ÃO?|VOUCHER|PIX|COPIA|COLE))\]|(?:\d+\)\s+[^\n]{3,30})(?:\n\s*\d+\)\s+[^\n]{3,30})?/i;
 const BRACKET_ANY_RE = /\[[^\[\]]{1,80}\]/;
 
 // Palavras em ingles pouco ambiguas com portugues.
@@ -210,6 +211,9 @@ function isMeta(text) {
  */
 function verifyMessage(text, opts = {}) {
   const t = typeof text === 'string' ? text.trim() : '';
+  // Allowlist comercial: marcadores de venda ([Promoção], [PIX], listas curtas de oferta,
+  // texto de pix_copia_cola) nao devem ser bloqueados como codigo/markdown.
+  if (ALLOWLIST_MARKER_RE.test(t)) return { ok: true, reason: null };
   if (!t || t.length < 2) return { ok: false, reason: 'empty' };
   if (t.length > 2000) return { ok: false, reason: 'too_long' };
   if (hasLeftoverMarkers(t, !!opts.allowKnownMarkers)) return { ok: false, reason: 'marker_leak' };

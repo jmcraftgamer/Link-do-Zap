@@ -83,13 +83,13 @@ async function run() {
   test('linux: getQrString e listConnectionStates expoe o estado', () => {
     const wm = new RealWM(null);
     assert.strictEqual(wm.getQrString('zap1'), null);
-    wm.clients.set('zap1', { status: 'connecting', qrCode: 'QR-TESTE-123', method: 'qrcode', phoneNumber: '5511999999999' });
-    assert.strictEqual(wm.getQrString('zap1'), 'QR-TESTE-123');
-    assert.strictEqual(wm.getQrString('inexistente'), null);
+    wm.clients.set('zap1', { status: 'connecting', pairingCode: 'ABC123', method: 'pairing', phoneNumber: '5511999999999' });
+    assert.strictEqual(wm.getQrString('zap1'), null, 'getQrString sempre nulo apos a remocao do QR');
     const list = wm.listConnectionStates();
     assert.strictEqual(list.length, 1);
     assert.strictEqual(list[0].id, 'zap1');
-    assert.strictEqual(list[0].qrPending, true);
+    assert.strictEqual(list[0].qrPending, false, 'qrPending sempre falso apos a remocao do QR');
+    assert.strictEqual(list[0].pairingCode, 'ABC123');
     assert.strictEqual(list[0].status, 'connecting');
   });
 
@@ -98,10 +98,9 @@ async function run() {
   // ---------------------------------------------------------------
   const { createStatusServer } = require(path.join(root, 'src', 'js', 'status-server'));
 
-  testAsync('linux: servidor responde /, /status, /logs, /qr e 404', async () => {
+  testAsync('linux: servidor responde /, /status, /logs e 404', async () => {
     const srv = createStatusServer({
-      getState: () => ({ ok: true, zaps: [{ id: 'z1', name: 'Loja', status: 'ready' }] }),
-      getQr: (id) => (id === 'z1' ? 'conteudo-do-qr' : null),
+      getState: () => ({ ok: true, zaps: [{ id: 'z1', name: 'Loja', status: 'ready', pairingCode: 'A123B' }] }),
       getLogs: () => ['linha1', 'linha2']
     });
     const port = await listen(srv, 0);
@@ -120,14 +119,8 @@ async function run() {
     const logs = await (await fetch(`${base}/logs`)).json();
     assert.deepStrictEqual(logs.lines, ['linha1', 'linha2']);
 
-    const qrRes = await fetch(`${base}/qr?zap=z1`);
-    assert.strictEqual(qrRes.status, 200);
-    assert.ok((qrRes.headers.get('content-type') || '').includes('image/png'), 'content-type do QR nao e image/png');
-    const png = Buffer.from(await qrRes.arrayBuffer());
-    assert.strictEqual(png.toString('ascii', 1, 4), 'PNG', 'resposta do QR nao e PNG');
-
-    assert.strictEqual((await fetch(`${base}/qr?zap=outro`)).status, 404);
-    assert.strictEqual((await fetch(`${base}/qr`)).status, 400);
+    assert.strictEqual((await fetch(`${base}/qr?zap=z1`)).status, 404, '/qr removido');
+    assert.strictEqual((await fetch(`${base}/qr`)).status, 404, '/qr removido');
     assert.strictEqual((await fetch(`${base}/rota-inexistente`)).status, 404);
 
     await closeServer(srv);
@@ -151,12 +144,12 @@ async function run() {
     assert.strictEqual((await fetch(`${base}/status`, { headers: { 'x-token': 'segredo123' } })).status, 200);
     assert.strictEqual((await fetch(`${base}/status`, { headers: { Authorization: 'Bearer segredo123' } })).status, 200);
 
-    const postOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ zap: 'z9', method: 'qrcode' }) };
+    const postOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ zap: 'z9' }) };
     assert.strictEqual((await fetch(`${base}/connect`, postOpts)).status, 401, 'POST sem token deveria dar 401');
     assert.strictEqual((await fetch(`${base}/connect?token=segredo123`, postOpts)).status, 202, 'POST com token deveria passar');
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].zapId, 'z9');
-    assert.strictEqual(calls[0].method, 'qrcode');
+    assert.strictEqual(calls[0].method, 'pairing');
     assert.strictEqual((await fetch(`${base}/disconnect?token=segredo123`, postOpts)).status, 200);
 
     await closeServer(srv);
@@ -255,7 +248,7 @@ async function run() {
     assert.ok(srv && srv.listening, 'servidor de status nao subiu');
     const base = `http://127.0.0.1:${process.env.LINK_HTTP_PORT}`;
 
-    fakeWM.clients.set('zap1', { status: 'connecting', qrCode: 'QR-INTEGRACAO' });
+    fakeWM.clients.set('zap1', { status: 'connecting', pairingCode: null, method: 'pairing' });
 
     const st = await (await fetch(`${base}/status`)).json();
     assert.strictEqual(st.ok, true);
@@ -266,7 +259,7 @@ async function run() {
     assert.ok(z1, 'zap1 ausente no status');
     assert.strictEqual(z1.name, 'Teste Linux');
     assert.strictEqual(z1.enabled, true);
-    assert.strictEqual(z1.qrPending, true);
+    assert.ok(z1.pairingCode === undefined || z1.pairingCode === null || z1.pairingCode === '', 'codigo de pareamento exibido');
     const z2 = st.zaps.find((z) => z.id === 'zap2');
     assert.ok(z2, 'zap2 ausente no status');
     assert.strictEqual(z2.enabled, false);
@@ -274,14 +267,6 @@ async function run() {
     const html = await (await fetch(`${base}/`)).text();
     assert.ok(html.includes('Teste Linux'), 'zap ausente na pagina do main');
     assert.ok(html.includes('Pasta de dados'), 'pasta de dados ausente na pagina');
-
-    const qrRes = await fetch(`${base}/qr?zap=zap1`);
-    assert.strictEqual(qrRes.status, 200);
-    const png = Buffer.from(await qrRes.arrayBuffer());
-    assert.strictEqual(png.toString('ascii', 1, 4), 'PNG', 'QR do main nao veio como PNG');
-
-    const qrMissing = await fetch(`${base}/qr?zap=zap2`);
-    assert.strictEqual(qrMissing.status, 404, 'zap sem QR deveria dar 404');
 
     const logs = await (await fetch(`${base}/logs`)).json();
     assert.ok(Array.isArray(logs.lines), '/logs deveria devolver array');
@@ -316,10 +301,9 @@ async function run() {
     assert.strictEqual((await post({})).status, 400, 'POST sem zap deveria dar 400');
     assert.strictEqual((await post({ zap: 'nao-existe' })).status, 404, 'zap fora do zaps.json deveria dar 404');
     assert.strictEqual((await fetch(`${base}/connect`)).status, 405, 'GET em /connect deveria dar 405');
-    assert.strictEqual((await post({ zap: 'zap1', method: 'pairing' })).status, 400, 'pairing sem phone deveria dar 400');
-
+    assert.strictEqual((await post({ zap: 'zap1', phone: '5511999999999' })).status, 202, 'connect com phone dá 202');
     const before = fakeWM.connects.length;
-    const ok = await post({ zap: 'zap1', method: 'qrcode' });
+    const ok = await post({ zap: 'zap1', phone: '5511999999999' });
     assert.strictEqual(ok.status, 202, 'POST /connect valido deveria dar 202');
     const j = await ok.json();
     assert.strictEqual(j.ok, true);

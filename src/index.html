@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://api.qrserver.com; connect-src 'self' https://api.openai.com https://api.groq.com https://api.openrouter.ai https://generativelanguage.googleapis.com https://api.deepseek.com https://api.mistral.ai;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://api.openai.com https://api.groq.com https://api.openrouter.ai https://generativelanguage.googleapis.com https://api.deepseek.com https://api.mistral.ai;">
 
   <title>Link no WhatsApp</title>
   <link rel="icon" type="image/svg+xml" href="assets/icon.svg">
@@ -1001,66 +1001,32 @@
         <button class="modal-close" id="closeConnectModal">&times;</button>
       </div>
       <div class="modal-body">
-        <!-- Connection Tabs -->
-        <div class="connect-tabs">
-          <button class="connect-tab active" data-method="qrcode">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="3" width="7" height="7"/>
-              <rect x="14" y="3" width="7" height="7"/>
-              <rect x="3" y="14" width="7" height="7"/>
-              <rect x="14" y="14" width="3" height="3"/>
-            </svg>
-            QR Code
-          </button>
-          <button class="connect-tab" data-method="pairing">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="5" y="2" width="14" height="20" rx="2" ry="2"/>
-              <line x1="12" y1="18" x2="12.01" y2="18"/>
-            </svg>
-            Cdigo
-          </button>
+        <div class="connect-zap-name" id="connectZapNamePair"></div>
+
+        <!-- Numero usado para gerar o codigo -->
+        <div class="connect-pairing-form" id="pairingForm">
+          <div class="form-group">
+            <label for="pairingPhone">Número do celular do cliente</label>
+            <input type="tel" id="pairingPhone" placeholder="Ex: 5511999999999" autocomplete="off" inputmode="numeric">
+            <p class="form-hint">Somente números, com DDI + DDD. O código é gerado automaticamente assim que o número estiver completo.</p>
+          </div>
         </div>
 
-        <!-- QR Code Tab -->
-        <div class="connect-tab-content active" id="tabQrcode">
-          <div class="connect-zap-name" id="connectZapNameQr"></div>
-          <div class="connect-qr-container">
-            <div class="connect-qr-loading" id="qrLoading">
-              <div class="spinner"></div>
-              <p>Gerando QR Code...</p>
-            </div>
-            <div class="connect-qr-image" id="qrImage" style="display:none"></div>
-          </div>
-          <div class="connect-status" id="qrStatus">Aguardando QR Code...</div>
-        </div>
-
-        <!-- Pairing Code Tab -->
-        <div class="connect-tab-content" id="tabPairing">
-          <div class="connect-zap-name" id="connectZapNamePair"></div>
-          <div class="connect-pairing-form" id="pairingForm">
-            <div class="form-group">
-              <label for="pairingPhone">Nmero do celular do cliente</label>
-              <input type="tel" id="pairingPhone" placeholder="Ex: 5511999999999">
-              <p class="form-hint">Apenas nmeros, sem espacos ou traos. Este  o nmero que o cliente usa no WhatsApp dele.</p>
-            </div>
-            <button class="btn btn-primary btn-block" id="generatePairingCode">
-              Gerar Cdigo de Pareamento
-            </button>
-          </div>
-          <div class="connect-pairing-code" id="pairingCodeDisplay" style="display:none">
-            <p class="pairing-code-label">Envie este cdigo para o cliente:</p>
-            <div class="pairing-code-value" id="pairingCodeValue"></div>
-            <button class="btn btn-outline btn-sm" id="copyPairingCode">Copiar Cdigo</button>
-            <p class="form-hint" style="margin-top:12px">O cliente deve abrir WhatsApp > Dispositivos vinculados > Vincular dispositivo > Vincular com nmero de telefone > Digitar este cdigo</p>
-          </div>
-          <div class="connect-status" id="pairingStatus"></div>
-        </div>
-
-        <!-- Connecting Status -->
-        <div class="connect-progress" id="connectProgress" style="display:none">
+        <!-- Carregamento -->
+        <div class="connect-progress" id="connectProgress">
           <div class="spinner"></div>
-          <p id="connectProgressText">Conectando...</p>
+          <p id="connectProgressText">Gerando código de pareamento...</p>
         </div>
+
+        <!-- Codigo gerado -->
+        <div class="connect-pairing-code" id="pairingCodeDisplay" style="display:none">
+          <p class="pairing-code-label">Envie este código para o cliente:</p>
+          <div class="pairing-code-value" id="pairingCodeValue"></div>
+          <button class="btn btn-outline btn-sm" id="copyPairingCode">Copiar Código</button>
+          <p class="form-hint" style="margin-top:12px">No celular: WhatsApp &gt; Dispositivos vinculados &gt; Vincular dispositivo &gt; Vincular com número de telefone &gt; digite este código.</p>
+        </div>
+
+        <div class="connect-status" id="pairingStatus"></div>
       </div>
     </div>
   </div>

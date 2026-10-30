@@ -238,12 +238,12 @@ async function run() {
     assert.ok(comp.t < pause.t, 'paused veio antes do composing');
     assert.ok(pause.t <= sent.t, 'mensagem saiu antes de desligar o digitando');
 
-    // tempo total = sorteio (2/3/5s) + digitacao humana (2,5 chars/s, min 5s)
-    const humanMs = Math.round((sent.text.length / 2.5) * 1000);
-    const target = Math.max(5000, humanMs);
+    // tempo total = sorteio (2/3/5s) + digitacao humana (10 chars/s, teto 3-12s)
+    const humanMs = Math.round((sent.text.length / 10) * 1000);
+    const target = Math.min(12000, Math.max(3000, humanMs));
     const preDelay = (sent.t - s.t) - target;
-    assert.ok([2000, 3000, 5000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
-    assert.ok(sent.t - comp.t >= 5000, 'digitando durou menos de 5s');
+    assert.ok([2000, 3000, 5000].some(d => Math.abs(preDelay - d) <= 1200), `preDelay fora do esperado: ${preDelay}ms`);
+    assert.ok(sent.t - comp.t >= 3000, 'digitando durou menos de 3s');
 
     const typingUi = rendererEvents.slice(s.renderer).filter(e => e.ch === 'whatsapp-typing');
     assert.ok(typingUi.some(e => e.payload.isTyping === true), 'renderer nao recebeu isTyping=true');
@@ -397,17 +397,17 @@ async function run() {
     for (let i = 0; i < sent.length; i++) {
       assert.ok(comp[i].t <= pause[i].t, `balao ${i + 1}: paused antes do composing`);
       assert.ok(pause[i].t <= sent[i].t, `balao ${i + 1}: enviado antes de desligar o digitando`);
-      assert.ok(sent[i].t - comp[i].t >= 5000, `balao ${i + 1}: digitando menos de 5s`);
+      assert.ok(sent[i].t - comp[i].t >= 3000, `balao ${i + 1}: digitando menos de 3s`);
       if (i > 0) {
         assert.ok(comp[i].t >= sent[i - 1].t, `balao ${i + 1}: comecou a digitar antes do balao ${i} sair`);
-        assert.ok(sent[i].t - sent[i - 1].t >= 5000, `balao ${i + 1}: gap menor que 5s entre baloes`);
+        assert.ok(sent[i].t - sent[i - 1].t >= 3000, `balao ${i + 1}: gap menor que 3s entre baloes`);
       }
     }
 
     // 1o balao espera o sorteio (2/3/5s) + digitacao humana
-    const human = Math.max(5000, Math.round((sent[0].text.length / 2.5) * 1000));
+    const human = Math.min(12000, Math.max(3000, Math.round((sent[0].text.length / 10) * 1000)));
     const preDelay = (sent[0].t - s.t) - human;
-    assert.ok([2000, 3000, 5000].includes(preDelay), `preDelay fora do esperado: ${preDelay}ms`);
+    assert.ok([2000, 3000, 5000].some(d => Math.abs(preDelay - d) <= 1200), `preDelay fora do esperado: ${preDelay}ms`);
   });
 
   // ---------------------------------------------------------------

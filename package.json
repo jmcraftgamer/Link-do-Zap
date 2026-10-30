@@ -12,7 +12,7 @@
     "icon": "electron scripts/make-icon.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis",
-    "test": "node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js && node test/audio.js",
+    "test": "node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js && node test/audio.js && node test/config-safety.js",
     "test:ai": "node test/ai.js",
     "test:agent": "node test/agent.js",
     "test:ai-live": "node test/ai-live.js",
@@ -36,6 +36,16 @@
       "output": "dist",
       "buildResources": "build"
     },
+    "extraFiles": [
+      {
+        "from": "ffmpeg.exe",
+        "to": "ffmpeg.exe"
+      },
+      {
+        "from": "ffprobe.exe",
+        "to": "ffprobe.exe"
+      }
+    ],
     "files": [
       "main.js",
       "preload.js",
@@ -49,7 +59,7 @@
       "!build/**/*"
     ],
     "win": {
-      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
       "target": [
         {
           "target": "nsis",

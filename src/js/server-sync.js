@@ -20,7 +20,7 @@ const { execFile } = require('child_process');
 // Somente configs. Nunca enviamos sessions/, bot-status.json, conversations.json
 // nem contacts.json: esses arquivos pertencem ao servidor (ou sao residuo local)
 // e criariam conflito/loop no git.
-const CONFIG_FILES = ['zaps.json', 'providers.json', 'trainings.json'];
+const CONFIG_FILES = ['zaps.json', 'providers.json', 'trainings.json', 'zaps.empty-ok.json', 'connect-requests.json'];
 const CONFIG_DIRS = ['trainings'];
 
 function run(cmd, args, opts = {}) {
@@ -565,11 +565,7 @@ class ServerSync {
     } catch (_) { return null; }
   }
 
-  // QR atual publicado pelo servidor (usado ao abrir a tela de conexao)
-  async getQrDataUrl(zapId) {
-    if (!this.enabled) return null;
-    return this._showPngDataUrl(`qr-${String(zapId)}.png`);
-  }
+   // (Removido: getQrDataUrl e _showPngDataUrl nao sao mais usados - nao ha mais QR)
 
   async _emitChanges() {
     // Codigos de pareamento novos/alterados
@@ -581,21 +577,6 @@ class ServerSync {
         if (this._lastCodes[id] !== code) {
           this._lastCodes[id] = code;
           if (this._onPairingCode) this._onPairingCode({ zapId: id, code });
-        }
-      }
-    } catch (_) {}
-
-    // QR do servidor (somente enquanto pendente)
-    try {
-      const zaps = this.botStatus && Array.isArray(this.botStatus.zaps) ? this.botStatus.zaps : [];
-      for (const z of zaps) {
-        const id = String(z.id);
-        if (!z.qrPending) continue;
-        const dataUrl = await this._showPngDataUrl(`qr-${id}.png`);
-        if (!dataUrl) continue;
-        if (this._lastQr[id] !== dataUrl) {
-          this._lastQr[id] = dataUrl;
-          if (this._onQr) this._onQr({ zapId: id, dataUrl });
         }
       }
     } catch (_) {}

@@ -44,26 +44,33 @@ function statusPill(status) {
 
 function renderPage(state, logs, opts) {
   const token = opts.token || '';
-  const tokenQs = token ? `&token=${encodeURIComponent(token)}` : '';
   const postQs = token ? `?token=${encodeURIComponent(token)}` : '';
-  const actionJs = `async function acao(metodo, zap) {
-  const r = await fetch('/' + metodo + ${JSON.stringify(postQs)}, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ zap: zap, method: 'qrcode' }) });
+  const actionJs = `async function acao(metodo, zap, phone) {
+  const body = { zap: zap, method: 'pairing' };
+  if (phone) body.phone = String(phone).replace(/\\D/g, '');
+  const r = await fetch('/' + metodo + ${JSON.stringify(postQs)}, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(function () { return {}; });
   if (!r.ok) { alert(j.error || ('erro ' + r.status)); } else { location.reload(); }
 }`;
-  const rows = (state.zaps || []).map(z => {
-    const qr = z.qrPending
-      ? `<img src="/qr?zap=${encodeURIComponent(z.id)}${tokenQs}" alt="QR do zap ${escapeHtml(z.name)}" style="width:180px;height:180px;background:#fff;padding:4px;border:1px solid #e5e7eb;border-radius:8px;margin-top:6px">`
-      : '';
+  const rows = (state.zaps || []).map((z, i) => {
     const zapJs = JSON.stringify(String(z.id));
+    const phone = String(z.phone || '').replace(/\D/g, '');
+    const code = z.pairingCode ? String(z.pairingCode) : '';
+    const inputId = `phone-${i}`;
+    const connection = z.status === 'ready'
+      ? 'conectado'
+      : (code
+        ? `<div class="pair-code">${escapeHtml(code)}</div><div class="hint">No celular: WhatsApp &gt; Dispositivos vinculados &gt; Vincular dispositivo &gt; Vincular com número de telefone</div>`
+        : 'aguardando número / código');
     const actions = z.status === 'ready'
       ? `<button onclick="acao('disconnect',${zapJs})">Desconectar</button>`
-      : `<button onclick="acao('connect',${zapJs})">Conectar (QR)</button>`;
+      : `<input class="phone-input" id="${inputId}" type="tel" inputmode="numeric" placeholder="5511999999999" value="${escapeHtml(phone)}">
+         <button onclick="acao('connect',${zapJs},document.getElementById('${inputId}').value)">Gerar código</button>`;
     return `<tr>
       <td>${escapeHtml(z.name || z.id)}</td>
       <td>${statusPill(z.status)}</td>
       <td>${z.enabled === false ? 'desligado' : 'ligado'} / auto: ${z.autoReply ? 'sim' : 'nao'}</td>
-      <td>${z.qrPending ? 'QR disponivel - escaneie pelo celular' : (z.status === 'ready' ? 'conectado' : 'desconectado')}${qr}</td>
+      <td>${connection}</td>
       <td>${actions}</td>
     </tr>`;
   }).join('\n');
@@ -76,7 +83,6 @@ function renderPage(state, logs, opts) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="5">
 <title>Assistente do Zap - Status</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f3f4f6;color:#111827}
@@ -90,6 +96,8 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid #f3f4f6;vertical-align
 th{color:#6b7280;font-weight:600;font-size:12px;text-transform:uppercase}
 button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 10px;font-size:13px;cursor:pointer}
 button:hover{background:#1d4ed8}
+.phone-input{width:150px;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;margin-right:6px}
+.pair-code{font-family:'Courier New',monospace;font-size:20px;font-weight:700;letter-spacing:2px;background:#f3f4f6;border:1px dashed #d1d5db;border-radius:6px;padding:4px 10px;display:inline-block;margin-bottom:4px}
 pre{background:#0b1220;color:#d1d5db;padding:12px;border-radius:8px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;max-height:420px;overflow-y:auto}
 .empty{color:#6b7280;font-size:14px}
 .hint{color:#6b7280;font-size:12px;margin-top:8px}
@@ -103,7 +111,7 @@ pre{background:#0b1220;color:#d1d5db;padding:12px;border-radius:8px;font-size:12
 <div class="card">
 <h2 style="margin-top:0">Zaps (${zapsCount})</h2>
 ${zapsCount ? `<table><thead><tr><th>Zap</th><th>Status</th><th>Ligado</th><th>Conexao</th><th>Acao</th></tr></thead><tbody>${rows}</tbody></table>
-<p class="hint">Ao clicar em Conectar o QR aparece aqui em ate 30s - escaneie com o celular. Depois de logado a sessao fica salva e o app reconecta sozinho ao reiniciar.</p>`
+<p class="hint">Informe o numero do celular (DDI + DDD + numero) e clique em Gerar codigo. O codigo aparece nesta pagina e vale por poucos minutos: no celular, abra WhatsApp &gt; Dispositivos vinculados &gt; Vincular dispositivo &gt; Vincular com numero de telefone. Depois de logado a sessao fica salva e o app reconecta sozinho ao reiniciar.</p>`
   : '<p class="empty">Nenhum zap configurado ainda. Configure no app do Windows e copie os arquivos zaps.json / providers.json / trainings.json para a pasta de dados do servidor.</p>'}
 </div>
 <div class="card">
@@ -111,7 +119,13 @@ ${zapsCount ? `<table><thead><tr><th>Zap</th><th>Status</th><th>Ligado</th><th>C
 <pre>${logText}</pre>
 </div>
 </div>
-<script>${actionJs}</script>
+<script>${actionJs}
+setInterval(function () {
+  var el = document.activeElement;
+  if (el && el.tagName === 'INPUT') return;
+  location.reload();
+}, 5000);
+</script>
 </body>
 </html>`;
 }
@@ -120,7 +134,6 @@ function createStatusServer(options) {
   const opts = options || {};
   const token = String(opts.token || '');
   const getState = opts.getState || (() => ({ ok: true }));
-  const getQr = opts.getQr || (() => null);
   const getLogs = opts.getLogs || (() => []);
 
   return http.createServer((req, res) => {
@@ -167,7 +180,7 @@ function createStatusServer(options) {
         }
         let result;
         try {
-          result = await handler(zapId, { method: body.method === 'pairing' ? 'pairing' : 'qrcode', phone: String(body.phone || '') });
+          result = await handler(zapId, { method: 'pairing', phone: String(body.phone || '') });
         } catch (e) {
           result = { status: 500, ok: false, error: e && e.message ? e.message : 'erro interno' };
         }
@@ -190,28 +203,6 @@ function createStatusServer(options) {
         try { lines = (await getLogs()) || []; } catch (e) { lines = [`erro ao ler logs: ${e.message}`]; }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         return res.end(JSON.stringify({ count: lines.length, lines: lines.slice(-n) }));
-      }
-
-      if (path === '/qr') {
-        const zapId = String(url.searchParams.get('zap') || '');
-        if (!zapId) {
-          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-          return res.end('400 - informe ?zap=ID');
-        }
-        const raw = await getQr(zapId);
-        if (!raw) {
-          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-          return res.end('404 - QR indisponivel para este zap (conecte o zap primeiro)');
-        }
-        let QRCode = null;
-        try { QRCode = require('qrcode'); } catch (_) { QRCode = null; }
-        if (!QRCode || typeof QRCode.toBuffer !== 'function') {
-          res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
-          return res.end('503 - pacote qrcode indisponivel');
-        }
-        const buf = await QRCode.toBuffer(String(raw), { type: 'png', width: 320, margin: 2, errorCorrectionLevel: 'M' });
-        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
-        return res.end(buf);
       }
 
       if (path === '/') {

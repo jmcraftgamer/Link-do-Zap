@@ -3492,31 +3492,6 @@ input, textarea, select {
   padding-left: 6px;
 }
 
-/* QR Code Container */
-.qr-container {
-  text-align: center;
-  padding: 20px;
-}
-
-.qr-code-img {
-  margin: 16px auto;
-  display: block;
-}
-
-.qr-status {
-  font-size: 13px;
-  color: var(--text-gray);
-  margin-top: 12px;
-}
-
-.qr-status.ready {
-  color: #16a34a;
-}
-
-.qr-status.error {
-  color: #dc2626;
-}
-
 /* ============================================
    WhatsApp Connection Modal
    ============================================ */
@@ -3528,87 +3503,12 @@ input, textarea, select {
   padding: 16px;
 }
 
-.connect-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 4px;
-  background: var(--bg-secondary);
-  border-radius: 8px;
-  margin-bottom: 14px;
-}
-
-.connect-tab {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  border: none;
-  background: transparent;
-  color: var(--text-gray);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.connect-tab:hover {
-  color: var(--text-primary);
-}
-
-.connect-tab.active {
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-}
-
-.connect-tab-content {
-  display: none;
-}
-
-.connect-tab-content.active {
-  display: block;
-}
-
 .connect-zap-name {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
   text-align: center;
   margin-bottom: 12px;
-}
-
-/* QR Code Section */
-.connect-qr-container {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  min-height: 170px;
-  background: var(--bg-secondary);
-  border-radius: 10px;
-  margin-bottom: 12px;
-}
-
-.connect-qr-loading {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  color: var(--text-gray);
-  font-size: 13px;
-}
-
-.connect-qr-image {
-  padding: 12px;
-}
-
-.connect-qr-image img {
-  width: 140px;
-  height: 140px;
-  border-radius: 8px;
-  border: 1px solid var(--border-color);
 }
 
 /* Pairing Code Section */

@@ -21,6 +21,13 @@ if [ "$QUICK" = "1" ]; then
   MODE="status"
 else
   git add -A --ignore-errors || exit 1
+  # Nunca versiona lixeira, temporarios nem cache volatil do Chromium (muda a
+  # cada segundo, e inconsistente e faz o repo crescer sem controle). A sessao
+  # de verdade (Local Storage/IndexedDB/cookies) continua indo no backup.
+  git reset -q -- \
+    'trash' '*.tmp' \
+    '*/Cache' '*/Code Cache' '*/GPUCache' '*/blob_storage' \
+    '*/Service Worker/CacheStorage' 2>/dev/null || true
   MODE="completo"
 fi
 
@@ -49,11 +56,12 @@ for i in 1 2 3; do
   sleep 3
 done
 
-# Ultimo recurso: nosso estado local e o mais completo (sessoes do servidor)
-if run_git_timeout git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 push --force-with-lease origin "HEAD:$BRANCH" >/dev/null 2>&1; then
-  echo "[BACKUP] push ok via force-with-lease (historico do repo remoto sobrescrito)"
+# Ultimo recurso: tenta mais uma vez. NUNCA usa --force: um force-push no
+# branch principal pode apagar configs e historico do repositorio de dados.
+if run_git_timeout git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 push origin "HEAD:$BRANCH" >/dev/null 2>&1; then
+  echo "[BACKUP] push ok na tentativa final"
   exit 0
 fi
 
-echo "[BACKUP] FALHOU apos 3 tentativas"
+echo "[BACKUP] FALHOU apos as tentativas (sem force-push, para preservar o historico)"
 exit 1

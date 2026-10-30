@@ -484,7 +484,10 @@ function at(y, mo, d, h, mi) {
 }
 
 function newStore(options) {
-  return new ConversationStore(null, options);
+  // As datas dos testes sao fixas (2026-09). Sem desligar a poda por idade,
+  // as conversas passariam de 30 dias conforme o calendario real avanca e os
+  // testes falhariam sozinhos. O teste especifico de poda passa suas opcoes.
+  return new ConversationStore(null, Object.assign({ maxAgeDays: 3650 }, options || {}));
 }
 
 function convMsg(body) {
@@ -563,14 +566,14 @@ test('MEMORIA: cada contato tem a sua propria conversa', () => {
 
 test('MEMORIA: historico persiste em disco e volta ao reiniciar o app', () => {
   const file = path.join(TMP_CONV_DIR, `conv-${Date.now()}.json`);
-  const s1 = new ConversationStore(file);
+  const s1 = new ConversationStore(file, { maxAgeDays: 3650 });
   s1.ensure('z1', 'c1', at(2026, 9, 27, 10, 0));
   s1.append('z1', 'c1', 'user', 'quanto custa?');
   s1.append('z1', 'c1', 'assistant', 'R$ 50');
   s1.flush();
   assert.ok(fs.existsSync(file));
 
-  const s2 = new ConversationStore(file);
+  const s2 = new ConversationStore(file, { maxAgeDays: 3650 });
   assert.strictEqual(s2.history('z1', 'c1').length, 2);
   assert.deepStrictEqual(s2.history('z1', 'c1')[1], { role: 'assistant', content: 'R$ 50' });
   const r = s2.ensure('z1', 'c1', at(2026, 9, 27, 18, 0));

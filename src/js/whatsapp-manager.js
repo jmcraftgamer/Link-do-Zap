@@ -2,8 +2,6 @@ const { Client, LocalAuth, MessageMedia } = require('wwebjs-electron');
 const path = require('path');
 const fs = require('fs');
 const { decryptWhatsAppMedia } = require('./media-crypto');
-let QRCode = null;
-try { QRCode = require('qrcode'); } catch (_) { console.warn('[QR] qrcode npm não encontrado, fallback para serviço remoto'); }
 
 class WhatsAppManager {
   constructor(mainWindow) {
@@ -97,7 +95,7 @@ class WhatsAppManager {
     this.onMessageCallback = callback;
   }
 
-  async connectZap(zapId, phoneNumber, method = 'qrcode') {
+  async connectZap(zapId, phoneNumber, method = 'pairing') {
     // Painel local com LINK_CONNECT_READONLY=1: a sessao deste zap vive no
     // servidor 24h. Conectar pelo PC reusa as mesmas credenciais em outro
     // navegador e o WhatsApp invalida a sessao do servidor (logout).
@@ -117,8 +115,8 @@ class WhatsAppManager {
         // recusava o pedido do usuario ("Conexao ja em curso") e o codigo
         // nunca aparecia. Durante 'connecting' (mid-boot) segue o guard.
         const wantPair = method === 'pairing' && !!String(phoneNumber || '').replace(/\D/g, '');
-        if (wantPair && (existing.status === 'waiting_qr' || existing.status === 'waiting_pairing')) {
-          this.logToApp(zapId, 'info', 'Pedido de pareamento: reiniciando conexao parada para gerar codigo novo...');
+        if (wantPair && (existing.status === 'waiting_qr' || existing.status === 'waiting_pairing' || existing.status === 'ready')) {
+          this.logToApp(zapId, 'info', 'Pedido de pareamento: reiniciando conexao para gerar codigo novo...');
           await this.disconnectZap(zapId, 'troca para pareamento');
         } else {
           // Corrida de conectividade (boot: auto-connect + campanha AUTOMSG):
@@ -137,31 +135,51 @@ class WhatsAppManager {
     const cacheKeepPath = path.join(this._baseDir, 'sessions', `${zapId}.cache-keep`);
     const profilePath = path.join(sessionPath, `session-${zapId}`, 'Default');
 
-    // For pairing code, always start fresh (no old sessions)
-    if (method === 'pairing' && fs.existsSync(sessionPath)) {
-      // Guarda o cache HTTP do Chromium (padrao ~28 MB de bundles do WA Web)
-      // antes de apagar: a autenticacao (IndexedDB/Local Storage/Session
-      // Storage/Cookies) some junto com a pasta, mas os arquivos baixados
-      // ficam e sao devolvidos depois - conexao muito mais rapida.
-      // Melhor esforco: se falhar, o pareamento segue normalmente.
+    const cleanPhone = String(phoneNumber || '').replace(/\D/g, '');
+    const hadSession = fs.existsSync(sessionPath);
+    // Modo pareamento:
+    //  - 'pairing' explicito (painel): sempre limpa a sessao e gera codigo novo
+    //  - 'qrcode'/reconexao: so pareia quando NAO existe sessao salva
+    const explicitPairing = method === 'pairing';
+    const isPairing = !!cleanPhone && (explicitPairing || !hadSession);
+
+    // For explicit pairing, always start fresh (no old sessions)
+    if (explicitPairing && hadSession) {
+      // Limpeza cirúrgica das credenciais de autenticação (IndexedDB, Storage, Cookies)
+      // mantendo a pasta Cache e Code Cache no lugar. Sem mover arquivos de lá para cá,
+      // a limpeza é instantânea e o Chromium reutiliza os arquivos do WhatsApp Web em disco,
+      // tornando a inicialização e geração do código muito mais rápida.
       try {
-        fs.rmSync(cacheKeepPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
         if (fs.existsSync(profilePath)) {
-          fs.mkdirSync(cacheKeepPath, { recursive: true });
-          for (const d of ['Cache', 'Code Cache']) {
-            const src = path.join(profilePath, d);
-            if (fs.existsSync(src)) fs.renameSync(src, path.join(cacheKeepPath, d));
+          const authDirs = ['IndexedDB', 'Local Storage', 'Session Storage', 'Sync Data', 'blob_storage', 'databases', 'Service Worker'];
+          for (const d of authDirs) {
+            const p = path.join(profilePath, d);
+            if (fs.existsSync(p)) {
+              try { fs.rmSync(p, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); } catch (_) {}
+            }
           }
+          const authFiles = ['Cookies', 'Cookies-journal', 'Login Data', 'Login Data-journal', 'Web Data', 'Web Data-journal'];
+          for (const f of authFiles) {
+            const p = path.join(profilePath, f);
+            if (fs.existsSync(p)) {
+              try { fs.rmSync(p, { force: true }); } catch (_) {}
+            }
+          }
+          const netDir = path.join(profilePath, 'Network');
+          if (fs.existsSync(netDir)) {
+            for (const f of ['Cookies', 'Cookies-journal', 'Network Persistent State']) {
+              const p = path.join(netDir, f);
+              if (fs.existsSync(p)) {
+                try { fs.rmSync(p, { force: true }); } catch (_) {}
+              }
+            }
+          }
+          this.logToApp(zapId, 'info', 'Autenticação anterior limpa (cache HTTP do navegador preservado para inicialização rápida).');
+        } else {
+          try { fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch (_) {}
         }
-      } catch (cacheErr) {
-        console.warn('[CACHE] Nao foi possivel preservar o cache HTTP:', cacheErr.message);
-        try { fs.rmSync(cacheKeepPath, { recursive: true, force: true }); } catch (_) { /* ignore */ }
-      }
-      try {
-        fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
-        this.logToApp(zapId, 'info', 'Sessao antiga removida (pareamento)');
       } catch (e) {
-        console.error('Erro ao remover sessao antiga:', e);
+        console.warn('Erro ao limpar credenciais antigas:', e.message);
       }
     }
 
@@ -177,36 +195,18 @@ class WhatsAppManager {
       fs.mkdirSync(sessionPath, { recursive: true });
     }
 
-    // Devolve o cache HTTP preservado (o LocalAuth recria o perfil em session-<id>)
-    try {
-      if (fs.existsSync(cacheKeepPath)) {
-        fs.mkdirSync(profilePath, { recursive: true });
-        let restored = 0;
-        for (const d of fs.readdirSync(cacheKeepPath)) {
-          const dest = path.join(profilePath, d);
-          if (fs.existsSync(dest)) {
-            fs.rmSync(dest, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-          }
-          fs.renameSync(path.join(cacheKeepPath, d), dest);
-          restored++;
-        }
-        fs.rmSync(cacheKeepPath, { recursive: true, force: true });
-        if (restored) this.logToApp(zapId, 'info', `Cache HTTP do navegador preservado (${restored} pastas) - conexao mais rapida.`);
-      }
-    } catch (e) {
-      console.warn('[CACHE] Falha ao restaurar cache HTTP:', e.message);
-    }
-
-    const cleanPhone = phoneNumber.replace(/\D/g, '');
-    this.logToApp(zapId, 'info', `Conectando ao WhatsApp (${cleanPhone}, metodo: ${method})...`);
+    this.logToApp(zapId, 'info', `Conectando ao WhatsApp (${cleanPhone || 'sessao salva'}, metodo: ${isPairing ? 'codigo' : 'sessao'})...`);
 
     const clientOptions = {
       authStrategy: new LocalAuth({
         clientId: zapId,
         dataPath: sessionPath
       }),
-      // Redes lentas: o WA Web pode demorar para expor window.Debug apos o
-      // evento load. O padrao do wwebjs e 30s e estoura "auth timeout".
+      pairWithPhoneNumber: isPairing && cleanPhone ? {
+        phoneNumber: cleanPhone,
+        showNotification: true,
+        intervalMs: 180000
+      } : undefined,
       authTimeoutMs: 180000,
       puppeteer: {
         headless: true,
@@ -218,9 +218,11 @@ class WhatsAppManager {
           '--no-first-run',
           '--disable-gpu',
           '--disable-features=IsolateOrigins,site-per-process,Translate,BackForwardCache,MediaRouter,OptimizationHints',
-          // Performance: evita trabalhos em background de atrair o carregamento
-          '--disable-background-networking',
+          '--disable-extensions',
+          '--disable-default-apps',
           '--disable-component-update',
+          '--disable-domain-reliability',
+          '--disable-background-networking',
           '--disable-sync',
           '--disable-background-timer-throttling',
           '--disable-renderer-backgrounding',
@@ -251,9 +253,8 @@ class WhatsAppManager {
       console.warn('[WWEB] Falha ao ler cache de versao:', e.message);
     }
 
-    // Pareamento robusto: nao usar pairWithPhoneNumber no construtor para controle total
-    // Vamos chamar requestPairingCode explicitamente apos initialize
-    const isPairing = method === 'pairing' && !!cleanPhone;
+    // Pareamento robusto: nao usar pairWithPhoneNumber no construtor para
+    // controle total. isPairing foi calculado acima (metodo + telefone).
 
     const client = new Client(clientOptions);
 
@@ -279,26 +280,51 @@ class WhatsAppManager {
       aiSentIds: new Set(),
       // Marcadores (corpo + timestamp) de envios em andamento da IA
       pendingAiSends: [],
+      // Cursor por chat (segundos): ultima mensagem ja tratada. Usado para
+      // recuperar o backlog que chegou enquanto o bot estava offline.
+      chatCursors: new Map(),
+      // IDs ja processados nesta sessao (evita responder duas vezes o backlog)
+      processedMsgKeys: new Set(),
+      // true enquanto o catch-up do backlog esta rodando
+      backlogRunning: false,
       // Watchdog de pareamento (polling do socket) - detecta quando o
       // celular aceita o codigo e força a conclusao se o 'ready' nao chegar
       _pairWatchdog: null
     });
 
-    client.on('qr', async (qr) => {
+    client.on('qr', async () => {
       const data = this.clients.get(zapId);
       // Nunca rebaixa o status depois de autenticado/ready, nem sobrescreve
-      // a tela de pareamento (a pagina renova o QR a cada 20s enquanto
-      // UNPAIRED e derrubava o codigo de pareamento da UI)
+      // um codigo de pareamento ja exibido.
       if (!data || data.client !== client || data.status === 'ready' || data.status === 'authenticated' || data.status === 'waiting_pairing' || data.status === 'pairing_accepted') return;
-      this.logToApp(zapId, 'info', 'QR Code gerado. Escaneie com o celular.');
-      data.qrCode = qr;
       data.status = 'waiting_qr';
-      let dataUrl = null;
-      if (QRCode) {
-        try { dataUrl = await QRCode.toDataURL(qr, { width: 280, margin: 1 }); } catch (e) { console.warn('[QR] falha ao gerar dataUrl:', e.message); }
+      // A interface nao tem mais QR: se temos o numero, pedimos o codigo.
+      if (!isPairing || !cleanPhone) {
+        this.logToApp(zapId, 'warning', 'WhatsApp aguardando autenticacao. Informe o numero do celular para gerar o codigo de pareamento.');
+        return;
       }
-      this.saveQrPng(zapId, dataUrl);
-      this.sendToRenderer('whatsapp-qr', { zapId, qr, dataUrl });
+      // Se já temos código ou já há uma requisição em curso, evita duplicar
+      if (data.pairingCode || data._pairingRequested) return;
+      data._pairingRequested = true;
+      try {
+        this.logToApp(zapId, 'info', `Solicitando codigo de pareamento para ${cleanPhone}...`);
+        const code = await this._withTimeout(client.requestPairingCode(cleanPhone), 20000, 'requestPairingCode');
+        if (data && code) {
+          data.pairingCode = code;
+          data.status = 'waiting_pairing';
+          this.registerPairingCode(zapId, code);
+          this.logToApp(zapId, 'success', this.pairingLogMessage(code));
+          this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
+          this._startPairingWatchdog(zapId, client);
+        }
+      } catch (e) {
+        if (!data.pairingCode) {
+          this.logToApp(zapId, 'warning', `Falha ao solicitar codigo de pareamento: ${e.message}`);
+          this.sendToRenderer('whatsapp-status', { zapId, status: 'pairing_error', error: e.message });
+        }
+      } finally {
+        if (data) data._pairingRequested = false;
+      }
     });
 
     client.on('code', (code) => {
@@ -387,6 +413,10 @@ class WhatsAppManager {
         const stack = e && e.stack ? e.stack.split('\n')[0] : '';
         console.error('[CONTACTS] Erro:', msg, stack);
         this.logToApp(zapId, 'warning', `Erro ao buscar contatos: ${msg} ${stack}`);
+      });
+      // Recupera mensagens que chegaram enquanto o bot estava offline.
+      this.catchUpBacklog(zapId).catch(e => {
+        console.warn('[BACKLOG] falha no catch-up:', e && e.message ? e.message : e);
       });
     };
     const handleAuthenticated = () => {
@@ -515,17 +545,6 @@ class WhatsAppManager {
         const data = this.clients.get(zapId);
         if (!data || data.client !== client) return;
 
-        // DONO RESPONDEU MANUALMENTE (celular/outro aparelho): registra o
-        // horario para a IA NAO responder por cima. 'web' = mesma sessao do
-        // app (envio da propria IA/UI) - nao conta como resposta do dono.
-        if (msg.deviceType && msg.deviceType !== 'web') {
-          const ownerJid = msg.to || msg.from || '';
-          if (!this._isGroupJid(ownerJid)) {
-            this.markOwnerReply(zapId, ownerJid, msg.timestamp);
-            this.logToApp(zapId, 'info', `Dono respondeu manualmente (${msg.deviceType}) em ${ownerJid} - IA nao vai responder por cima.`);
-          }
-        }
-
         // Chat da mensagem: para mensagens enviadas por mim, o chat e msg.to
         const chatJid = msg.to || msg.from || '';
         const chatNum = this._normNum(chatJid);
@@ -536,6 +555,10 @@ class WhatsAppManager {
           console.log(`[GRUPO] mensagem propria em grupo descartada (zap ${zapId}) - nao vai para a IA`);
           return;
         }
+
+        // Envio pelo NOSSO app/IA? Nao depende de deviceType (ele chega
+        // undefined em varias versoes mesmo para envio manual do celular).
+        const isOwnSend = this._isOwnAppSend(data, msg);
 
         // Somente o chat do proprio numero (autochat). Outros chats saem aqui.
         const selfNums = this._selfNums(data);
@@ -553,10 +576,15 @@ class WhatsAppManager {
           } catch (_) { /* contato nao resolvido - nao e autochat */ }
         }
         if (!isSelfChat) {
-          // O dono respondeu manualmente (celular/outro aparelho) num chat comum:
-          // registra no historico da UI. Envios 'web' (nosso app) ja sao
-          // registrados no proprio sendMessage/sendMedia.
-          if (msg.deviceType && msg.deviceType !== 'web') {
+          // DONO RESPONDEU MANUALMENTE (celular/outro aparelho) num chat comum:
+          // registra o horario (para a IA nao responder por cima) e a mensagem
+          // no historico da UI. Envios do nosso app/IA ja sao registrados no
+          // proprio sendMessage/sendMedia.
+          // Nao depende de deviceType: ele chega undefined em varias versoes
+          // mesmo para envio manual do celular.
+          if (!isOwnSend) {
+            this.markOwnerReply(zapId, chatJid, msg.timestamp);
+            this.logToApp(zapId, 'info', `Dono respondeu manualmente em ${chatJid} - IA nao vai responder por cima.`);
             try {
               const chatObj = await msg.getChat();
               const cid = chatObj && chatObj.id && (chatObj.id._serialized || chatObj.id);
@@ -577,37 +605,14 @@ class WhatsAppManager {
 
         const msgId = this._ensureMsgKey(msg);
         const bodyTxt = msg.body || '';
-        // deviceType 'web' = enviado pela mesma sessao web (a IA envia por aqui).
-        // Mensagens vindas do celular do usuario sao 'android'/'ios' - nunca sao da IA.
-        const isWebMsg = msg.deviceType === 'web';
 
-        // Anti-loop 1: id ja identificado como enviado pela IA (definitivo)
-        if (msgId && data.aiSentIds && data.aiSentIds.has(msgId)) {
-          this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop id): "${bodyTxt.substring(0, 60)}"`);
+        // Anti-loop: mensagem enviada pelo NOSSO app/IA nunca volta para a IA.
+        // No autochat a mensagem manual do dono E a entrada da IA, entao so
+        // descartamos o que sabemos ser envio nosso.
+        if (isOwnSend) {
+          if (msgId && data.aiSentIds) data.aiSentIds.add(msgId);
+          this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop): "${bodyTxt.substring(0, 60)}"`);
           return;
-        }
-
-        // Anti-loop 2: envio da IA ainda em curso (o message_create do envio proprio
-        // chega antes do sendMessage resolver, entao o id ainda nao esta em aiSentIds).
-        // Nessa janela, mensagem 'web' = nossa sessao = resposta da IA.
-        // Apos resolver, o id cai em aiSentIds (anti-loop 1) e tambem casamos por corpo.
-        const aiSending = !!data.aiSending;
-        if (aiSending && isWebMsg && msgId) {
-          if (data.aiSentIds) data.aiSentIds.add(msgId); // fixa para nao depender da janela
-          this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop janela): "${bodyTxt.substring(0, 60)}"`);
-          return;
-        }
-        if (isWebMsg && data.pendingAiSends && data.pendingAiSends.length) {
-          const idx = data.pendingAiSends.findIndex(p => {
-            if ((Date.now() - p.t) >= 20000) return false;
-            if (p.midia) return msg.hasMedia;
-            return p.body === bodyTxt;
-          });
-          if (idx !== -1) {
-            data.pendingAiSends.splice(idx, 1);
-            this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop marca): "${bodyTxt.substring(0, 60)}"`);
-            return;
-          }
         }
 
         data.messages.set(msgId, msg);
@@ -648,49 +653,33 @@ class WhatsAppManager {
         this.logToApp(zapId, 'info', `Navegador e pagina do WhatsApp prontos em ${sec(tInit, Date.now())}s.`);
       }
 
-      // Pareamento robusto: gerar codigo explicitamente apos initialize
-      if (isPairing) {
-        try {
-          this.logToApp(zapId, 'info', `Solicitando codigo de pareamento para ${cleanPhone}...`);
-          // Pequeno delay para garantir que a pagina carregou
-          await new Promise(r => setTimeout(r, 100));
-          let code;
+      // Pareamento robusto: se o código ainda não foi gerado pelo pairWithPhoneNumber, solicita como fallback único
+      if (isPairing && cleanPhone) {
+        const data = this.clients.get(zapId);
+        if (data && !data.pairingCode && !data._pairingRequested && data.status !== 'ready' && data.status !== 'authenticated') {
+          data._pairingRequested = true;
           try {
-            code = await this._withTimeout(client.requestPairingCode(cleanPhone), 20000, 'requestPairingCode');
-          } catch (firstErr) {
-            // Fallback: tentar com intervalo explicito
-            this.logToApp(zapId, 'warning', `Primeira tentativa falhou (${firstErr.message}), tentando novamente...`);
-            await new Promise(r => setTimeout(r, 300));
-            code = await this._withTimeout(client.requestPairingCode(cleanPhone, true), 20000, 'requestPairingCode');
+            this.logToApp(zapId, 'info', `Solicitando codigo de pareamento para ${cleanPhone}...`);
+            await new Promise(r => setTimeout(r, 100));
+            const code = await this._withTimeout(client.requestPairingCode(cleanPhone), 20000, 'requestPairingCode');
+            if (code && data) {
+              data.pairingCode = code;
+              data.status = 'waiting_pairing';
+              this.registerPairingCode(zapId, code);
+              this.logToApp(zapId, 'success', this.pairingLogMessage(code, `(${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio)`));
+              this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
+              this._startPairingWatchdog(zapId, client);
+            }
+          } catch (e) {
+            if (data && !data.pairingCode) {
+              this.logToApp(zapId, 'error', `Falha ao solicitar codigo de pareamento: ${e.message}`);
+              this.sendToRenderer('whatsapp-status', { zapId, status: 'pairing_error', error: e.message });
+            }
+          } finally {
+            if (data) data._pairingRequested = false;
           }
-          const data = this.clients.get(zapId);
-          // O evento 'code' (disparado pela propria pagina) ja registrou e
-          // enviou o codigo para a UI antes do evaluate resolver - so completamos
-          // com o tempo de conexao para diagnóstico
-          const alreadySent = data && data.pairingCode === code;
-          if (data) {
-            data.pairingCode = code;
-            data.status = 'waiting_pairing';
-          }
-          this.registerPairingCode(zapId, code);
-          if (alreadySent) {
-            this.logToApp(zapId, 'info', `Codigo pronto em ${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio.`);
-          } else {
-            this.logToApp(zapId, 'success', this.pairingLogMessage(code, `(${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio)`));
-            this.sendToRenderer('whatsapp-pairing-code', { zapId, code });
-          }
-          // Watchdog (idempotente): garante deteccao mesmo se o evento 'code'
-          // da pagina nao disparar neste caminho manual
-          this._startPairingWatchdog(zapId, client);
-          // Sem regeneracao daqui: o intervalo proprio da pagina (3 min, padrao
-          // do wwebjs) renova o codigo enquanto nao pareado e dispara o evento
-          // 'code' para a UI. Regenerar manualmente reiniciava o vinculo por
-          // cima do usuario digitando, travava 180s no protocolTimeout e
-          // acabava derrubando a sessao (LOGOUT).
-        } catch (e) {
-          this.logToApp(zapId, 'error', `Falha ao solicitar codigo de pareamento: ${e.message}`);
-          // Nao joga erro fatal - deixa usuario tentar novamente ou usar QR
-          this.sendToRenderer('whatsapp-status', { zapId, status: 'pairing_error', error: e.message });
+        } else if (data && data.pairingCode) {
+          this.logToApp(zapId, 'info', `Codigo pronto em ${((Date.now() - tInit) / 1000).toFixed(1)}s desde o inicio.`);
         }
       }
 
@@ -703,7 +692,8 @@ class WhatsAppManager {
     }
   }
 
-  async handleMessage(zapId, msg) {
+  async handleMessage(zapId, msg, opts) {
+    const fromBacklog = !!(opts && opts.fromBacklog);
     try {
       // Garante a chave da mensagem antes de qualquer uso (cache/IA/audio)
       this._ensureMsgKey(msg);
@@ -884,12 +874,22 @@ class WhatsAppManager {
         return;
       }
 
-      // REGRA 1: Bot precisa estar pronto. Aceita 'ready' (sync concluido) e
-      // tambem 'authenticated' (sessao ja autenticada, socket aberto) - assim
-      // mensagens que chegam logo apos o pareamento NAO sao descartadas.
+      // REGRA 1: Bot precisa estar pronto para ENVIAR. Aceita 'authenticated'
+      // apenas para ESPERAR o ready (chega segundos depois): antes disso a IA
+      // gerava a resposta, o sendMessage falhava e o cliente ficava sem
+      // resposta (e o historico ganhava uma mensagem fantasma).
       if (clientData.status !== 'ready' && clientData.status !== 'authenticated') {
         this.logToApp(zapId, 'warning', `IA ignorada: status atual e "${clientData.status}" (aguardando ready).`);
         return;
+      }
+      if (clientData.status !== 'ready') {
+        this.logToApp(zapId, 'info', `Mensagem de ${contactName} aguardando a conexao ficar pronta...`);
+        const ready = await this._waitForReady(zapId, 180000);
+        if (!ready) {
+          this.logToApp(zapId, 'warning',
+            `Conexao nao ficou pronta a tempo - a mensagem de ${contactName} sera recuperada pelo backlog.`);
+          return;
+        }
       }
 
       // REGRA 1b: Ignora templates vazios / notificações internas sem texto (ex: notification_template com body "")
@@ -908,21 +908,25 @@ class WhatsAppManager {
       }
 
       // REGRA 2: o wwebjs SO emite o evento 'message' para mensagens novas
-      // (no listener injetado: `if (!msg.isNewMsg) return`) - historico/backlog
-      // NUNCA chega aqui. Por isso nao ha filtro por relogio do PC (que estava
-      // descartando mensagens reais por skew de minutos). Mantemos apenas uma
-      // sanidade independente de relogio: ignora se a mensagem for bem mais
-      // antiga (3 min) que a mensagem mais nova ja vista nesta sessao.
+      // (no listener injetado: `if (!msg.isNewMsg) return`). O backlog e
+      // recuperado explicitamente por catchUpBacklog(), que passa fromBacklog.
+      // Para mensagens ao vivo mantemos uma sanidade independente de relogio:
+      // ignora se for bem mais antiga (3 min) que a mais nova ja vista.
       const msgTs = Number(msg.timestamp) || 0;
-      if (msgTs) {
+      if (msgTs && !fromBacklog) {
         const newest = Number(clientData.newestMsgTs) || 0;
         if (newest && msgTs < newest - 180) {
           this.logToApp(zapId, 'warning',
             `IA ignorada: mensagem antiga (msg ${msgTs} < mais nova vista ${newest} -180s).`);
           return;
         }
-        if (msgTs > newest) clientData.newestMsgTs = msgTs;
       }
+      if (msgTs && msgTs > (Number(clientData.newestMsgTs) || 0)) {
+        clientData.newestMsgTs = msgTs;
+      }
+      // Cursor por chat: marca ate onde este chat ja foi tratado (usado pelo
+      // backlog para nao responder duas vezes a mesma mensagem).
+      this._setChatCursor(zapId, chatId, msgTs);
 
       // Passou em todos os filtros - chamar a IA!
       this.logToApp(zapId, 'info', `Filtros aprovados. Enviando mensagem de ${contactName} para a IA...`);
@@ -2079,38 +2083,295 @@ class WhatsAppManager {
   }
 
   // ============================================================
-  // RESPOSTA DO DONO DO NUMERO (evita a IA responder por cima)
+  // CURSOR DE BACKLOG + ESPERA DE "READY"
   // ============================================================
 
-  // Registra que o dono respondeu neste chat no horario `ts` (segundos).
-  markOwnerReply(zapId, chatId, ts) {
-    const cd = this.clients.get(String(zapId));
-    if (!cd) return;
-    const chatNorm = this._normNum(chatId);
-    if (!chatNorm) return;
-    if (!cd.ownerReplies) cd.ownerReplies = new Map();
-    const t = Number(ts) || Math.floor(Date.now() / 1000);
-    if (t > (cd.ownerReplies.get(chatNorm) || 0)) {
-      cd.ownerReplies.set(chatNorm, t);
+  _withTimeout(promise, ms, label) {
+    return Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => {
+        const t = setTimeout(() => reject(new Error(`${label || 'operacao'} expirou (${ms}ms)`)), ms);
+        if (t && typeof t.unref === 'function') t.unref();
+      })
+    ]);
+  }
+
+  // Espera o Zap ficar 'ready'. Usado quando uma mensagem chega em
+  // 'authenticated': processar antes disso fazia a IA gerar a resposta e o
+  // envio falhar (sendMessage exige ready).
+  _waitForReady(zapId, timeoutMs = 180000) {
+    const started = Date.now();
+    return new Promise((resolve) => {
+      const check = () => {
+        const cd = this.clients.get(String(zapId));
+        if (cd && cd.status === 'ready') return resolve(true);
+        if (!cd || cd.status === 'disconnected' || cd.status === 'auth_failure') return resolve(false);
+        if (Date.now() - started >= timeoutMs) return resolve(false);
+        const t = setTimeout(check, 1000);
+        if (t && typeof t.unref === 'function') t.unref();
+      };
+      check();
+    });
+  }
+
+  _backlogCursorPath() {
+    return path.join(this._baseDir, 'backlog-cursors.json');
+  }
+
+  _loadBacklogCursors() {
+    if (this._backlogCursorsDisk) return this._backlogCursorsDisk;
+    try {
+      const obj = JSON.parse(fs.readFileSync(this._backlogCursorPath(), 'utf8'));
+      this._backlogCursorsDisk = obj && typeof obj === 'object' ? obj : {};
+    } catch (_) {
+      this._backlogCursorsDisk = {};
+    }
+    return this._backlogCursorsDisk;
+  }
+
+  _persistBacklogCursors() {
+    try {
+      const out = Object.assign({}, this._loadBacklogCursors());
+      for (const [zapId, data] of this.clients) {
+        if (!data || !data.chatCursors || !data.chatCursors.size) continue;
+        out[zapId] = Object.fromEntries(data.chatCursors);
+      }
+      fs.mkdirSync(this._baseDir, { recursive: true });
+      fs.writeFileSync(this._backlogCursorPath(), JSON.stringify(out, null, 2));
+      this._backlogCursorsDisk = out;
+    } catch (e) {
+      console.warn('[BACKLOG] falha ao salvar cursores:', e.message);
     }
   }
 
-  // O dono respondeu depois de `sinceTs`? Checa o evento em tempo real e,
-  // quando `opts.live`, confere ao vivo na rede (pega o que o evento perdeu).
-  async hasOwnerReplied(zapId, chatId, sinceTs, opts) {
+  schedulePersistBacklog() {
+    if (this._backlogSaveTimer) return;
+    this._backlogSaveTimer = setTimeout(() => {
+      this._backlogSaveTimer = null;
+      this._persistBacklogCursors();
+    }, 3000);
+    if (this._backlogSaveTimer.unref) this._backlogSaveTimer.unref();
+  }
+
+  _getChatCursor(zapId, chatId) {
     const cd = this.clients.get(String(zapId));
-    if (!cd) return false;
+    const num = this._normNum(chatId);
+    if (!num) return 0;
+    let fromDisk = 0;
+    try {
+      const all = this._loadBacklogCursors();
+      const perZap = all[String(zapId)];
+      if (perZap && perZap[num]) fromDisk = Number(perZap[num]) || 0;
+    } catch (_) {}
+    const inMem = cd && cd.chatCursors ? (cd.chatCursors.get(num) || 0) : 0;
+    return Math.max(fromDisk, inMem);
+  }
+
+  _setChatCursor(zapId, chatId, ts) {
+    const cd = this.clients.get(String(zapId));
+    const num = this._normNum(chatId);
+    const t = Number(ts) || 0;
+    if (!cd || !num || !t) return;
+    if (!cd.chatCursors) cd.chatCursors = new Map();
+    if (t > (cd.chatCursors.get(num) || 0)) {
+      cd.chatCursors.set(num, t);
+      this.schedulePersistBacklog();
+    }
+  }
+
+  // A mensagem enviada foi pelo NOSSO app/IA? Usado para nao confundir o envio
+  // da propria IA com uma resposta manual do dono. Nao depende de deviceType:
+  // em varias versoes ele chega undefined mesmo para envio do celular.
+  _isOwnAppSend(data, msg) {
+    if (!msg || !msg.fromMe) return false;
+    if (msg.deviceType === 'web') return true;
+    const id = this._ensureMsgKey(msg);
+    if (id && data && data.aiSentIds && data.aiSentIds.has(id)) return true;
+    if (data && Array.isArray(data.pendingAiSends) && data.pendingAiSends.length) {
+      const now = Date.now();
+      data.pendingAiSends = data.pendingAiSends.filter((p) => now - (p.t || 0) < 60000);
+      const body = String(msg.body || '').trim();
+      const idx = data.pendingAiSends.findIndex((p) => {
+        if (p.midia) return !!msg.hasMedia;
+        return String(p.body || '').trim() === body;
+      });
+      if (idx !== -1) {
+        data.pendingAiSends.splice(idx, 1);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Recupera mensagens que chegaram enquanto o bot estava offline/desconectado.
+  // O evento 'message' do wwebjs so entrega mensagens novas (isNewMsg), entao
+  // sem isto o cliente que escreveu durante uma queda NUNCA era respondido.
+  async catchUpBacklog(zapId) {
+    const data = this.clients.get(String(zapId));
+    if (!data || data.status !== 'ready' || !data.client || !this.onMessageCallback) return;
+    if (data.backlogRunning) return;
+    data.backlogRunning = true;
+    try {
+      // Deixa a pagina estabilizar depois do ready.
+      await new Promise((r) => setTimeout(r, 4000));
+      const current = this.clients.get(String(zapId));
+      if (!current || current.client !== data.client || data.status !== 'ready') return;
+
+      const client = data.client;
+      const chats = await this._withTimeout(client.getChats(), 25000, 'getChats');
+      if (!Array.isArray(chats) || !chats.length) return;
+
+      const now = Math.floor(Date.now() / 1000);
+      const hasCursor = data.chatCursors && data.chatCursors.size > 0;
+      // Primeira vez: nao responde coisas antigas demais.
+      const maxAge = now - (hasCursor ? 24 * 3600 : 2 * 3600);
+      const candidates = [];
+      for (const chat of chats) {
+        try {
+          if (!chat || chat.isGroup) continue;
+          const id = chat.id && (chat.id._serialized || chat.id);
+          if (!id || this._isGroupJid(id)) continue;
+          const lastTs = Number(chat.lastMessage && chat.lastMessage.timestamp) || 0;
+          const unread = Number(chat.unreadCount) || 0;
+          const cursor = this._getChatCursor(zapId, id);
+          if (!unread && lastTs <= cursor) continue;
+          if (lastTs && lastTs < maxAge) continue;
+          candidates.push({ chat, id, lastTs });
+        } catch (_) { /* chat quebrado - segue */ }
+      }
+      candidates.sort((a, b) => b.lastTs - a.lastTs);
+      const limit = Math.min(candidates.length, 15);
+      let processed = 0;
+      for (let i = 0; i < limit; i++) {
+        const { chat, id } = candidates[i];
+        try {
+          if (this.clients.get(String(zapId)) !== data || data.status !== 'ready') break;
+          const msgs = await this._withTimeout(chat.fetchMessages({ limit: 8 }), 15000, 'fetchMessages');
+          if (!Array.isArray(msgs) || !msgs.length) continue;
+          const last = msgs[msgs.length - 1];
+          // Dono/IA ja respondeu por ultimo: nao responde por cima.
+          if (last && last.fromMe) {
+            this._setChatCursor(zapId, id, Number(last.timestamp) || 0);
+            continue;
+          }
+          const cursor = this._getChatCursor(zapId, id);
+          let target = null;
+          for (const m of msgs) {
+            if (!m || m.fromMe) continue;
+            const ts = Number(m.timestamp) || 0;
+            if (ts > cursor && (!target || ts > (Number(target.timestamp) || 0))) target = m;
+          }
+          if (!target) continue;
+          const key = this._ensureMsgKey(target);
+          if (key && data.processedMsgKeys && data.processedMsgKeys.has(key)) continue;
+          if (key) data.processedMsgKeys.add(key);
+          // Marca antes de processar: se o envio falhar, nao repete em loop.
+          this._setChatCursor(zapId, id, Number(target.timestamp) || 0);
+          processed++;
+          this.logToApp(zapId, 'info', `Backlog: recuperando mensagem de ${chat.name || id}`);
+          await this.handleMessage(zapId, target, { fromBacklog: true });
+        } catch (e) {
+          console.warn(`[BACKLOG] falha no chat ${id}: ${e.message}`);
+        }
+      }
+      if (processed) this.logToApp(zapId, 'success', `Backlog: ${processed} conversa(s) recuperada(s).`);
+    } catch (e) {
+      console.warn('[BACKLOG] catch-up falhou:', e.message);
+    } finally {
+      data.backlogRunning = false;
+      data.lastBacklogAt = Date.now();
+    }
+  }
+
+  // ============================================================
+  // RESPOSTA DO DONO DO NUMERO (evita a IA responder por cima)
+  // ============================================================
+
+  _ownerRepliesPath() {
+    return path.join(this._baseDir, 'owner-replies.json');
+  }
+
+  _loadOwnerRepliesDisk() {
+    if (this._ownerRepliesDisk) return this._ownerRepliesDisk;
+    try {
+      const obj = JSON.parse(fs.readFileSync(this._ownerRepliesPath(), 'utf8'));
+      this._ownerRepliesDisk = obj && typeof obj === 'object' ? obj : {};
+    } catch (_) {
+      this._ownerRepliesDisk = {};
+    }
+    return this._ownerRepliesDisk;
+  }
+
+  schedulePersistOwnerReplies() {
+    if (this._ownerReplySaveTimer) return;
+    this._ownerReplySaveTimer = setTimeout(() => {
+      this._ownerReplySaveTimer = null;
+      try {
+        const out = this._loadOwnerRepliesDisk();
+        for (const [zapId, data] of this.clients) {
+          if (!data || !data.ownerReplies || !data.ownerReplies.size) continue;
+          out[zapId] = Object.fromEntries(data.ownerReplies);
+        }
+        // Descarta marcas com mais de 7 dias.
+        const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 3600;
+        for (const zapId of Object.keys(out)) {
+          for (const num of Object.keys(out[zapId] || {})) {
+            if ((Number(out[zapId][num]) || 0) < cutoff) delete out[zapId][num];
+          }
+        }
+        fs.mkdirSync(this._baseDir, { recursive: true });
+        fs.writeFileSync(this._ownerRepliesPath(), JSON.stringify(out, null, 2));
+        this._ownerRepliesDisk = out;
+      } catch (e) {
+        console.warn('[OWNER] falha ao salvar respostas do dono:', e.message);
+      }
+    }, 2000);
+    if (this._ownerReplySaveTimer.unref) this._ownerReplySaveTimer.unref();
+  }
+
+  // Registra que o dono respondeu neste chat no horario `ts` (segundos).
+  // Funciona MESMO sem cliente conectado (resposta antes do pareamento) e
+  // sobrevive a reinicio/reconexao.
+  markOwnerReply(zapId, chatId, ts) {
+    const chatNorm = this._normNum(chatId);
+    if (!chatNorm) return;
+    const t = Number(ts) || Math.floor(Date.now() / 1000);
+    const cd = this.clients.get(String(zapId));
+    if (cd) {
+      if (!cd.ownerReplies) cd.ownerReplies = new Map();
+      if (t > (cd.ownerReplies.get(chatNorm) || 0)) cd.ownerReplies.set(chatNorm, t);
+    }
+    try {
+      const disk = this._loadOwnerRepliesDisk();
+      if (!disk[String(zapId)]) disk[String(zapId)] = {};
+      if (t > (Number(disk[String(zapId)][chatNorm]) || 0)) {
+        disk[String(zapId)][chatNorm] = t;
+      }
+    } catch (_) {}
+    this.schedulePersistOwnerReplies();
+  }
+
+  // O dono respondeu depois de `sinceTs`? Checa memoria, disco e, quando
+  // `opts.live`, confere ao vivo na rede.
+  async hasOwnerReplied(zapId, chatId, sinceTs, opts) {
     const since = Number(sinceTs) || 0;
     const chatNorm = this._normNum(chatId);
-    if (cd.ownerReplies && chatNorm) {
+    if (!chatNorm) return false;
+    const cd = this.clients.get(String(zapId));
+    if (cd && cd.ownerReplies) {
       const t = cd.ownerReplies.get(chatNorm) || 0;
-      if (t > since) return true;
+      if (t > since && t > 0) return true;
     }
+    try {
+      const disk = this._loadOwnerRepliesDisk();
+      const t = Number((disk[String(zapId)] || {})[chatNorm]) || 0;
+      if (t > since && t > 0) return true;
+    } catch (_) {}
     if (opts && opts.live && since) {
       try {
         const msgs = await this.fetchRecentMessages(zapId, chatId, 4);
         for (const m of msgs) {
-          if (m && m.fromMe && m.deviceType && m.deviceType !== 'web' && (m.timestamp || 0) > since) {
+          if (m && m.fromMe && !(m.deviceType === 'web') && (m.timestamp || 0) >= since) {
             return true;
           }
         }
@@ -2255,7 +2516,13 @@ class WhatsAppManager {
           list = window.require('WAWebCollections').Chat.getModelsArray() || [];
         } catch (e) {
           out.errors.push('getModelsArray: ' + (e && e.message ? e.message : String(e)));
-          return out;
+        }
+        // Todos os contatos da agenda do WhatsApp (nao apenas os que ja tem conversa)
+        let allContacts = [];
+        try {
+          allContacts = window.require('WAWebCollections').Contact.getModelsArray() || [];
+        } catch (e) {
+          out.errors.push('contacts: ' + (e && e.message ? e.message : String(e)));
         }
 
         const numFromWid = (v) => {
@@ -2332,6 +2599,23 @@ class WhatsAppManager {
             out.chats.push({ id: chatId, name: String(name), number: String(number) });
           } catch (e) {
             out.errors.push('chat: ' + (e && e.message ? e.message : String(e)));
+          }
+        }
+
+        // Adiciona todos os contatos da agenda que ainda nao estao nos chats
+        for (const c of allContacts) {
+          try {
+            const cid = c.id && typeof c.id === 'object' ? c.id._serialized : c.id;
+            if (!cid) { out.skip.semId++; continue; }
+            if (cid.includes('@g.us') || cid.includes('@newsletter') || cid.includes('@broadcast')) { out.skip.grupo++; continue; }
+            const num = numFromWid(cid);
+            if (!/^\d{6,}$/.test(num)) { out.skip.semId++; continue; }
+            if (out.chats.some(ch => ch.id === cid)) continue;
+            let nm = c.name || c.pushname || c.shortName || '';
+            if (!nm) nm = num;
+            out.chats.push({ id: cid, name: String(nm), number: String(num) });
+          } catch (e) {
+            out.errors.push('contact: ' + (e && e.message ? e.message : String(e)));
           }
         }
         return out;
@@ -2536,6 +2820,9 @@ class WhatsAppManager {
       conv.messages.push(msg);
       if (conv.messages.length > 200) conv.messages = conv.messages.slice(-200);
       conv.lastMessage = msg;
+      // Avanca o cursor do chat: o backlog nao deve responder o que ja foi
+      // respondido (pelo dono, pela IA ou pela UI).
+      this._setChatCursor(zapId, chatId, msg.timestamp);
       this.persistContacts();
       this.sendToRenderer('whatsapp-message', msg);
       return msg;
@@ -2812,19 +3099,7 @@ class WhatsAppManager {
     return `Codigo de pareamento gerado: ${code}${tail}`;
   }
 
-  // PNG do QR em $LINK_CODE_DIR/qr-<zapId>.png (fallback visual do pareamento)
-  saveQrPng(zapId, dataUrl) {
-    const codeFile = process.env.LINK_CODE_FILE;
-    if (!codeFile || !dataUrl) return;
-    try {
-      const dir = path.dirname(codeFile);
-      const pngPath = path.join(dir, `qr-${zapId}.png`);
-      const b64 = String(dataUrl).replace(/^data:image\/png;base64,/, '');
-      fs.writeFileSync(pngPath, Buffer.from(b64, 'base64'));
-    } catch (e) {
-      console.warn(`[QR] Falha ao gravar PNG: ${e.message}`);
-    }
-  }
+  // (O QR foi removido do produto: o pareamento e sempre por codigo.)
 
   // Aguarda uma promise com limite de tempo (evita evaluate travado por 180s
   // no protocolTimeout do puppeteer, que segurava requestPairingCode pendurado)

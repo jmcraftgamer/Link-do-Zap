@@ -564,18 +564,28 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
       return null;
     };
 
-    const whisper = [], gemini = [], others = [];
+    // Matriz de transcrição (A1): apenas openai/groq -> whisper, google -> gemini.
+    // Outros provedores (DeepSeek, NVIDIA, etc.) NÃO sao usados silenciosamente para
+    // a url/chave de outro provedor; sao ignorados com aviso e s[o]o eliminados no
+    // bloqueio. Provedores habilitados explicitamente (transcriptionAvailable=true)
+    // podem ser adicionados nos caminhos de desenvolvimento.
+    const whisper = [], gemini = [], transcoders = [];
     for (const p of (providersData || [])) {
       const key = keyOf(p);
       if (!key) continue;
       const name = (p.name || '').toLowerCase();
       const entry = { p, key, name };
-      if (name.includes('openai') || name.includes('groq')) whisper.push(entry);
-      else if (name.includes('google')) gemini.push(entry);
-      else others.push(entry);
+      if (name.includes('openai') || name.includes('groq') || name === 'whisper' || name.includes('openai-compatible')) whisper.push(entry);
+      else if (name.includes('google') || name.includes('gemini')) gemini.push(entry);
+      else if (String(p.transcriptionAvailable || 'true')) transcoders.push(entry);
     }
-    const candidates = [...whisper, ...gemini, ...others];
-    if (!candidates.length) throw new Error('Nenhum provedor com chave para transcrever audio');
+    const candidates = [...whisper, ...gemini];
+    if (!candidates.length) {
+      if (transcoders.length) {
+        console.warn(`[TRANSCRIBE] todos os transcoders habilitados sao para ${[...whisper, ...gemini].map(c => c.name).join(', ')}; usar flag transcriptionAvailable nos provedores de transcrição.`);
+      }
+      throw new Error('Nenhum provedor transcription-capaz (openai/groq/google ou com transcriptionAvailable=true)');
+    }
 
     let b64 = audio.data || '';
     const commaIdx = b64.indexOf(',');
@@ -636,7 +646,7 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
   async _transcribeWithGemini(key, b64, mime, provider) {
     // Gemini aceita audio inline via generateContent - nao precisa de Whisper
     const models = (provider.models || []).map(m => m.id).filter(Boolean);
-    const modelId = models.find(id => id.includes('flash')) || models[0] || 'gemini-3.6-flash';
+    const modelId = models.find(id => id.includes('3.6-flash')) || models.find(id => id.includes('flash')) || models[0] || 'gemini-3.6-flash';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${key}`;
     const body = {
       contents: [{

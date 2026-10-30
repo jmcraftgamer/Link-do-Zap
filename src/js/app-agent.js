@@ -375,6 +375,55 @@ Regras:
         return { ok: true, zap: z.name, bloqueados: Array.isArray(z.blockedContacts) ? z.blockedContacts : [] };
       },
 
+      block_all_existing: async (a) => {
+        const zaps = this.loadZaps();
+        const z = this.findZap(a.zap, zaps);
+        if (!z) return { ok: false, error: `Zap nao encontrado: ${a.zap}` };
+        if (!Array.isArray(z.blockedContacts)) z.blockedContacts = [];
+        let added = 0;
+        const fs = require('fs');
+        const path = require('path');
+        const dataDir = (require('electron') && require('electron').app && require('electron').app.getPath) ? require('electron').app.getPath('userData') : (process.env.APPDATA || process.env.USERPROFILE || require('os').homedir());
+        const memoDir = path.join(dataDir, 'link-no-whatsapp', 'memorias', String(z.id));
+        const blockedSet = new Set(z.blockedContacts.map(b => String(b).replace(/\D/g, '').replace(/^55/, '')));
+        try {
+          if (fs.existsSync(memoDir)) {
+            for (const file of fs.readdirSync(memoDir)) {
+              try {
+                const content = fs.readFileSync(path.join(memoDir, file), 'utf8');
+                const nums = content.match(/\b(\+?\d{10,14})\b/g) || [];
+                for (const n of nums) {
+                  const clean = n.replace(/\D/g, '');
+                  if (clean.length >= 10) blockedSet.add(clean);
+                }
+              } catch (_) {}
+            }
+          }
+        } catch (_) {}
+        try {
+          const convFile = path.join(dataDir, 'link-no-whatsapp', 'conversations.json');
+          if (fs.existsSync(convFile)) {
+            const data = JSON.parse(fs.readFileSync(convFile, 'utf8'));
+            if (Array.isArray(data)) {
+              for (const item of data) {
+                if (item && item.zapId === String(z.id) && item.contact && item.contact.id) {
+                  const clean = String(item.contact.id).replace(/\D/g, '').replace(/^55/, '');
+                  if (clean.length >= 10) blockedSet.add(clean);
+                }
+              }
+            }
+          }
+        } catch (_) {}
+        for (const num of blockedSet) {
+          if (!z.blockedContacts.some(b => String(b).replace(/\D/g, '').replace(/^55/, '') === num)) {
+            z.blockedContacts.push(num);
+            added++;
+          }
+        }
+        this.saveZaps(zaps);
+        return { ok: true, zap: z.name, adicionados: added, totalBloqueados: z.blockedContacts.length };
+      },
+
       add_training: async (a) => {
         const zaps = this.loadZaps();
         const z = this.findZap(a.zap, zaps);

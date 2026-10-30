@@ -1,11 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  // Chaves de IA fora do codigo (env do sistema / secrets do GitHub Actions)
-  bootstrapKeys: {
-    openrouter: process.env.OPENROUTER_API_KEY || '',
-    googleai: process.env.GOOGLE_AI_KEY || ''
-  },
+  // Chaves de IA removidas do preload (exfiltração via XSS).
+  // Toda chamada de IA passa pelo processo principal; chaves vêm de providers.json / safeStorage.
+  // compat: manutenção — leia apenas providers.json no renderer.
 
   // Window controls
   minimize: () => ipcRenderer.send('window-minimize'),
@@ -39,6 +37,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   serverStatus: () => ipcRenderer.invoke('server-status'),
   serverPairingCodes: () => ipcRenderer.invoke('server-pairing-codes'),
   serverCurrentQr: (zapId) => ipcRenderer.invoke('server-current-qr', zapId),
+  serverConnectZap: (zapId, phone) => ipcRenderer.invoke('server-connect-zap', zapId, phone),
 
   // Conexao do Setup ao servidor 24h (repositorio de dados)
   serverConfigGet: () => ipcRenderer.invoke('server-config-get'),
@@ -50,6 +49,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Painel de gerenciamento do servidor (status, power e terminal)
   serverOverview: () => ipcRenderer.invoke('server-overview'),
   serverPower: (running) => ipcRenderer.invoke('server-power', running),
+  zapBlockAllExisting: (zapRef) => ipcRenderer.invoke('zap-block-all-existing', zapRef),
+  onServerPowerUpdated: (callback) => ipcRenderer.on('server-power-updated', (e, data) => callback(data)),
   serverTerminalLogs: () => ipcRenderer.invoke('server-terminal-logs'),
   serverTerminalClear: () => ipcRenderer.invoke('server-terminal-clear'),
   serverTerminalExport: () => ipcRenderer.invoke('server-terminal-export'),
@@ -70,7 +71,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   agentChat: (payload) => ipcRenderer.invoke('agent-chat', payload),
 
   // WhatsApp events
-  onWhatsAppQR: (callback) => ipcRenderer.on('whatsapp-qr', (e, data) => callback(data)),
   onWhatsAppPairingCode: (callback) => ipcRenderer.on('whatsapp-pairing-code', (e, data) => callback(data)),
   onWhatsAppStatus: (callback) => ipcRenderer.on('whatsapp-status', (e, data) => callback(data)),
   onWhatsAppMessage: (callback) => ipcRenderer.on('whatsapp-message', (e, data) => callback(data)),
@@ -80,7 +80,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Data persistence
   loadZaps: () => ipcRenderer.invoke('load-zaps'),
-  saveZaps: (data) => ipcRenderer.invoke('save-zaps', data),
+  saveZaps: (data, opts) => ipcRenderer.invoke('save-zaps', data, opts),
+  billingSave: (zapId, data) => ipcRenderer.invoke('billing-save', zapId, data),
+  billingCheck: (zapId) => ipcRenderer.invoke('billing-check', zapId),
   loadProviders: () => ipcRenderer.invoke('load-providers'),
   saveProviders: (data) => ipcRenderer.invoke('save-providers', data),
 

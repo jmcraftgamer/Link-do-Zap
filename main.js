@@ -8,6 +8,14 @@ const { resolveReplyMedia } = require('./src/js/media-resolver');
 const { verifyMessage } = require('./src/js/message-guard');
 const { isWithinWorkHours } = require('./src/js/work-hours');
 
+// Garante que binarios extras (ffmpeg, etc.) no mesmo diretorio do .exe sejam encontrados pelo PATH
+if (process.env.PATH) {
+  const execDir = path.dirname(process.execPath || __dirname);
+  process.env.PATH = execDir + path.delimiter + process.env.PATH;
+} else {
+  process.env.PATH = path.dirname(process.execPath || __dirname);
+}
+
 if (process.platform === 'win32' && typeof app.setAppUserModelId === 'function') {
   app.setAppUserModelId('com.linknowhatsapp.app');
 }
@@ -322,6 +330,98 @@ function ensureDataDir() {
 }
 
 // ------------------------------------------------------------
+// Persistencia segura de configuracao
+// ------------------------------------------------------------
+// Um JSON de configuracao corrompido NAO pode virar "lista vazia" silenciosa:
+// no servidor, uma lista vazia faz o reconciliador tratar todos os Zaps como
+// removidos e apagar sessoes/treinamentos. Aqui a falha fica registrada e quem
+// consome decide entre abortar a operacao ou usar o backup.
+const configIssues = new Map();
+
+function configBackupPath(p) {
+  return p + '.bak';
+}
+
+// true apenas quando o arquivo esta corrompido E nao foi possivel recuperar.
+function isConfigUnsafe(filename) {
+  const issue = configIssues.get(filename);
+  return !!(issue && !issue.recovered);
+}
+
+function configIssueSummary() {
+  return [...configIssues.entries()]
+    .filter(([, v]) => v && !v.recovered)
+    .map(([k, v]) => `${k}: ${v.error}`)
+    .join('; ');
+}
+
+// Escrita atomica com backup da versao anterior. Nunca grava algo que nao
+// consiga ler de volta (JSON.parse no proprio conteudo serializado).
+function saveJsonAtomic(p, data) {
+  ensureDataDir();
+  const json = JSON.stringify(data, null, 2);
+  JSON.parse(json);
+  const tmp = p + '.tmp';
+  fs.writeFileSync(tmp, json);
+  try {
+    if (fs.existsSync(p)) fs.copyFileSync(p, configBackupPath(p));
+  } catch (_) { /* backup e melhor-esforco */ }
+  try {
+    fs.renameSync(tmp, p);
+  } catch (_) {
+    // Windows: antivirus/OneDrive podem segurar o arquivo. Fallback direto.
+    fs.writeFileSync(p, json);
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+  configIssues.delete(path.basename(p));
+  return json.length;
+}
+
+// Move para a lixeira em vez de apagar. Nada e destruido por engano.
+function moveToTrash(targetPath, reason) {
+  try {
+    if (!fs.existsSync(targetPath)) return false;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const trashDir = path.join(getDataDir(), 'trash', stamp);
+    fs.mkdirSync(trashDir, { recursive: true });
+    fs.renameSync(targetPath, path.join(trashDir, path.basename(targetPath)));
+    console.log(`[TRASH] ${path.basename(targetPath)} movido para lixeira (${reason || 'sem motivo'})`);
+    return true;
+  } catch (e) {
+    console.error(`[TRASH] falha ao mover ${targetPath}: ${e.message}`);
+    return false;
+  }
+}
+
+// Limpa a lixeira depois de N dias (recuperacao continua possivel na janela).
+function pruneTrash(maxAgeDays = 14) {
+  try {
+    const root = path.join(getDataDir(), 'trash');
+    if (!fs.existsSync(root)) return;
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    for (const name of fs.readdirSync(root)) {
+      const full = path.join(root, name);
+      try {
+        if (fs.statSync(full).mtimeMs < cutoff) fs.rmSync(full, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+function validateZapsPayload(data) {
+  if (!Array.isArray(data)) return 'payload nao e uma lista';
+  const ids = new Set();
+  for (const z of data) {
+    if (!z || typeof z !== 'object' || Array.isArray(z)) return 'zap invalido na lista';
+    const id = String(z.id == null ? '' : z.id).trim();
+    if (!id) return 'zap sem id';
+    if (ids.has(id)) return `id duplicado: ${id}`;
+    ids.add(id);
+  }
+  return null;
+}
+
+// ------------------------------------------------------------
 // Configuracao do servidor 24h (painel remoto)
 // ------------------------------------------------------------
 // O Setup instalado nao fica ao lado da pasta `data` do projeto. Este arquivo
@@ -371,6 +471,62 @@ function decryptServerToken(value) {
   return '';
 }
 
+// ------------------------------------------------------------
+// Criptografar / descriptografar chaves de API de provedor
+// Usa safeStorage (Electron): 'enc:' -> safeStorage.encryptString
+// Fallback para 'plain:' + base64 se safeStorage indisponivel.
+// ------------------------------------------------------------
+function encryptProviderKey(raw) {
+  const v = String(raw || '');
+  if (!v) return '';
+  try {
+    if (safeStorage && typeof safeStorage.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+      return 'enc:' + safeStorage.encryptString(v).toString('base64');
+    }
+  } catch (_) {}
+  return 'plain:' + Buffer.from(v, 'utf8').toString('base64');
+}
+function decryptProviderKey(value) {
+  const s = String(value || '');
+  try {
+    if (s.startsWith('enc:')) return safeStorage.decryptString(Buffer.from(s.slice(4), 'base64'));
+    if (s.startsWith('plain:')) return Buffer.from(s.slice(6), 'base64').toString('utf8');
+    // Sem prefixo reconhecido: ja estava em texto puro (arquivo legado / teste),
+    // retorna inalterado.
+    return s;
+  } catch (_) {}
+  return '';
+}
+// Descriptografa todas as chaves de um providers.json (puro/encriptado no disco).
+function decryptAllProvidersKeys(list) {
+  for (const p of list || []) {
+    if (typeof p !== 'object' || !p) continue;
+    if (typeof p.apiKey === 'string' && p.apiKey) {
+      const d = decryptProviderKey(p.apiKey);
+      if (d) p.apiKey = d;
+    }
+    if (Array.isArray(p.apiKeys) && p.apiKeys.length) {
+      p.apiKeys = p.apiKeys.map(k => { try { return decryptProviderKey(String(k)); } catch (_) { return k; } });
+    }
+  }
+  return list;
+}
+//criptografar todas as chaves de um providers.json antes de salvar.
+function encryptAllProvidersKeys(list) {
+  for (const p of list || []) {
+    if (typeof p !== 'object' || !p) continue;
+    if (typeof p.apiKey === 'string' && p.apiKey && !p.apiKey.startsWith('enc:') && !p.apiKey.startsWith('plain:')) {
+      p.apiKey = encryptProviderKey(p.apiKey);
+    }
+    if (Array.isArray(p.apiKeys) && p.apiKeys.length) {
+      p.apiKeys = p.apiKeys.map(k => {
+        try { return encryptProviderKey(String(k)); } catch (_) { return k; }
+      });
+    }
+  }
+  return list;
+}
+
 function looksLikeGitRepo(dir) {
   try {
     return !!dir && fs.existsSync(path.join(dir, '.git'));
@@ -389,9 +545,10 @@ function resolveServerRepoDir() {
     if (process.env.LINK_DATA_REPO_DIR) candidates.push(process.env.LINK_DATA_REPO_DIR);
   } catch (_) {}
   const cfg = loadServerRepoConfig();
-  if (cfg && cfg.enabled !== false && cfg.dir) candidates.push(cfg.dir);
-  candidates.push(path.join(localDir, 'server-repo'));
-  candidates.push(path.join(__dirname, 'data'));
+  if (cfg && cfg.enabled !== false) {
+    if (cfg.dir) candidates.push(cfg.dir);
+    candidates.push(path.join(localDir, 'server-repo'));
+  }
   for (const candidate of candidates) {
     try {
       const abs = path.resolve(String(candidate));
@@ -428,12 +585,83 @@ function serverRepoUrlWithToken(url, token) {
 
 function loadJsonFile(filename, fallback) {
   const p = getFilePath(filename);
-  if (!fs.existsSync(p)) return fallback;
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return fallback; }
+  if (!fs.existsSync(p)) {
+    configIssues.delete(filename);
+    return fallback;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    configIssues.delete(filename);
+    return data;
+  } catch (e) {
+    // 1) tenta o backup antes de aceitar que o dado se perdeu
+    try {
+      const bak = configBackupPath(p);
+      if (fs.existsSync(bak)) {
+        const data = JSON.parse(fs.readFileSync(bak, 'utf8'));
+        console.error(`[CONFIG] ${filename} corrompido (${e.message}); restaurando do backup`);
+        try { fs.copyFileSync(bak, p); } catch (_) {}
+        configIssues.set(filename, { error: e.message, recovered: true, at: Date.now() });
+        return data;
+      }
+    } catch (_) { /* backup tambem invalido */ }
+    // 2) sem backup valido: registra a falha. Quem consome decide o que fazer.
+    console.error(`[CONFIG] ${filename} corrompido e sem backup valido: ${e.message}`);
+    configIssues.set(filename, { error: e.message, recovered: false, at: Date.now() });
+    return fallback;
+  }
 }
 function loadZapsData() { return loadJsonFile('zaps.json', []); }
+// ------------------------------------------------------------
+// Pagamento por Zap: cada zap tem um plano de pagamento.
+// Se a pessoa nao marque "pago" ate o dia do prazo (gracePeriod), o zap
+// para de responder. Apos a ultima data vencida, se nao foi pago,
+// o zap fica definitivamente indisponivel ("em atraso") para evitar
+// prorrogamentos absurdos.
+// ------------------------------------------------------------
+function getBillingForZap(id) {
+  const list = loadZapsData();
+  const z = list.find(z => String(z.id) === String(id));
+  if (!z || !z.billingPlan) return null;
+  const now = new Date();
+  const monthKey = String(now.getMonth() + 1); // 1..12
+  const payMonths = z.billingPlan.paidMonths || {};
+  return {
+    dueDay: Number(z.billingPlan.dueDay) || 1,
+    graceDays: Number(z.billingPlan.graceDays) || 0,
+    payMonths: payMonths,
+    monthKey: monthKey,
+    now: now.toISOString(),
+    ...z.billingPlan
+  };
+}
+// Checa se um zap pode responder agora. Retorna { active: true|false, reason, todayKey, currentDue }
+function checkBillingActive(zapId) {
+  const bp = getBillingForZap(zapId);
+  if (!bp) return { active: true, reason: 'no_plan', todayKey: null, currentDue: null };
+  if (bp.disabledForOwnUse === true) return { active: true, reason: 'own_use', todayKey: null, currentDue: null };
+  const mk = bp.monthKey || String((Number(bp.now || new Date().getMonth()) || 0) + 1);
+  const dueDate = new Date(new Date().getFullYear(), Number(mk) - 1, Number(bp.dueDay) || 1);
+  const pmt = bp.paidMonths && !bp.paidMonths[mk];
+  if (!pmt) {
+    // Quem nao pagou ate o dia do plano -> inativo. Prazo e calculado ate o dia do proximo mes que venceu.
+    const lastDueMonth = new Date(new Date().getFullYear(), Number(mk), 1).getFullYear();
+    const monthsAgo = (new Date().getMonth() + 1) - Number(mk);
+    if ((monthsAgo + 12) % 12 === 0) {
+      // Mes que vencia ainda nao terminou ou eh o mes atual... simplifique: aposto permanente prazo
+      return { active: false, reason: 'atrasado_desde_meu_prazo', todayKey: mk, currentDue: Number(bp.dueDay) };
+    }
+    // Daqui ate o seguinte "vence" -> 60 dias de prazo maximo
+    if (dueDate < new Date()) return { active: false, reason: 'atrasado', todayKey: mk, currentDue: Number(bp.dueDay) };
+    return { active: false, reason: 'prazo_prescrito', todayKey: mk, currentDue: Number(bp.dueDay) };
+  }
+  // Marcado: volta ativo
+  return { active: true, reason: 'pago', todayKey: mk, currentDue: Number(bp.dueDay) };
+}
+
 function loadProvidersData() {
-  const list = loadJsonFile('providers.json', []);
+  let list = loadJsonFile('providers.json', []);
+  list = decryptAllProvidersKeys(list); // descriptografa chaves do disco
   // Chaves podem vir do ambiente (secrets do GitHub Actions / env local):
   // se o secret estiver configurado, ele SEMPRE prevalece sobre chaves antigas ou invalidas do arquivo
   try {
@@ -459,10 +687,12 @@ function loadProvidersData() {
         // Oficiais validos para contas NOVAS do AI Studio (2.5/2.0/1.5
         // retornam 404 "no longer available to new users")
         const officialModels = [
-          { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', free: true },
-          { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', free: true },
-          { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', free: true },
-          { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash-Lite', free: true }
+          { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', free: true },
+          { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', free: true },
+          { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', free: true },
+          { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite', free: true },
+          { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', free: true },
+          { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', free: true }
         ];
         if (!Array.isArray(p.models) || p.models.length === 0) {
           p.models = officialModels;
@@ -652,10 +882,11 @@ async function clearTypingIndicator(zapId, chatId) {
 // (2,5 caracteres por segundo = 2s a cada 5 digitos, minimo 5s visivel).
 // Renova o indicador a cada 20s porque o WhatsApp expira "digitando" em ~25s.
 async function waitRealisticTyping(zapId, chatId, typingStart, text) {
-  const CARACTERES_POR_SEGUNDO = 5 / 2;
+  // Velocidade realista (8-12 chars/s = ~0,1s por char) com teto 3-12s (T1).
+  const CARACTERES_POR_SEGUNDO = 10;
   const chars = String(text || '').length;
   const humanTypingMs = Math.round((chars / CARACTERES_POR_SEGUNDO) * 1000);
-  const targetTypingMs = Math.max(5000, humanTypingMs);
+  const targetTypingMs = Math.min(12000, Math.max(3000, humanTypingMs));
   const typingElapsed = Date.now() - typingStart;
   const remainingMs = targetTypingMs - typingElapsed;
 
@@ -768,6 +999,12 @@ async function processMessage(messageData) {
   }
   if (zap.enabled === false) {
     sendLog(zapId, 'warning', 'Zap desativado. Ignorando mensagem.');
+    return;
+  }
+  // ================= PLANO DE PAGAMENTO =================
+  const billing = checkBillingActive(String(zapId));
+  if (!billing.active && billing.reason !== 'own_use' && billing.reason !== 'no_plan') {
+    sendLog(zapId, 'warning', 'Zap suspenso por atraso de pagamento (mes ' + billing.todayKey + '). Mensagem ignorada.');
     return;
   }
   if (zap.autoReply === false) {
@@ -1057,12 +1294,17 @@ async function processMessage(messageData) {
 
     // Portao final NO EXATO MOMENTO DO ENVIO: se o dono do numero ja respondeu
     // depois da mensagem do cliente (inclusive durante o sorteio/digitacao),
-    // a IA NAO manda por cima.
+    // a IA NAO manda por cima. So vale para a PRIMEIRA parte: depois de comecar
+    // a responder, e melhor terminar do que deixar o cliente com meia resposta.
     let ownerReplied = false;
-    if (whatsappManager && typeof whatsappManager.hasOwnerReplied === 'function') {
+    if (i === 0 && whatsappManager && typeof whatsappManager.hasOwnerReplied === 'function') {
       try {
-        ownerReplied = await whatsappManager.hasOwnerReplied(String(zapId), chatId, triggerTs, { live: i === 0 });
-      } catch (_) { ownerReplied = false; }
+        ownerReplied = await whatsappManager.hasOwnerReplied(String(zapId), chatId, triggerTs, { live: true });
+      } catch (e) {
+        // Fail-closed: em erro, nao arrisca falar por cima do dono.
+        console.warn('[OWNER] falha ao checar resposta do dono:', e && e.message ? e.message : e);
+        ownerReplied = true;
+      }
     }
     if (ownerReplied) {
       sendLog(zapId, 'info', 'Dono do numero ja respondeu esta conversa - IA nao vai responder por cima.');
@@ -1149,6 +1391,10 @@ async function processMessage(messageData) {
 // Window
 // ------------------------------------------------------------
 function createWindow() {
+  const extraArgs = [];
+  if (!app.isPackaged) {
+    extraArgs.push('--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage');
+  }
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -1163,7 +1409,8 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
-    }
+    },
+    additionalArguments: extraArgs
   });
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
@@ -1184,10 +1431,11 @@ function buildStatusState() {
     return {
       id: String(z.id),
       name: z.name || '',
+      phone: String(z.phone || '').replace(/\D/g, ''),
       enabled: z.enabled !== false,
       autoReply: !!z.autoReply,
       status: st.status || 'disconnected',
-      qrPending: !!st.qrCode,
+      pairingCode: st.pairingCode || null,
       method: st.method || null
     };
   });
@@ -1218,21 +1466,16 @@ function startStatusServer() {
       port,
       token,
       getState: buildStatusState,
-      getQr: (zapId) => {
-        if (whatsappManager && whatsappManager.getQrString) return whatsappManager.getQrString(zapId);
-        return null;
-      },
       getLogs: () => logRing,
       onConnect: (zapId, opts) => {
         const zap = loadZapsData().find((z) => String(z.id) === String(zapId));
         if (!zap) return { status: 404, ok: false, error: 'zap nao configurado (nao consta no zaps.json)' };
         if (!whatsappManager) return { status: 503, ok: false, error: 'gerenciador do WhatsApp indisponivel' };
-        const method = opts && opts.method === 'pairing' ? 'pairing' : 'qrcode';
-        const phone = opts && opts.phone ? opts.phone : '';
-        if (method === 'pairing' && !phone) return { status: 400, ok: false, error: 'metodo pairing exige o campo "phone"' };
-        Promise.resolve(whatsappManager.connectZap(String(zapId), phone, method))
+        const phone = String((opts && opts.phone) || zap.phone || '').replace(/\D/g, '');
+        if (!phone) return { status: 400, ok: false, error: 'informe o numero do celular (campo "phone")' };
+        Promise.resolve(whatsappManager.connectZap(String(zapId), phone, 'pairing'))
           .catch((e) => console.error(`[HTTP] connectZap(${zapId}) falhou: ${e.message}`));
-        return { status: 202, ok: true, message: 'conexao solicitada - acompanhe o status da pagina' };
+        return { status: 202, ok: true, message: 'codigo de pareamento solicitado - acompanhe o status da pagina' };
       },
       onDisconnect: async (zapId) => {
         if (!whatsappManager) return { status: 503, ok: false, error: 'gerenciador do WhatsApp indisponivel' };
@@ -1304,7 +1547,7 @@ function autoConnectSavedSessions(staggerMs = 2000) {
     count++;
     setTimeout(() => {
       console.log(`[AUTO] Reconectando zap ${zapId} (${z.name || ''}) com sessao salva...`);
-      Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
+      Promise.resolve(whatsappManager.connectZap(zapId, String(z.phone || ''), 'qrcode'))
         .then(() => {
           persistBotStatus();
           // Se for headless com LINK_AUTO_PAIR=1: detecta se a sessao salva expirou (caiu em waiting_qr)
@@ -1317,7 +1560,7 @@ function autoConnectSavedSessions(staggerMs = 2000) {
                 if (phone) {
                   console.log(`[AUTO-PAIR] Sessao salva do zap ${zapId} expirou (caiu em QR). Limpando sessao e gerando QR novo...`);
                   try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}
-                  whatsappManager.connectZap(zapId, '', 'qrcode')
+                  whatsappManager.connectZap(zapId, phone, 'pairing')
                     .catch((err) => console.error(`[AUTO-PAIR] Falha ao gerar QR do zap ${zapId}: ${err.message}`));
                 }
               }
@@ -1334,8 +1577,8 @@ function autoConnectSavedSessions(staggerMs = 2000) {
 
 // Conexao automatica no boot (GitHub Actions / servidor): com
 // LINK_AUTO_PAIR=1, zaps SEM sessao salva e com telefone no zaps.json
-// recebem connectZap(qrcode). O QR e renovado pelo proprio WhatsApp Web a
-// cada ~20s e publicado no repo de dados; o painel exibe o QR atual.
+// recebem connectZap(phone, pairing). O codigo e publicado no repo de dados
+// (pairing-codes.json) e o painel o exibe.
 function autoPairMissingSessions() {
   try {
     const flag = String(process.env.LINK_AUTO_PAIR || '').toLowerCase();
@@ -1351,14 +1594,75 @@ function autoPairMissingSessions() {
     if (fs.existsSync(sessionDir)) return;
     count++;
     setTimeout(() => {
-      console.log(`[AUTO-PAIR] Zap ${zapId} sem sessao salva - gerando QR...`);
-      Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
-        .catch((e) => console.error(`[AUTO-PAIR] Falha ao gerar QR do zap ${zapId}: ${e.message}`));
+      console.log(`[AUTO-PAIR] Zap ${zapId} sem sessao salva - gerando codigo de pareamento...`);
+      Promise.resolve(whatsappManager.connectZap(zapId, phone, 'pairing'))
+        .catch((e) => console.error(`[AUTO-PAIR] Falha ao gerar codigo do zap ${zapId}: ${e.message}`));
     }, 5000 + i * 3000);
   });
   if (count) console.log(`[AUTO-PAIR] ${count} zap(s) aguardando leitura do QR.`);
   else console.log('[AUTO-PAIR] Nenhum zap precisa de pareamento agora.');
   return count;
+}
+
+// ------------------------------------------------------------
+// Pedidos de pareamento vindos do painel (connect-requests.json)
+// ------------------------------------------------------------
+// O painel grava { <zapId>: { phone, ts } } no repo de dados. O servidor
+// headless le o arquivo, apaga a sessao antiga e gera um codigo novo.
+const processedPairRequests = new Map();
+
+async function processPairingRequests() {
+  if (!whatsappManager) return;
+  let reqs = null;
+  try {
+    const p = getFilePath('connect-requests.json');
+    if (!fs.existsSync(p)) return;
+    reqs = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (_) { return; }
+  if (!reqs || typeof reqs !== 'object' || Array.isArray(reqs)) return;
+
+  const now = Date.now();
+  for (const [rawId, req] of Object.entries(reqs)) {
+    if (!req || typeof req !== 'object') continue;
+    const id = String(rawId);
+    const phone = String(req.phone || '').replace(/\D/g, '');
+    const ts = Number(req.ts || 0);
+    if (!phone || !ts) continue;
+    if (now - ts > 15 * 60 * 1000) continue; // pedido expirado
+    if (processedPairRequests.get(id) === ts) continue; // ja tratado
+
+    let st = { status: 'disconnected' };
+    try { st = whatsappManager.getStatus(id) || st; } catch (_) {}
+    // Se ja esta pronto e o pedido nao e recente, ignora (evita reparear
+    // depois de um restart do container).
+    if (st.status === 'ready' && now - ts > 2 * 60 * 1000) {
+      processedPairRequests.set(id, ts);
+      continue;
+    }
+
+    processedPairRequests.set(id, ts);
+    console.log(`[PAIR-REQ] Pareamento solicitado pelo painel para o zap ${id} (${phone})`);
+    try {
+      try { await whatsappManager.disconnectZap(id, 'pareamento solicitado pelo painel'); } catch (_) {}
+      try { fs.rmSync(path.join(getDataDir(), 'sessions', id), { recursive: true, force: true }); } catch (_) {}
+      await whatsappManager.connectZap(id, phone, 'pairing');
+    } catch (e) {
+      console.error(`[PAIR-REQ] Falha ao parear ${id}: ${e.message}`);
+    }
+  }
+}
+
+function startPairingRequestWatcher(intervalMs = 10000) {
+  if (!isHeadless() || !whatsappManager) return null;
+  const timer = setInterval(() => {
+    processPairingRequests().catch((e) => console.error('[PAIR-REQ] falhou:', e.message));
+  }, intervalMs);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  // primeira leitura logo apos o boot
+  setTimeout(() => {
+    processPairingRequests().catch((e) => console.error('[PAIR-REQ] falhou:', e.message));
+  }, 3000);
+  return timer;
 }
 
 // ------------------------------------------------------------
@@ -1372,6 +1676,9 @@ function startConnectionWatchdog(intervalMs = 60000) {
   const attempts = new Map();
   const inFlight = new Set();
   const BUSY = ['ready', 'connecting', 'initializing', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated'];
+  // Timeout de pareamento: se o zap fica > 10 min em waiting_qr/pairing, forca reconexao
+  const PAIRING_TIMEOUT_MS = 10 * 60 * 1000;
+  const pairingStart = new Map();
   const autoPair = ['1', 'true', 'yes'].includes(String(process.env.LINK_AUTO_PAIR || '').toLowerCase());
 
   const timer = setInterval(async () => {
@@ -1384,9 +1691,32 @@ function startConnectionWatchdog(intervalMs = 60000) {
         const st = (whatsappManager.getStatus(id) || { status: 'disconnected' });
 
         // O proprio WhatsApp Web renova o QR a cada ~20s (evento 'qr').
-        // Nao desconecte aqui: reconectar no meio da navegacao derrubava o
+        // Nao desconecte aqui: reconectar no meio da naveacao derrubava o
         // contexto do Chromium e impedia o QR de ser publicado.
         if (BUSY.includes(st.status)) {
+          // Timeout de pareamento: se fica mais de 10 min aguardando, recomeca
+          // o pareamento por codigo (a sessao antiga provavelmente expirou).
+          const pairingId = `pairing:${id}`;
+          if ((st.status === 'waiting_qr' || st.status === 'waiting_pairing') && pairingStart.has(pairingId)) {
+            if (Date.now() - pairingStart.get(pairingId) > PAIRING_TIMEOUT_MS) {
+              console.warn(`[WATCHDOG] Zap ${id} aguardando pareamento por mais de 10 min - gerando codigo novo`);
+              inFlight.add(id);
+              try {
+                const phone = String(z.phone || '').replace(/\D/g, '');
+                if (phone) {
+                  try { fs.rmSync(path.join(getDataDir(), 'sessions', id), { recursive: true, force: true }); } catch (_) {}
+                  await whatsappManager.connectZap(id, phone, 'pairing');
+                }
+              } catch (e) { /* perdeu: retry mais tarde */ }
+              finally {
+                inFlight.delete(id);
+                pairingStart.delete(pairingId);
+              }
+              continue;
+            }
+          } else if (!pairingStart.has(pairingId)) {
+            pairingStart.set(pairingId, Date.now());
+          }
           // Conectou: zera o backoff para uma proxima queda ser tratada rapido.
           if (st.status === 'ready') attempts.delete(id);
           continue;
@@ -1405,7 +1735,7 @@ function startConnectionWatchdog(intervalMs = 60000) {
         inFlight.add(id);
         console.log(`[WATCHDOG] Zap ${id} esta ${st.status || 'desconectado'} - tentando reconectar (tentativa ${rec.n})...`);
         try {
-          await whatsappManager.connectZap(id, '', 'qrcode');
+          await whatsappManager.connectZap(id, phone, hasSession ? 'qrcode' : 'pairing');
         } catch (e) {
           console.error(`[WATCHDOG] Falha ao reconectar zap ${id}: ${e.message}`);
         } finally {
@@ -1425,27 +1755,52 @@ function startConnectionWatchdog(intervalMs = 60000) {
 // Reconciler do servidor: aplica ao vivo o zaps.json alterado no painel
 // (novo zap = conecta/pareia; zap removido/desativado = desconecta)
 // ------------------------------------------------------------
-function startServerReconciler(intervalMs = 15000) {
-  if (!isHeadless() || !whatsappManager) return null;
-  const snapshot = () => {
-    const map = new Map();
-    for (const z of loadZapsData()) map.set(String(z.id), { enabled: z.enabled !== false });
-    return map;
-  };
-  if (!serverKnownZaps) serverKnownZaps = snapshot();
+function snapshotServerZaps() {
+  const map = new Map();
+  const list = loadZapsData();
+  if (!Array.isArray(list)) return map;
+  for (const z of list) map.set(String(z.id), { enabled: z.enabled !== false });
+  return map;
+}
+
+// Executa UMA reconciliacao. Exportada para teste; o timer so chama isto.
+async function reconcileServerZapsOnce() {
+  if (!whatsappManager) return;
   const autoPair = ['1', 'true', 'yes'].includes(String(process.env.LINK_AUTO_PAIR || '').toLowerCase());
-  const timer = setInterval(async () => {
-    try {
+  try {
       const zaps = loadZapsData();
+      // Trava de seguranca: config invalida ou vazia NAO pode ser interpretada
+      // como "todos os zaps foram removidos" - isso apagaria todas as sessoes.
+      if (isConfigUnsafe('zaps.json')) {
+        console.error('[SYNC] zaps.json invalido - reconciliacao abortada para proteger as sessoes');
+        return;
+      }
+      if (!Array.isArray(zaps)) {
+        console.error('[SYNC] zaps.json nao e uma lista - reconciliacao abortada');
+        return;
+      }
+      if (zaps.length === 0 && serverKnownZaps.size > 0) {
+        // Lista vazia so e aceita quando o painel confirmou a exclusao. Sem o
+        // marcador, tratamos como corrupcao e nao tocamos nas sessoes.
+        const marker = loadJsonFile('zaps.empty-ok.json', null);
+        const confirmed = marker && marker.empty === true &&
+          (Date.now() - Number(marker.at || 0)) < 24 * 60 * 60 * 1000;
+        if (!confirmed) {
+          console.error('[SYNC] zaps.json veio vazio sem confirmacao - reconciliacao abortada para nao apagar sessoes');
+          return;
+        }
+        console.warn('[SYNC] zaps.json vazio confirmado pelo painel - removendo zaps do servidor');
+      }
       const ids = new Set(zaps.map((z) => String(z.id)));
-      // Removidos no painel: desconecta e apaga a sessao no servidor
+      // Removidos no painel: desconecta e move a sessao para a lixeira
+      // (recuperavel por 14 dias). Nunca apaga de verdade.
       for (const id of [...serverKnownZaps.keys()]) {
         if (ids.has(id)) continue;
         console.log(`[SYNC] Zap ${id} removido no painel - desconectando`);
         try { await whatsappManager.disconnectZap(id, 'removido no painel'); } catch (_) {}
-        try { fs.rmSync(path.join(getDataDir(), 'sessions', id), { recursive: true, force: true }); } catch (_) {}
-        try { fs.rmSync(path.join(getDataDir(), 'sessions', `${id}.cache-keep`), { recursive: true, force: true }); } catch (_) {}
-        try { fs.rmSync(path.join(getDataDir(), 'trainings', id), { recursive: true, force: true }); } catch (_) {}
+        moveToTrash(path.join(getDataDir(), 'sessions', id), 'zap removido');
+        moveToTrash(path.join(getDataDir(), 'sessions', `${id}.cache-keep`), 'zap removido');
+        moveToTrash(path.join(getDataDir(), 'trainings', id), 'zap removido');
         serverKnownZaps.delete(id);
       }
       for (const z of zaps) {
@@ -1464,12 +1819,12 @@ function startServerReconciler(intervalMs = 15000) {
           const phone = String(z.phone || '').replace(/\D/g, '');
           if (hasSession) {
             console.log(`[SYNC] Novo zap ${id} com sessao salva - conectando`);
-            Promise.resolve(whatsappManager.connectZap(id, '', 'qrcode'))
+            Promise.resolve(whatsappManager.connectZap(id, phone, 'qrcode'))
               .catch((e) => console.error(`[SYNC] connectZap(${id}) falhou: ${e.message}`));
           } else if (autoPair && phone) {
-            console.log(`[SYNC] Novo zap ${id} sem sessao - gerando QR`);
-            Promise.resolve(whatsappManager.connectZap(id, '', 'qrcode'))
-              .catch((e) => console.error(`[SYNC] qrcode(${id}) falhou: ${e.message}`));
+            console.log(`[SYNC] Novo zap ${id} sem sessao - gerando codigo de pareamento`);
+            Promise.resolve(whatsappManager.connectZap(id, phone, 'pairing'))
+              .catch((e) => console.error(`[SYNC] pairing(${id}) falhou: ${e.message}`));
           }
         }
         serverKnownZaps.set(id, { enabled: z.enabled !== false });
@@ -1477,6 +1832,14 @@ function startServerReconciler(intervalMs = 15000) {
     } catch (e) {
       console.error('[SYNC] reconciler falhou:', e.message);
     }
+}
+
+function startServerReconciler(intervalMs = 15000) {
+  if (!isHeadless() || !whatsappManager) return null;
+  if (!serverKnownZaps) serverKnownZaps = snapshotServerZaps();
+  pruneTrash(14);
+  const timer = setInterval(() => {
+    reconcileServerZapsOnce().catch((e) => console.error('[SYNC] reconciler falhou:', e.message));
   }, intervalMs);
   if (timer && typeof timer.unref === 'function') timer.unref();
   console.log(`[SYNC] Reconciler ativo (a cada ${Math.round(intervalMs / 1000)}s)`);
@@ -1776,7 +2139,8 @@ function ensureCampaignZapConnected() {
       return;
     }
     autoMessage.addLog('info', `Reconectando a conta ${zapId} para continuar a campanha...`);
-    Promise.resolve(whatsappManager.connectZap(zapId, '', 'qrcode'))
+    const campZap = loadZapsData().find(x => String(x.id) === String(zapId)) || {};
+    Promise.resolve(whatsappManager.connectZap(zapId, String(campZap.phone || ''), 'qrcode'))
       .catch((e) => console.error(`[AUTOMSG] Falha ao reconectar conta da campanha ${zapId}: ${e.message}`));
   } catch (e) {
     console.error('[AUTOMSG] ensureCampaignZapConnected falhou:', e.message);
@@ -1786,7 +2150,22 @@ function ensureCampaignZapConnected() {
 // ------------------------------------------------------------
 // App lifecycle
 // ------------------------------------------------------------
+// Quando roda localmente (npm start), usa flags de compatibilidade:
+// - desativa GPU (evita crash por driver)
+// - usa sandbox desativado (evita problemas de permissao)
+// - pasta de dados local (evita Acesso negado em AppData)
+const isPackaged = process.env.NODE_ENV === 'production' || process.elements?.electron?.builtIn;
+if (!isPackaged) {
+  try {
+    app.commandLine.appendSwitch('disable-gpu');
+    app.commandLine.appendSwitch('no-sandbox');
+    app.commandLine.appendSwitch('disable-dev-shm-usage');
+  } catch (_) {}
+}
 app.whenReady().then(() => {
+  if (!isPackaged) {
+    app.setPath('userData', path.join(__dirname, 'data'));
+  }
   ensureDataDir();
   loadTerminalFromDisk();
   if (!isHeadless()) createWindow();
@@ -1801,7 +2180,7 @@ app.whenReady().then(() => {
     const cfg = loadServerRepoConfig();
     serverModeRequested = !!process.env.LINK_DATA_REPO_DIR || !!(cfg && cfg.enabled !== false);
     const resolvedRepo = resolveServerRepoDir();
-    if (isElectron && !isHeadless() && !syncOff && resolvedRepo) {
+    if (isElectron && !isHeadless() && !syncOff && serverModeRequested && resolvedRepo) {
       serverSync = new ServerSync({ sourceDir: localDir, dataDir: resolvedRepo });
       serverMode = !!serverSync.enabled;
     }
@@ -1842,17 +2221,15 @@ app.whenReady().then(() => {
     resolveProviderKey,
     loadZaps: loadZapsData,
     saveZaps: (zaps) => {
-      ensureDataDir();
-      const p = getFilePath('zaps.json');
-      const tmp = p + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(zaps, null, 2));
-      fs.renameSync(tmp, p);
+      const problem = validateZapsPayload(zaps);
+      if (problem) throw new Error(`lista de zaps invalida: ${problem}`);
+      saveJsonAtomic(getFilePath('zaps.json'), zaps);
       if (serverSync) serverSync.scheduleSync();
     },
     loadTrainings: loadTrainingsData,
     saveTrainings: (data) => {
-      ensureDataDir();
-      fs.writeFileSync(getFilePath('trainings.json'), JSON.stringify(data, null, 2));
+      if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('trainings invalido');
+      saveJsonAtomic(getFilePath('trainings.json'), data);
       if (serverSync) serverSync.scheduleSync();
     },
     getConversationStore: () => conversationStore || initConversationStore(),
@@ -1869,9 +2246,6 @@ app.whenReady().then(() => {
     try {
       serverSync.onPairingCode((d) => {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-pairing-code', d);
-      });
-      serverSync.onQr((d) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-qr', d);
       });
       serverSync.onStatus((d) => {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('whatsapp-status', d);
@@ -1897,26 +2271,39 @@ app.whenReady().then(() => {
     autoPairMissingSessions();
     startServerReconciler();
     startConnectionWatchdog();
+    startPairingRequestWatcher();
   }
   const statusTimer = setInterval(persistBotStatus, 30000);
   if (statusTimer && typeof statusTimer.unref === 'function') statusTimer.unref();
 });
 
 let isAppQuitting = false;
+// Handler compartilhado de desligamento gracioso: fecha loja com seguranca
+// (flush de conversas, desconecta sessoes WhatsApp, persiste status).
+async function gracefulShutdown() {
+  if (isAppQuitting) return;
+  isAppQuitting = true;
+  try {
+    if (conversationStore) conversationStore.flush();
+    if (whatsappManager) await whatsappManager.disconnectAll();
+    persistBotStatus();
+    console.log('[SHUTDOWN] desligamento gracioso concluído');
+  } catch (_) {}
+  app.exit(0);
+}
+
 app.on('before-quit', (e) => {
   if (isAppQuitting) return;
-  if (isHeadless()) return;
   e.preventDefault();
-  isAppQuitting = true;
   (async () => {
-    try {
-      if (conversationStore) conversationStore.flush();
-      if (whatsappManager) await whatsappManager.disconnectAll();
-      persistBotStatus();
-    } catch (_) {}
-    app.exit(0);
+    await gracefulShutdown();
   })();
 });
+
+// SIGTERM / SIGINT (systemd/docker stop, kill, Actions cancel) — so chamam
+// gracefulShutdown em modo headless; em modo janela, before-quit ja cuida disso.
+process.on('SIGTERM', () => { gracefulShutdown(); });
+process.on('SIGINT', () => { gracefulShutdown(); });
 
 app.on('window-all-closed', () => {
   if (isHeadless()) return;
@@ -2080,23 +2467,56 @@ ipcMain.handle('agent-chat', async (e, payload) => {
 // ------------------------------------------------------------
 // IPC - Data persistence
 // ------------------------------------------------------------
+ipcMain.handle('billing-check', (e, zapId) => checkBillingActive(String(zapId)));
+ipcMain.handle('billing-save', (e, zapId, data) => {
+  try {
+    const zaps = loadZapsData();
+    const z = zaps.find(z => String(z.id) === String(zapId));
+    if (z) z.billingPlan = data || {};
+    saveJsonAtomic(getFilePath('zaps.json'), zaps);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
 ipcMain.handle('load-zaps', () => {
   if (!fs.existsSync(getFilePath('zaps.json'))) return null;
-  return loadZapsData();
+  const data = loadZapsData();
+  if (isConfigUnsafe('zaps.json')) {
+    // Nunca devolve lista vazia: o renderer apagaria a UI e o cache local.
+    throw new Error('zaps.json esta corrompido e nao ha backup valido. O arquivo foi preservado para recuperacao.');
+  }
+  return data;
 });
-ipcMain.handle('save-zaps', (e, data) => {
+ipcMain.handle('save-zaps', (e, data, opts) => {
+  const problem = validateZapsPayload(data);
+  if (problem) {
+    console.error(`save-zaps recusado: ${problem}`);
+    return false;
+  }
   ensureDataDir();
   const p = getFilePath('zaps.json');
-  const tmp = p + '.tmp';
   const before = fs.existsSync(p) ? loadZapsData() : [];
+  const allowEmpty = !!(opts && opts.allowEmpty);
+  // Guarda contra bug de UI/IPC que apagaria todos os Zaps. No servidor isso
+  // faria o reconciliador remover todas as sessoes.
+  if (data.length === 0 && Array.isArray(before) && before.length > 0 && !allowEmpty) {
+    console.error('[CONFIG] save-zaps recusou esvaziar a lista sem allowEmpty explicito');
+    return false;
+  }
   try {
-    const json = JSON.stringify(data, null, 2);
-    // Log size for debug
-    console.log(`save-zaps: ${json.length} bytes, ${data.length} zaps`);
-    fs.writeFileSync(tmp, json);
-    fs.renameSync(tmp, p);
-    if (Array.isArray(data)) {
-      const beforeById = new Map((Array.isArray(before) ? before : []).map((z) => [String(z.id), z]));
+    const size = saveJsonAtomic(p, data);
+    // Marcador explicito: o servidor so aceita uma lista vazia quando o painel
+    // confirmou a exclusao (allowEmpty). Sem isso, lista vazia = possivel
+    // corrupcao e o reconciliador deve abortar.
+    try {
+      saveJsonAtomic(getFilePath('zaps.empty-ok.json'), {
+        empty: data.length === 0,
+        at: Date.now()
+      });
+    } catch (_) {}
+    console.log(`save-zaps: ${size} bytes, ${data.length} zaps`);
+    if (Array.isArray(before)) {
+      const beforeById = new Map(before.map((z) => [String(z.id), z]));
       const afterIds = new Set(data.map((z) => String(z.id)));
       for (const z of data) {
         if (!beforeById.has(String(z.id))) {
@@ -2111,8 +2531,7 @@ ipcMain.handle('save-zaps', (e, data) => {
     }
   } catch (err) {
     console.error('save-zaps falhou:', err.message, err.code);
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
-    // Nao joga erro para nao travar o app - apenas loga
+    try { if (fs.existsSync(p + '.tmp')) fs.unlinkSync(p + '.tmp'); } catch (_) {}
     return false;
   }
   if (serverSync) serverSync.scheduleSync();
@@ -2120,16 +2539,26 @@ ipcMain.handle('save-zaps', (e, data) => {
 });
 ipcMain.handle('load-providers', () => loadProvidersData());
 ipcMain.handle('save-providers', (e, data) => {
+  if (!Array.isArray(data)) {
+    console.error('save-providers recusado: payload nao e uma lista');
+    return false;
+  }
   ensureDataDir();
   const p = getFilePath('providers.json');
-  const tmp = p + '.tmp';
+  const before = fs.existsSync(p) ? loadProvidersData() : [];
+  // Nunca deixa um bug de UI apagar todas as chaves de API de uma vez.
+  if (data.length === 0 && Array.isArray(before) && before.length > 0) {
+    console.error('[CONFIG] save-providers recusou esvaziar a lista de provedores');
+    return false;
+  }
   try {
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-    fs.renameSync(tmp, p);
+    const safe = JSON.parse(JSON.stringify(data));
+    encryptAllProvidersKeys(safe);
+    saveJsonAtomic(p, safe);
   } catch (err) {
     console.error('save-providers falhou:', err.message);
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
-    throw err;
+    try { if (fs.existsSync(p + '.tmp')) fs.unlinkSync(p + '.tmp'); } catch (_) {}
+    return false;
   }
   if (serverSync) serverSync.scheduleSync();
   return true;
@@ -2371,22 +2800,73 @@ ipcMain.handle('server-delete-zap-session', (e, zapId) => {
   if (serverSync) return serverSync.deleteZapSession(id);
   return { ok: true, localOnly: true };
 });
-ipcMain.handle('server-status', () => (serverSync ? serverSync.getBotStatus() : null));
+ipcMain.handle('server-status', () => {
+  const base = serverSync ? serverSync.getBotStatus() : null;
+  const errors = [];
+  try {
+    const logPath = getFilePath ? getFilePath('bot-status.json') : null;
+    if (logPath && fs.existsSync(logPath)) {
+      const s = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+      if (s.lastErrors && Array.isArray(s.lastErrors)) errors.push(...s.lastErrors.slice(-5));
+    }
+  } catch (_) {}
+  return { ...(base || {}), errors, updatedAt: Date.now() };
+});
 ipcMain.handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
 
-// QR/codigo atual do servidor para a tela de conexao do painel.
+// Codigo de pareamento atual do servidor para a tela de conexao do painel.
 ipcMain.handle('server-current-qr', async (e, zapId) => {
   if (!serverMode || !serverSync) return { ok: false, error: 'modo servidor inativo' };
   const id = String(zapId || '');
-  let dataUrl = null;
-  try { dataUrl = await serverSync.getQrDataUrl(id); } catch (_) {}
   const st = serverSync.getZapStatus(id) || {};
+  let pairingCode = st.pairingCode || null;
+  if (!pairingCode) {
+    try {
+      const codes = serverSync.getPairingCodes() || {};
+      if (codes[id] && codes[id].code) pairingCode = String(codes[id].code);
+    } catch (_) {}
+  }
   return {
     ok: true,
-    dataUrl,
     status: st.status || 'disconnected',
-    pairingCode: st.pairingCode || null
+    pairingCode
   };
+});
+
+// Pede ao servidor 24h que pareie um zap por codigo. Grava o pedido no repo
+// de dados (connect-requests.json); o container le, limpa a sessao antiga e
+// publica o codigo em pairing-codes.json.
+ipcMain.handle('server-connect-zap', async (e, zapId, phone) => {
+  const id = String(zapId || '');
+  const cleanPhone = String(phone || '').replace(/\D/g, '');
+  if (!id) return { ok: false, error: 'zap invalido' };
+  if (!cleanPhone) return { ok: false, error: 'informe o numero do celular' };
+  try {
+    const zaps = loadZapsData();
+    const z = Array.isArray(zaps) ? zaps.find((x) => String(x.id) === id) : null;
+    if (z) {
+      z.phone = cleanPhone;
+      saveJsonAtomic(getFilePath('zaps.json'), zaps);
+    }
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  try {
+    const reqPath = getFilePath('connect-requests.json');
+    let reqs = {};
+    try {
+      const raw = JSON.parse(fs.readFileSync(reqPath, 'utf8'));
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) reqs = raw;
+    } catch (_) {}
+    reqs[id] = { phone: cleanPhone, ts: Date.now() };
+    saveJsonAtomic(reqPath, reqs);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  if (serverSync) {
+    try { await serverSync.syncNow(); } catch (_) {}
+  }
+  return { ok: true };
 });
 
 // ------------------------------------------------------------
@@ -2451,7 +2931,7 @@ function getServerOverview() {
     }
   }
   const enabledZaps = [...enabledById.values()];
-  const RECENT_ERROR_MS = 10 * 60 * 1000;
+  const RECENT_ERROR_MS = 24 * 60 * 60 * 1000;
 
   let connected = 0;
   let recentErrors = 0;
@@ -2578,6 +3058,11 @@ async function setServerRunning(running) {
           msg: `Falha ao ${want ? 'ligar' : 'desligar'} o servidor: ${(result && result.error) || 'erro desconhecido'}`
         });
       }
+      // Notifica todas as janelas para atualizar o painel imediatamente
+      const { BrowserWindow } = require('electron');
+      BrowserWindow.getAllWindows().forEach(w => {
+        if (!w.isDestroyed()) w.webContents.send('server-power-updated', { running: want, paused: isServerPaused() });
+      });
       return result;
     } catch (e) {
       appendServerTerminalEntry({
@@ -2714,7 +3199,7 @@ async function runServerCommand(text) {
       }
       out('info', `Conectando Zap ${zap.name || zap.id}...`);
       try {
-        await whatsappManager.connectZap(String(zap.id), String(zap.phone || ''), 'qrcode');
+        await whatsappManager.connectZap(String(zap.id), String(zap.phone || ''), 'pairing');
       } catch (e) {
         out('error', `Falha ao conectar ${zap.name || zap.id}: ${e.message}`);
       }
@@ -2780,6 +3265,21 @@ async function runServerCommand(text) {
 
 ipcMain.handle('server-overview', () => getServerOverview());
 ipcMain.handle('server-power', (e, running) => setServerRunning(!!running));
+
+ipcMain.handle('zap-block-all-existing', (e, zapRef) => {
+  try {
+    const AppAgent = require('./src/js/app-agent');
+    const agent = new AppAgent({
+      aiResponder: new (require('./src/js/ai-responder'))(),
+      getProviders: () => { try { return JSON.parse(fs.readFileSync('providers.json', 'utf8')) || []; } catch(_) { return []; } },
+      loadZaps: () => { try { return JSON.parse(fs.readFileSync('zaps.json', 'utf8')) || []; } catch(_) { return []; } },
+      saveZaps: (data) => { try { fs.writeFileSync('zaps.json', JSON.stringify(data, null, 2)); } catch(_) {} }
+    });
+    return agent.agentAction({ action: 'block_all_existing', zap: zapRef });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
 ipcMain.handle('server-terminal-logs', () => {
   loadTerminalFromDisk();
   return terminalLog.slice(-TERMINAL_MAX_LINES);
@@ -2800,5 +3300,10 @@ module.exports = {
   getStatusServer,
   getLogRing,
   autoConnectSavedSessions,
-  getAutoMessage: () => autoMessage
+  getAutoMessage: () => autoMessage,
+  // Testes de seguranca de configuracao
+  reconcileServerZapsOnce,
+  snapshotServerZaps,
+  isConfigUnsafe,
+  validateZapsPayload
 };
