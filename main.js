@@ -2215,6 +2215,16 @@ app.whenReady().then(() => {
   whatsappManager = new WhatsAppManager(mainWindow);
   aiResponder = new AIResponder();
   initConversationStore();
+  
+  // Initialize monitoring system
+  const { BotMonitor } = require('./src/js/monitor');
+  const botMonitor = new BotMonitor(whatsappManager);
+  
+  // Start monitoring in server mode (GitHub Actions)
+  if (isServerMode() || process.env.LINK_MONITOR_ENABLED === '1') {
+    botMonitor.start(30000); // Check every 30 seconds
+    console.log('[MONITOR] Bot monitoring enabled (30s interval)');
+  }
   appAgent = new AppAgent({
     aiResponder,
     getProviders: loadProvidersData,

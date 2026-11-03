@@ -13,6 +13,17 @@ class WhatsAppManager {
     this._reconnecting = new Set();
     // Fila por chat para garantir ordem de chegada (evita audio lento processar depois de texto rapido)
     this._chatQueues = new Map();
+    
+    // Heartbeat monitoring for session health
+    this._heartbeatIntervals = new Map();
+    this._lastHeartbeat = new Map();
+    this._heartbeatTimeout = 300000; // 5 minutes
+    this._heartbeatCheckInterval = 60000; // 1 minute
+    
+    // Critical event tracking
+    this._criticalEvents = [];
+    this._maxCriticalEvents = 100;
+    
     // LINK_DATA_DIR tem prioridade (servidor Linux); senao Electron userData
     let baseDir;
     if (process.env.LINK_DATA_DIR) {
@@ -53,6 +64,132 @@ class WhatsAppManager {
     } catch (e) {
       console.error('[CONTACTS] Erro ao carregar contatos persistidos:', e.message);
     }
+  }
+
+  // Heartbeat monitoring for session health
+  startHeartbeat(zapId) {
+    if (this._heartbeatIntervals.has(zapId)) {
+      this.stopHeartbeat(zapId);
+    }
+    
+    this._lastHeartbeat.set(zapId, Date.now());
+    
+    const interval = setInterval(() => {
+      const lastBeat = this._lastHeartbeat.get(zapId);
+      const now = Date.now();
+      
+      if (lastBeat && (now - lastBeat) > this._heartbeatTimeout) {
+        this.logCriticalEvent(zapId, 'heartbeat_timeout', `Heartbeat timeout: no activity for ${this._heartbeatTimeout/1000} seconds`);
+        this._forceReconnect(zapId);
+      }
+    }, this._heartbeatCheckInterval);
+    
+    this._heartbeatIntervals.set(zapId, interval);
+    this.logToApp(zapId, 'info', 'Heartbeat monitoring started');
+  }
+
+  stopHeartbeat(zapId) {
+    const interval = this._heartbeatIntervals.get(zapId);
+    if (interval) {
+      clearInterval(interval);
+      this._heartbeatIntervals.delete(zapId);
+      this._lastHeartbeat.delete(zapId);
+      this.logToApp(zapId, 'info', 'Heartbeat monitoring stopped');
+    }
+  }
+
+  updateHeartbeat(zapId) {
+    this._lastHeartbeat.set(zapId, Date.now());
+  }
+
+  // Critical event tracking for diagnostics
+  logCriticalEvent(zapId, eventType, details) {
+    const event = {
+      timestamp: Date.now(),
+      zapId,
+      eventType,
+      details,
+      uptime: process.uptime()
+    };
+    
+    this._criticalEvents.push(event);
+    
+    // Keep only the most recent events
+    if (this._criticalEvents.length > this._maxCriticalEvents) {
+      this._criticalEvents.shift();
+    }
+    
+    // Log to console with special formatting for critical events
+    const ts = new Date().toTimeString().slice(0, 8);
+    console.error(`[${ts}][CRITICAL][${eventType}] Zap ${zapId}: ${details} (uptime: ${Math.floor(process.uptime())}s)`);
+    
+    // Send to renderer for UI display
+    this.sendToRenderer('critical-event', event);
+  }
+
+  getCriticalEvents(zapId) {
+    if (!zapId) {
+      return this._criticalEvents;
+    }
+    return this._criticalEvents.filter(event => event.zapId === zapId);
+  }
+
+  clearCriticalEvents(zapId) {
+    if (!zapId) {
+      this._criticalEvents = [];
+    } else {
+      this._criticalEvents = this._criticalEvents.filter(event => event.zapId !== zapId);
+    }
+  }
+
+  // Get session health information for monitoring
+  getSessionHealth(zapId) {
+    const clientData = this.clients.get(zapId);
+    const heartbeat = this._lastHeartbeat.get(zapId);
+    
+    if (!clientData) {
+      return {
+        status: 'disconnected',
+        uptime: 0,
+        lastActivity: null,
+        criticalEvents: []
+      };
+    }
+    
+    const now = Date.now();
+    const lastActivity = heartbeat ? (now - heartbeat) : null;
+    const isHealthy = lastActivity ? lastActivity < this._heartbeatTimeout : false;
+    
+    return {
+      status: clientData.status,
+      uptime: process.uptime(),
+      lastActivity,
+      isHealthy,
+      criticalEvents: this.getCriticalEvents(zapId).slice(-10), // Last 10 critical events
+      sessionUptime: now - (clientData.startupTime * 1000),
+      phoneNumber: clientData.phoneNumber,
+      reconnecting: this._reconnecting.has(zapId)
+    };
+  }
+
+  // Get overall system health
+  getSystemHealth() {
+    const sessions = [];
+    let totalCriticalEvents = 0;
+    
+    for (const [zapId] of this.clients) {
+      const health = this.getSessionHealth(zapId);
+      sessions.push(health);
+      totalCriticalEvents += health.criticalEvents.length;
+    }
+    
+    return {
+      uptime: process.uptime(),
+      totalSessions: this.clients.size,
+      healthySessions: sessions.filter(s => s.isHealthy).length,
+      totalCriticalEvents,
+      sessions
+    };
   }
 
   persistContacts() {
@@ -96,6 +233,11 @@ class WhatsAppManager {
   }
 
   async connectZap(zapId, phoneNumber, method = 'pairing') {
+    // Save checkpoint before connection attempt
+    if (this.clients.has(zapId)) {
+      await this.saveCheckpointBeforeOperation(zapId, 'connectZap');
+    }
+
     // Painel local com LINK_CONNECT_READONLY=1: a sessao deste zap vive no
     // servidor 24h. Conectar pelo PC reusa as mesmas credenciais em outro
     // navegador e o WhatsApp invalida a sessao do servidor (logout).
@@ -408,6 +550,10 @@ class WhatsAppManager {
       this._clearPagePairingInterval(client);
       this.logToApp(zapId, 'success', `CONECTADO e pronto! Sistema ativo. readyAt=${data.readyAt} (buffer 90s)`);
       this.sendToRenderer('whatsapp-status', { zapId, status: 'ready' });
+      
+      // Start heartbeat monitoring for this session
+      this.startHeartbeat(zapId);
+      this.logCriticalEvent(zapId, 'session_ready', `Session ready at ${data.readyAt} - heartbeat monitoring started`);
       this.fetchAllContacts(zapId).catch(e => {
         const msg = e && e.message ? e.message : String(e);
         const stack = e && e.stack ? e.stack.split('\n')[0] : '';
@@ -695,6 +841,9 @@ class WhatsAppManager {
   async handleMessage(zapId, msg, opts) {
     const fromBacklog = !!(opts && opts.fromBacklog);
     try {
+      // Update heartbeat for activity monitoring
+      this.updateHeartbeat(zapId);
+      
       // Garante a chave da mensagem antes de qualquer uso (cache/IA/audio)
       this._ensureMsgKey(msg);
       // Normalize chat/contact detection: handle @g.us (grupo), @lid (novo ID), @c.us/@s.whatsapp.net
@@ -1856,16 +2005,28 @@ class WhatsAppManager {
 
     this._reconnecting.add(zapId);
     this.logToApp(zapId, 'warning', 'Pagina do WhatsApp inoperante - reconectando automaticamente (sessao preservada)...');
+    this.logCriticalEvent(zapId, 'auto_reconnect_triggered', 'Auto-reconnect triggered due to page inoperability');
+    
+    const reconnectStart = Date.now();
     try {
       await this.disconnectZap(zapId, 'reconexao automatica');
       // 'qrcode': nao apaga a sessao existente - LocalAuth reusa o login
       await this.connectZap(zapId, cd.phoneNumber || '', 'qrcode');
       const ok = await this._waitReady(zapId, 150000);
-      if (ok) this.logToApp(zapId, 'success', 'Reconexao automatica concluida - sistema pronto.');
-      else this.logToApp(zapId, 'error', 'Reconexao automatica nao ficou pronta a tempo.');
+      const reconnectDuration = Date.now() - reconnectStart;
+      
+      if (ok) {
+        this.logToApp(zapId, 'success', `Reconexao automatica concluida - sistema pronto. (${reconnectDuration}ms)`);
+        this.logCriticalEvent(zapId, 'auto_reconnect_success', `Auto-reconnect successful after ${reconnectDuration}ms`);
+      } else {
+        this.logToApp(zapId, 'error', 'Reconexao automatica nao ficou pronta a tempo.');
+        this.logCriticalEvent(zapId, 'auto_reconnect_timeout', `Auto-reconnect timeout after ${reconnectDuration}ms`);
+      }
       return ok;
     } catch (e) {
+      const reconnectDuration = Date.now() - reconnectStart;
       this.logToApp(zapId, 'error', `Reconexao automatica falhou: ${this._errText(e)}`);
+      this.logCriticalEvent(zapId, 'auto_reconnect_failed', `Auto-reconnect failed after ${reconnectDuration}ms: ${this._errText(e)}`);
       return false;
     } finally {
       this._reconnecting.delete(zapId);
@@ -1877,6 +2038,8 @@ class WhatsAppManager {
   async _healPage(zapId) {
     const cd0 = this.clients.get(zapId);
     if (cd0 && (await this._waitPageHealthy(cd0, 30000))) return true;
+    
+    this.logCriticalEvent(zapId, 'page_heal_failed', 'Page heal failed - triggering auto-reconnect');
     return this._forceReconnect(zapId);
   }
 
@@ -1887,10 +2050,14 @@ class WhatsAppManager {
   async _sendRobust(zapId, ids, doSend) {
     const attempts = 3;
     let lastErr = null;
+    const sendStart = Date.now();
+    
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const cd = this.clients.get(zapId);
       if (!cd || cd.status !== 'ready') {
-        throw new Error(`Zap ${zapId} ${cd ? 'esta ' + cd.status : 'foi desconectado'} - envio interrompido`);
+        const errorMsg = `Zap ${zapId} ${cd ? 'esta ' + cd.status : 'foi desconectado'} - envio interrompido`;
+        this.logCriticalEvent(zapId, 'send_failed_client_not_ready', errorMsg);
+        throw new Error(errorMsg);
       }
       for (const id of ids) {
         try {
@@ -1898,19 +2065,32 @@ class WhatsAppManager {
         } catch (e) {
           lastErr = e;
           const em = this._errText(e);
-          if (/nao esta no whatsapp/i.test(em)) throw new Error('Numero nao esta no WhatsApp');
+          if (/nao esta no whatsapp/i.test(em)) {
+            this.logCriticalEvent(zapId, 'send_failed_number_not_on_whatsapp', `Number not on WhatsApp: ${em}`);
+            throw new Error('Numero nao esta no WhatsApp');
+          }
           if (this._isPageDeadError(e)) {
             this.logToApp(zapId, 'warning', `Pagina do WhatsApp instavel (${em}) - tentando recuperar (tentativa ${attempt}/${attempts})...`);
+            this.logCriticalEvent(zapId, 'send_failed_page_dead', `Page dead error on attempt ${attempt}/${attempts}: ${em}`);
             const ok = await this._healPage(zapId);
-            if (!ok) throw new Error(`A pagina do WhatsApp nao recuperou apos o reinicio (${em})`);
+            if (!ok) {
+              const errorMsg = `A pagina do WhatsApp nao recuperou apos o reinicio (${em})`;
+              this.logCriticalEvent(zapId, 'send_failed_page_recover_failed', errorMsg);
+              throw new Error(errorMsg);
+            }
           } else {
             this.logToApp(zapId, 'warning', `Envio falhou para ${id} (tentativa ${attempt}/${attempts}): ${em}`);
+            this.logCriticalEvent(zapId, 'send_failed_retry', `Send failed for ${id} (attempt ${attempt}/${attempts}): ${em}`);
           }
         }
       }
       if (attempt < attempts) await new Promise(r => setTimeout(r, 800));
     }
-    throw lastErr || new Error('Falha ao enviar mensagem');
+    
+    const sendDuration = Date.now() - sendStart;
+    const finalError = lastErr || new Error('Falha ao enviar mensagem');
+    this.logCriticalEvent(zapId, 'send_failed_all_attempts', `Send failed after ${attempts} attempts (${sendDuration}ms): ${this._errText(finalError)}`);
+    throw finalError;
   }
 
   async sendMessage(zapId, phone, text, opts) {
@@ -1919,6 +2099,9 @@ class WhatsAppManager {
       throw new Error(`Zap ${zapId} nao esta conectado`);
     }
     const source = (opts && opts.source) || 'owner';
+
+    // Save checkpoint before sending critical message
+    await this.saveCheckpointBeforeOperation(zapId, 'sendMessage');
 
     const msgText = String(text || '');
     const targetId = this._normalizeChatId(phone);
@@ -3032,6 +3215,9 @@ class WhatsAppManager {
     const clientData = this.clients.get(zapId);
     if (clientData) {
       this._stopPairingWatchdog(clientData.client); // para o polling antes de destruir
+      // Stop heartbeat monitoring before disconnecting
+      this.stopHeartbeat(zapId);
+      this.logCriticalEvent(zapId, 'session_disconnected', `Session disconnected (reason: ${reason || 'user'})`);
       try {
         // Remove os listeners ANTES do destroy: um evento tardio do cliente
         // antigo (disconnected/ready) nao pode sobrescrever o status do novo
@@ -3100,6 +3286,159 @@ class WhatsAppManager {
   }
 
   // (O QR foi removido do produto: o pareamento e sempre por codigo.)
+
+  // Session checkpoint functionality for Level 2 improvements
+  saveSessionCheckpoint(zapId) {
+    try {
+      const clientData = this.clients.get(zapId);
+      if (!clientData || !clientData.client) {
+        this.logToApp(zapId, 'warning', 'Cannot save checkpoint: no active client');
+        return false;
+      }
+
+      const checkpoint = {
+        timestamp: Date.now(),
+        zapId,
+        status: clientData.status,
+        phoneNumber: clientData.phoneNumber,
+        startupTime: clientData.startupTime,
+        lastHeartbeat: this._lastHeartbeat.get(zapId),
+        conversations: {},
+        criticalEvents: this.getCriticalEvents(zapId).slice(-20), // Last 20 critical events
+        metadata: {
+          uptime: process.uptime(),
+          sessionUptime: Date.now() - (clientData.startupTime * 1000),
+          reconnecting: this._reconnecting.has(zapId)
+        }
+      };
+
+      // Save conversation data
+      const convMap = this.conversations.get(String(zapId));
+      if (convMap) {
+        convMap.forEach((conv, chatId) => {
+          checkpoint.conversations[chatId] = {
+            contact: conv.contact,
+            lastMessage: conv.lastMessage,
+            messageCount: (conv.messages || []).length,
+            lastMessageTime: conv.lastMessage ? conv.lastMessage.timestamp : null
+          };
+        });
+      }
+
+      // Save checkpoint to file
+      const checkpointDir = path.join(this._baseDir, 'checkpoints');
+      if (!fs.existsSync(checkpointDir)) {
+        fs.mkdirSync(checkpointDir, { recursive: true });
+      }
+
+      const checkpointFile = path.join(checkpointDir, `session-checkpoint-${zapId}.json`);
+      fs.writeFileSync(checkpointFile, JSON.stringify(checkpoint, null, 2));
+      
+      this.logToApp(zapId, 'success', `Session checkpoint saved to ${checkpointFile}`);
+      this.logCriticalEvent(zapId, 'checkpoint_saved', `Session checkpoint saved at ${new Date().toISOString()}`);
+      
+      return true;
+    } catch (error) {
+      this.logToApp(zapId, 'error', `Failed to save checkpoint: ${error.message}`);
+      this.logCriticalEvent(zapId, 'checkpoint_failed', `Failed to save checkpoint: ${error.message}`);
+      return false;
+    }
+  }
+
+  // Load session checkpoint for recovery
+  loadSessionCheckpoint(zapId) {
+    try {
+      const checkpointFile = path.join(this._baseDir, 'checkpoints', `session-checkpoint-${zapId}.json`);
+      if (!fs.existsSync(checkpointFile)) {
+        this.logToApp(zapId, 'warning', `No checkpoint found for zap ${zapId}`);
+        return null;
+      }
+
+      const checkpoint = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
+      this.logToApp(zapId, 'info', `Loaded checkpoint from ${new Date(checkpoint.timestamp).toISOString()}`);
+      
+      return checkpoint;
+    } catch (error) {
+      this.logToApp(zapId, 'error', `Failed to load checkpoint: ${error.message}`);
+      this.logCriticalEvent(zapId, 'checkpoint_load_failed', `Failed to load checkpoint: ${error.message}`);
+      return null;
+    }
+  }
+
+  // Recover session from checkpoint
+  async recoverSession(zapId) {
+    this.logToApp(zapId, 'info', 'Attempting session recovery...');
+    this.logCriticalEvent(zapId, 'session_recovery_started', 'Session recovery attempt started');
+
+    try {
+      // Level 1: Try to restore from checkpoint
+      const checkpoint = this.loadSessionCheckpoint(zapId);
+      if (checkpoint) {
+        this.logToApp(zapId, 'info', 'Found checkpoint, attempting to restore session state...');
+        
+        // Restore conversations if available
+        if (checkpoint.conversations) {
+          const convMap = new Map();
+          Object.keys(checkpoint.conversations).forEach(chatId => {
+            convMap.set(chatId, checkpoint.conversations[chatId]);
+          });
+          this.conversations.set(String(zapId), convMap);
+          this.logToApp(zapId, 'info', `Restored ${convMap.size} conversations from checkpoint`);
+        }
+
+        // Try to reconnect with existing session
+        if (checkpoint.phoneNumber) {
+          this.logToApp(zapId, 'info', `Attempting to reconnect with existing session for ${checkpoint.phoneNumber}...`);
+          const result = await this.connectZap(zapId, checkpoint.phoneNumber, 'existing_session');
+          
+          if (result.status === 'ready') {
+            this.logToApp(zapId, 'success', 'Session successfully recovered from checkpoint');
+            this.logCriticalEvent(zapId, 'session_recovery_success', 'Session successfully recovered from checkpoint');
+            return true;
+          } else {
+            this.logToApp(zapId, 'warning', 'Reconnection with existing session failed, trying fresh pairing');
+          }
+        }
+      }
+
+      // Level 2: If checkpoint restore failed, try to reconnect with existing session
+      const clientData = this.clients.get(zapId);
+      if (clientData && clientData.phoneNumber) {
+        this.logToApp(zapId, 'info', 'Attempting fresh reconnection with existing credentials...');
+        const result = await this.connectZap(zapId, clientData.phoneNumber, 'reconnect');
+        
+        if (result.status === 'ready') {
+          this.logToApp(zapId, 'success', 'Session successfully reconnected');
+          this.logCriticalEvent(zapId, 'session_reconnect_success', 'Session successfully reconnected without fresh pairing');
+          return true;
+        }
+      }
+
+      // Level 3: Generate fresh pairing code
+      this.logToApp(zapId, 'info', 'Generating fresh pairing code...');
+      this.logCriticalEvent(zapId, 'fresh_pairing_required', 'Fresh pairing required due to session recovery failure');
+      
+      return await this.requestPairingCode(zapId);
+      
+    } catch (error) {
+      this.logToApp(zapId, 'error', `Session recovery failed: ${error.message}`);
+      this.logCriticalEvent(zapId, 'session_recovery_failed', `Session recovery failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  // Save checkpoint before critical operations
+  async saveCheckpointBeforeOperation(zapId, operationName) {
+    this.logToApp(zapId, 'info', `Saving checkpoint before ${operationName}...`);
+    
+    if (this.saveSessionCheckpoint(zapId)) {
+      this.logToApp(zapId, 'success', `Checkpoint saved before ${operationName}`);
+      return true;
+    } else {
+      this.logToApp(zapId, 'warning', `Failed to save checkpoint before ${operationName}, proceeding anyway`);
+      return false;
+    }
+  }
 
   // Aguarda uma promise com limite de tempo (evita evaluate travado por 180s
   // no protocolTimeout do puppeteer, que segurava requestPairingCode pendurado)
