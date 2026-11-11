@@ -205,6 +205,8 @@ async function run() {
   const electronStub = {
     app: {
       getPath: () => path.join(tmp, 'electron-userdata'),
+      setPath() {},
+      isPackaged: false,
       whenReady: () => Promise.resolve(),
       on() {},
       quit() {},

@@ -140,7 +140,14 @@ class FakeWhatsAppManager {
 }
 
 const electronStub = {
-  app: { getPath: () => userData, whenReady: () => Promise.resolve(), on() {}, quit() {} },
+  app: {
+    getPath: () => userData,
+    setPath() {},
+    isPackaged: false,
+    whenReady: () => Promise.resolve(),
+    on() {},
+    quit() {}
+  },
   BrowserWindow: FakeBrowserWindow,
   ipcMain: { handle() {}, on() {} },
   dialog: {}

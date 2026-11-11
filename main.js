@@ -2219,11 +2219,17 @@ app.whenReady().then(() => {
   // Initialize monitoring system
   const { BotMonitor } = require('./src/js/monitor');
   const botMonitor = new BotMonitor(whatsappManager);
-  
-  // Start monitoring in server mode (GitHub Actions)
-  if (isServerMode() || process.env.LINK_MONITOR_ENABLED === '1') {
-    botMonitor.start(30000); // Check every 30 seconds
-    console.log('[MONITOR] Bot monitoring enabled (30s interval)');
+
+  // Start monitoring in server mode (headless) or when explicitly enabled
+  if (serverMode || isHeadless() || process.env.LINK_MONITOR_ENABLED === '1') {
+    try {
+      if (typeof whatsappManager.getSystemHealth === 'function') {
+        botMonitor.start(30000); // Check every 30 seconds
+        console.log('[MONITOR] Bot monitoring enabled (30s interval)');
+      }
+    } catch (e) {
+      console.error('[MONITOR] Falha ao iniciar monitoramento:', e.message);
+    }
   }
   appAgent = new AppAgent({
     aiResponder,
@@ -2874,7 +2880,12 @@ ipcMain.handle('server-connect-zap', async (e, zapId, phone) => {
     return { ok: false, error: err.message };
   }
   if (serverSync) {
-    try { await serverSync.syncNow(); } catch (_) {}
+    try { 
+      // A sincronização precisa ser feita em uma função async
+      setTimeout(async () => {
+        try { await serverSync.syncNow(); } catch (_) {}
+      }, 0);
+    } catch (_) {}
   }
   return { ok: true };
 });
@@ -3248,10 +3259,17 @@ async function runServerCommand(text) {
       }
       out('info', 'Sincronizando configuracoes...');
       try {
-        const r = await serverSync.syncNow();
-        out(r && r.ok ? 'success' : 'error', r && r.ok
-          ? `Sincronizacao concluida${r.unchanged ? ' (sem alteracoes)' : ''}.`
-          : `Falha na sincronizacao: ${(r && r.error) || 'erro desconhecido'}`);
+        // A sincronização precisa ser feita em uma função async
+        setTimeout(async () => {
+          try {
+            const r = await serverSync.syncNow();
+            out(r && r.ok ? 'success' : 'error', r && r.ok
+              ? `Sincronizacao concluida${r.unchanged ? ' (sem alteracoes)' : ''}.`
+              : `Falha na sincronizacao: ${(r && r.error) || 'erro desconhecido'}`);
+          } catch (e) {
+            out('error', `Falha na sincronizacao: ${e.message}`);
+          }
+        }, 0);
       } catch (e) {
         out('error', `Falha na sincronizacao: ${e.message}`);
       }

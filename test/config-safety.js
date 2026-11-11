@@ -66,6 +66,7 @@ function testAsync(name, fn) { pending.push({ name, fn }); }
     setOnMessageCallback() {}
     async connectZap(id, phone, method) { this.connects.push({ id, method }); }
     getStatus() { return { status: 'disconnected' }; }
+    getSystemHealth() { return { ok: true, zaps: [] }; }
     listConnectionStates() { return []; }
     async disconnectZap() { return { status: 'disconnected' }; }
     async disconnectAll() {}
@@ -73,6 +74,8 @@ function testAsync(name, fn) { pending.push({ name, fn }); }
   const electronStub = {
     app: {
       getPath: () => path.join(tmp, 'electron-userdata'),
+      setPath() {},
+      isPackaged: false,
       whenReady: () => Promise.resolve(),
       on() {},
       quit() {},
