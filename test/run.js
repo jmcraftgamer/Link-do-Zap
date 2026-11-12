@@ -246,9 +246,10 @@ test('fonte: codigo injetado nao usa Msg.get quebrado e tem o strip de midia', (
 
 test('fonte: main.js usa o modulo de resolucao', () => {
   const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  const coreSrc = fs.readFileSync(path.join(root, 'src', 'core', 'messaging', 'pipeline.js'), 'utf8');
   assert.ok(src.includes("require('./src/js/media-resolver')"));
   assert.ok(!src.includes('function parseImageMarkers'));
-  assert.ok(src.includes('resolveReplyMedia('));
+  assert.ok(coreSrc.includes('resolveReplyMedia('));
 });
 
 test('modulo carrega e exporta tudo que o main usa', () => {
@@ -451,8 +452,9 @@ test('horario: usa o fuso configurado (servidor roda em UTC)', () => {
 
 test('horario: main.js e o painel usam o horario de atendimento', () => {
   const mainSrc = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
-  assert.ok(mainSrc.includes('isWithinWorkHours'), 'main.js nao checa o horario');
-  assert.ok(mainSrc.includes('Fora do horario de atendimento'), 'sem log ao ignorar fora do horario');
+  const coreSrc = fs.readFileSync(path.join(root, 'src', 'core', 'messaging', 'pipeline.js'), 'utf8');
+  assert.ok((mainSrc + coreSrc).includes('isWithinWorkHours'), 'main.js nao checa o horario');
+  assert.ok((mainSrc + coreSrc).includes('Fora do horario de atendimento'), 'sem log ao ignorar fora do horario');
   const html = fs.readFileSync(path.join(root, 'src', 'index.html'), 'utf8');
   assert.ok(html.includes('panelWorkHours'), 'painel sem opcao de horario');
   assert.ok(html.includes('panelWorkStart') && html.includes('panelWorkEnd'), 'painel sem campos de hora');
@@ -764,11 +766,12 @@ test('MEMORIA IA: bloco de memoria so entra no prompt quando ja ha historico', (
 
 test('MEMORIA: main.js agenda a virada 00:00 e injeta a memoria no fluxo', () => {
   const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  const coreSrc = fs.readFileSync(path.join(root, 'src', 'core', 'messaging', 'pipeline.js'), 'utf8');
   assert.ok(src.includes('function scheduleMidnightRollover()'), 'agenda a virada de dia');
   assert.ok(src.includes('conversationStore.rollOver'), 'fecha conversas as 00:00');
   assert.ok(src.includes('initConversationStore()'), 'inicializa o store');
   assert.ok(/new AIResponder\(\);\s*\r?\n\s*initConversationStore\(\)/.test(src), 'inicializa depois de criar o AIResponder');
-  assert.ok(src.includes('conversationInfo'), 'passa o contexto de memoria para o prompt');
+  assert.ok((src + coreSrc).includes('conversationInfo'), 'passa o contexto de memoria para o prompt');
   assert.ok(src.includes('setHistoryStore'), 'conecta o store ao AIResponder');
   assert.ok(src.includes('conversations.json'), 'grava o historico em disco');
   assert.ok(src.includes('conversationStore.flush()'), 'salva ao fechar o app');
@@ -837,10 +840,12 @@ test('MEMORIA IA: bloco MEMORIA DE CONVERSAS entra no prompt quando ha memoryTex
 
 test('MEMORIA 3 DIAS: main.js grava .txt e passa memoryText no prompt', () => {
   const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
-  assert.ok(src.includes('MEMORY_DAYS'), 'janela de dias configuravel');
-  assert.ok(src.includes('conversationStore.memoryText'), 'usa o store para montar a memoria');
-  assert.ok(src.includes("'memorias'"), 'grava o arquivo .txt');
-  assert.ok(src.includes('memoryText'), 'injeta a memoria no prompt');
+  const coreSrc = fs.readFileSync(path.join(root, 'src', 'core', 'messaging', 'pipeline.js'), 'utf8');
+  const combined = src + coreSrc;
+  assert.ok(combined.includes('MEMORY_DAYS'), 'janela de dias configuravel');
+  assert.ok(combined.includes('conversationStore.memoryText'), 'usa o store para montar a memoria');
+  assert.ok(combined.includes("'memorias'"), 'grava o arquivo .txt');
+  assert.ok(combined.includes('memoryText'), 'injeta a memoria no prompt');
 });
 
 // --------------------- PONTUACAO HUMANA (SEM CARA DE IA) ---------------------

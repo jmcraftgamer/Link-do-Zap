@@ -1,0 +1,24 @@
+[Unit]
+Description=Assistente do Zap - Backend (Electron headless + Xvfb)
+Documentation=https://github.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zap
+Group=zap
+WorkingDirectory=/opt/assistente-zap
+EnvironmentFile=/opt/assistente-zap/.env
+Environment=HEADLESS=1
+Environment=LINK_SERVER_SYNC=0
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1280x800x24" /opt/assistente-zap/node_modules/electron/dist/electron /opt/assistente-zap/backend/electron-entry.js --no-sandbox --disable-gpu --disable-dev-shm-usage
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -16,3 +16,5 @@ data/
 *.swp
 *.swo
 .freebuff/
+# Testes E2E locais (backend Electron + Setup)
+.tmp-e2e/

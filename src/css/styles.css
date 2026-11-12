@@ -5273,6 +5273,28 @@ input, textarea, select {
   margin-top: 4px;
 }
 
+/* Conexao do Setup com o backend na VPS */
+.remote-connect-row {
+  display: block;
+  margin-top: 10px;
+  max-width: 460px;
+}
+
+.remote-connect-row .server-clone-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.remote-connect-actions {
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+#remoteConnectCard.is-connected {
+  border-color: #bfe3c8;
+  background: #f4fbf5;
+}
+
 @media (max-width: 900px) {
   .server-connect-card { flex-direction: column; align-items: flex-start; }
   .server-clone-row { grid-template-columns: 1fr; }

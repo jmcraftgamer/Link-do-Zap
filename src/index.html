@@ -483,6 +483,21 @@
             </div>
           </div>
 
+          <div class="server-connect-card" id="remoteConnectCard">
+            <div class="server-connect-main">
+              <div class="server-connect-title" id="remoteConnectTitle">Servidor na VPS (API)</div>
+              <div class="server-connect-hint" id="remoteConnectHint">Conecte este Setup ao backend 24h que roda na VPS. O bot continua no ar mesmo com o PC desligado.</div>
+              <div class="server-clone-row remote-connect-row">
+                <input class="server-clone-input" id="remoteServerUrl" type="text" placeholder="http://203.0.113.10 ou http://meuservidor.com" spellcheck="false" autocomplete="off">
+              </div>
+              <div class="server-connect-actions remote-connect-actions">
+                <button type="button" class="server-connect-btn" id="remoteConnectTest" title="Testar se o servidor responde">Testar conexao</button>
+                <button type="button" class="server-connect-btn" id="remoteConnectSave" title="Salvar e reiniciar em modo cliente">Salvar e reiniciar</button>
+                <button type="button" class="server-connect-btn ghost" id="remoteConnectOff" title="Voltar a rodar o bot neste PC">Voltar ao modo local</button>
+              </div>
+            </div>
+          </div>
+
           <div class="server-clone-panel" id="serverClonePanel" style="display:none">
             <div class="server-clone-row">
               <label class="server-clone-label" for="serverRepoUrl">URL do repositorio de dados</label>
@@ -1128,6 +1143,6 @@
   </div>
 
   <script src="js/providers.js"></script>
-  <script src="js/app.js"></script>
+  <script src="js/remote-gate.js"></script>
 </body>
 </html>

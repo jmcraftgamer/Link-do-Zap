@@ -8,6 +8,33 @@ const { resolveReplyMedia } = require('./src/js/media-resolver');
 const { verifyMessage } = require('./src/js/message-guard');
 const { isWithinWorkHours } = require('./src/js/work-hours');
 
+// Nucleo compartilhado com o backend (sem dependencia de Electron)
+const { createPaths } = require('./src/core/paths');
+const { createJsonStore } = require('./src/core/json-store');
+const billingCore = require('./src/core/billing');
+const { createEventBus } = require('./src/core/events');
+const { createTypingService } = require('./src/core/messaging/typing');
+const { createMessagePipeline } = require('./src/core/messaging/pipeline');
+
+// Superficie unica de comandos: o IPC do Setup e a API do backend chamam os
+// mesmos handlers, garantindo comportamento identico nos dois transportes.
+const commandHandlers = new Map();
+function handle(channel, fn) {
+  commandHandlers.set(channel, fn);
+  if (ipcMain && typeof ipcMain.handle === 'function') ipcMain.handle(channel, fn);
+}
+async function invokeCommand(channel, ...args) {
+  const fn = commandHandlers.get(channel);
+  if (!fn) throw new Error(`Comando desconhecido: ${channel}`);
+  return await fn({}, ...args);
+}
+function hasCommand(channel) {
+  return commandHandlers.has(channel);
+}
+function listCommands() {
+  return [...commandHandlers.keys()];
+}
+
 // Garante que binarios extras (ffmpeg, etc.) no mesmo diretorio do .exe sejam encontrados pelo PATH
 if (process.env.PATH) {
   const execDir = path.dirname(process.execPath || __dirname);
@@ -213,6 +240,7 @@ function appendServerTerminalEntry(input, opts) {
     } catch (_) { /* mantem so em memoria */ }
   }
   sendTerminalEntry(entry);
+  coreEvents.emit('server-terminal-log', entry);
   return entry;
 }
 
@@ -229,6 +257,7 @@ function clearServerTerminal() {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('server-terminal-cleared');
   }
+  coreEvents.emit('server-terminal-cleared', { at: new Date().toISOString() });
   appendServerTerminalEntry({ level: 'info', source: 'PAINEL', msg: 'Terminal limpo.' });
 }
 
@@ -304,29 +333,47 @@ function isHeadless() {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
+// Quando LINK_API_URL esta definido, o Setup vira cliente do backend:
+// nao inicializa WhatsApp/IA nem jobs locais. A URL pode vir do ambiente ou
+// de data/remote-server.json (salvo pela tela "Conectar ao servidor").
+function loadRemoteConfig() {
+  try {
+    const cfg = loadJsonFile('remote-server.json', null);
+    if (cfg && typeof cfg === 'object' && cfg.url && cfg.enabled !== false) {
+      return {
+        url: String(cfg.url).replace(/\/+$/, ''),
+        apiPrefix: String(cfg.apiPrefix || '/api/v1'),
+        savedAt: cfg.savedAt || null
+      };
+    }
+  } catch (_) {}
+  return null;
+}
+
+function isRemoteClientMode() {
+  if (String(process.env.LINK_API_URL || '').trim()) return true;
+  return !!loadRemoteConfig();
+}
+
 function getLogRing() {
   return logRing;
 }
 
 // ------------------------------------------------------------
-// Helpers - paths
+// Helpers - paths (nucleo compartilhado)
 // ------------------------------------------------------------
+const corePaths = createPaths({ getApp: () => app });
+const coreStore = createJsonStore({ paths: corePaths });
+const coreEvents = createEventBus();
+
 function getDataDir() {
-  try {
-    if (process.env.LINK_DATA_DIR) return path.resolve(process.env.LINK_DATA_DIR);
-  } catch (_) {}
-  try {
-    if (app && app.getPath) return path.join(app.getPath('userData'), 'link-no-whatsapp');
-  } catch (_) {}
-  const base = process.env.APPDATA || process.env.HOME || process.env.USERPROFILE || require('os').homedir();
-  return path.join(base, 'link-no-whatsapp');
+  return corePaths.getDataDir();
 }
 function getFilePath(filename) {
-  return path.join(getDataDir(), filename);
+  return corePaths.getFilePath(filename);
 }
 function ensureDataDir() {
-  const dir = getDataDir();
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return corePaths.ensureDataDir();
 }
 
 // ------------------------------------------------------------
@@ -336,89 +383,37 @@ function ensureDataDir() {
 // no servidor, uma lista vazia faz o reconciliador tratar todos os Zaps como
 // removidos e apagar sessoes/treinamentos. Aqui a falha fica registrada e quem
 // consome decide entre abortar a operacao ou usar o backup.
-const configIssues = new Map();
-
 function configBackupPath(p) {
-  return p + '.bak';
+  return coreStore.configBackupPath(p);
 }
 
 // true apenas quando o arquivo esta corrompido E nao foi possivel recuperar.
 function isConfigUnsafe(filename) {
-  const issue = configIssues.get(filename);
-  return !!(issue && !issue.recovered);
+  return coreStore.isConfigUnsafe(filename);
 }
 
 function configIssueSummary() {
-  return [...configIssues.entries()]
-    .filter(([, v]) => v && !v.recovered)
-    .map(([k, v]) => `${k}: ${v.error}`)
-    .join('; ');
+  return coreStore.configIssueSummary();
 }
 
 // Escrita atomica com backup da versao anterior. Nunca grava algo que nao
 // consiga ler de volta (JSON.parse no proprio conteudo serializado).
 function saveJsonAtomic(p, data) {
-  ensureDataDir();
-  const json = JSON.stringify(data, null, 2);
-  JSON.parse(json);
-  const tmp = p + '.tmp';
-  fs.writeFileSync(tmp, json);
-  try {
-    if (fs.existsSync(p)) fs.copyFileSync(p, configBackupPath(p));
-  } catch (_) { /* backup e melhor-esforco */ }
-  try {
-    fs.renameSync(tmp, p);
-  } catch (_) {
-    // Windows: antivirus/OneDrive podem segurar o arquivo. Fallback direto.
-    fs.writeFileSync(p, json);
-    try { fs.unlinkSync(tmp); } catch (_) {}
-  }
-  configIssues.delete(path.basename(p));
-  return json.length;
+  return coreStore.saveJsonAtomic(p, data);
 }
 
 // Move para a lixeira em vez de apagar. Nada e destruido por engano.
 function moveToTrash(targetPath, reason) {
-  try {
-    if (!fs.existsSync(targetPath)) return false;
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const trashDir = path.join(getDataDir(), 'trash', stamp);
-    fs.mkdirSync(trashDir, { recursive: true });
-    fs.renameSync(targetPath, path.join(trashDir, path.basename(targetPath)));
-    console.log(`[TRASH] ${path.basename(targetPath)} movido para lixeira (${reason || 'sem motivo'})`);
-    return true;
-  } catch (e) {
-    console.error(`[TRASH] falha ao mover ${targetPath}: ${e.message}`);
-    return false;
-  }
+  return coreStore.moveToTrash(targetPath, reason);
 }
 
 // Limpa a lixeira depois de N dias (recuperacao continua possivel na janela).
 function pruneTrash(maxAgeDays = 14) {
-  try {
-    const root = path.join(getDataDir(), 'trash');
-    if (!fs.existsSync(root)) return;
-    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    for (const name of fs.readdirSync(root)) {
-      const full = path.join(root, name);
-      try {
-        if (fs.statSync(full).mtimeMs < cutoff) fs.rmSync(full, { recursive: true, force: true });
-      } catch (_) {}
-    }
-  } catch (_) {}
+  return coreStore.pruneTrash(maxAgeDays);
 }
 
 function validateZapsPayload(data) {
-  if (!Array.isArray(data)) return 'payload nao e uma lista';
-  const ids = new Set();
-  for (const z of data) {
-    if (!z || typeof z !== 'object' || Array.isArray(z)) return 'zap invalido na lista';
-    const id = String(z.id == null ? '' : z.id).trim();
-    if (!id) return 'zap sem id';
-    if (ids.has(id)) return `id duplicado: ${id}`;
-    ids.add(id);
-  }
-  return null;
+  return coreStore.validateZapsPayload(data);
 }
 
 // ------------------------------------------------------------
@@ -584,32 +579,7 @@ function serverRepoUrlWithToken(url, token) {
 }
 
 function loadJsonFile(filename, fallback) {
-  const p = getFilePath(filename);
-  if (!fs.existsSync(p)) {
-    configIssues.delete(filename);
-    return fallback;
-  }
-  try {
-    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
-    configIssues.delete(filename);
-    return data;
-  } catch (e) {
-    // 1) tenta o backup antes de aceitar que o dado se perdeu
-    try {
-      const bak = configBackupPath(p);
-      if (fs.existsSync(bak)) {
-        const data = JSON.parse(fs.readFileSync(bak, 'utf8'));
-        console.error(`[CONFIG] ${filename} corrompido (${e.message}); restaurando do backup`);
-        try { fs.copyFileSync(bak, p); } catch (_) {}
-        configIssues.set(filename, { error: e.message, recovered: true, at: Date.now() });
-        return data;
-      }
-    } catch (_) { /* backup tambem invalido */ }
-    // 2) sem backup valido: registra a falha. Quem consome decide o que fazer.
-    console.error(`[CONFIG] ${filename} corrompido e sem backup valido: ${e.message}`);
-    configIssues.set(filename, { error: e.message, recovered: false, at: Date.now() });
-    return fallback;
-  }
+  return coreStore.loadJsonFile(filename, fallback);
 }
 function loadZapsData() { return loadJsonFile('zaps.json', []); }
 // ------------------------------------------------------------
@@ -622,41 +592,13 @@ function loadZapsData() { return loadJsonFile('zaps.json', []); }
 function getBillingForZap(id) {
   const list = loadZapsData();
   const z = list.find(z => String(z.id) === String(id));
-  if (!z || !z.billingPlan) return null;
-  const now = new Date();
-  const monthKey = String(now.getMonth() + 1); // 1..12
-  const payMonths = z.billingPlan.paidMonths || {};
-  return {
-    dueDay: Number(z.billingPlan.dueDay) || 1,
-    graceDays: Number(z.billingPlan.graceDays) || 0,
-    payMonths: payMonths,
-    monthKey: monthKey,
-    now: now.toISOString(),
-    ...z.billingPlan
-  };
+  return billingCore.getBillingForZap(z);
 }
 // Checa se um zap pode responder agora. Retorna { active: true|false, reason, todayKey, currentDue }
 function checkBillingActive(zapId) {
-  const bp = getBillingForZap(zapId);
-  if (!bp) return { active: true, reason: 'no_plan', todayKey: null, currentDue: null };
-  if (bp.disabledForOwnUse === true) return { active: true, reason: 'own_use', todayKey: null, currentDue: null };
-  const mk = bp.monthKey || String((Number(bp.now || new Date().getMonth()) || 0) + 1);
-  const dueDate = new Date(new Date().getFullYear(), Number(mk) - 1, Number(bp.dueDay) || 1);
-  const pmt = bp.paidMonths && !bp.paidMonths[mk];
-  if (!pmt) {
-    // Quem nao pagou ate o dia do plano -> inativo. Prazo e calculado ate o dia do proximo mes que venceu.
-    const lastDueMonth = new Date(new Date().getFullYear(), Number(mk), 1).getFullYear();
-    const monthsAgo = (new Date().getMonth() + 1) - Number(mk);
-    if ((monthsAgo + 12) % 12 === 0) {
-      // Mes que vencia ainda nao terminou ou eh o mes atual... simplifique: aposto permanente prazo
-      return { active: false, reason: 'atrasado_desde_meu_prazo', todayKey: mk, currentDue: Number(bp.dueDay) };
-    }
-    // Daqui ate o seguinte "vence" -> 60 dias de prazo maximo
-    if (dueDate < new Date()) return { active: false, reason: 'atrasado', todayKey: mk, currentDue: Number(bp.dueDay) };
-    return { active: false, reason: 'prazo_prescrito', todayKey: mk, currentDue: Number(bp.dueDay) };
-  }
-  // Marcado: volta ativo
-  return { active: true, reason: 'pago', todayKey: mk, currentDue: Number(bp.dueDay) };
+  const list = loadZapsData();
+  const z = list.find(z => String(z.id) === String(zapId));
+  return billingCore.checkBillingActive(z || null);
 }
 
 function loadProvidersData() {
@@ -713,13 +655,7 @@ function loadTrainingsData() {
   return loadJsonFile('trainings.json', {});
 }
 function resolveDataPath(rel) {
-  const base = path.resolve(getDataDir());
-  const abs = path.resolve(base, rel);
-  const relative = path.relative(base, abs);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
-  // Windows case-insensitive check
-  if (abs.toLowerCase().indexOf(base.toLowerCase()) !== 0) return null;
-  return abs;
+  return corePaths.resolveDataPath(rel);
 }
 
 // ------------------------------------------------------------
@@ -774,9 +710,47 @@ function sendLog(zapId, type, msg) {
   if (type === 'error' && zapId != null) {
     zapErrors.set(String(zapId), Date.now());
   }
+  coreEvents.emit('log', { zapId, type, msg, ts: Date.now() });
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('whatsapp-log', { zapId, type, msg });
   }
+}
+
+// ------------------------------------------------------------
+// Servicos do nucleo (compartilhados com o backend)
+// ------------------------------------------------------------
+const typingService = createTypingService({
+  getWhatsapp: () => whatsappManager,
+  emit: (event, payload) => {
+    coreEvents.emit(event, payload);
+    if (event === 'typing' && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('whatsapp-typing', payload);
+    }
+  },
+  log: (zapId, type, msg) => sendLog(zapId, type, msg)
+});
+
+let messagePipeline = null;
+
+function getMessagePipeline() {
+  if (!messagePipeline) {
+    messagePipeline = createMessagePipeline({
+      paths: corePaths,
+      getWhatsapp: () => whatsappManager,
+      getAiResponder: () => aiResponder,
+      getConversationStore: () => conversationStore,
+      loadZaps: loadZapsData,
+      loadProviders: loadProvidersData,
+      loadTrainings: loadTrainingsData,
+      checkBillingActive: (zap) => billingCore.checkBillingActive(zap),
+      isServerPaused,
+      isServerMode: () => serverMode,
+      log: sendLog,
+      typing: typingService,
+      resolveProviderKey
+    });
+  }
+  return messagePipeline;
 }
 
 // ------------------------------------------------------------
@@ -814,96 +788,18 @@ async function sendErrorToWhatsApp(zapId, chatId, msg) {
 }
 
 async function sendTypingIndicator(zapId, chatId, silent = false) {
-  try {
-    const clientData = whatsappManager && whatsappManager.clients.get(String(zapId));
-    if (!clientData || !clientData.client || !clientData.client.pupPage) {
-      if (!silent) sendLog(zapId, 'warning', 'Indicador digitando: cliente ou pagina pupPage indisponivel');
-      return;
-    }
-    const page = clientData.client.pupPage;
-    const success = await page.evaluate(async (id) => {
-      try {
-        let wid = window.require('WAWebWidFactory').createWid(id);
-        if (wid.isLid && wid.isLid()) {
-          try {
-            const pn = window.require('WAWebApiContact').getPhoneNumber(wid);
-            if (pn) wid = pn;
-          } catch (_) {}
-        }
-        const ChatState = window.require('WAWebChatStateBridge');
-        await ChatState.sendChatStateComposing(wid);
-        return true;
-      } catch (err) {
-        return { error: err.message };
-      }
-    }, chatId);
-
-    if (success === true) {
-      if (!silent) {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('whatsapp-typing', { zapId: String(zapId), chatId, isTyping: true });
-        }
-        sendLog(zapId, 'info', 'Indicador digitando enviado no WhatsApp');
-      }
-    } else {
-      sendLog(zapId, 'warning', `Falha ao enviar digitando via page.evaluate: ${success && success.error ? success.error : 'desconhecido'}`);
-    }
-  } catch (e) {
-    sendLog(zapId, 'warning', `Nao foi possivel enviar digitando: ${e.message}`);
-  }
+  return typingService.send(zapId, chatId, silent);
 }
 
 async function clearTypingIndicator(zapId, chatId) {
-  try {
-    const clientData = whatsappManager && whatsappManager.clients.get(String(zapId));
-    if (!clientData || !clientData.client || !clientData.client.pupPage) return;
-    const page = clientData.client.pupPage;
-    await page.evaluate(async (id) => {
-      try {
-        let wid = window.require('WAWebWidFactory').createWid(id);
-        if (wid.isLid && wid.isLid()) {
-          try {
-            const pn = window.require('WAWebApiContact').getPhoneNumber(wid);
-            if (pn) wid = pn;
-          } catch (_) {}
-        }
-        const ChatState = window.require('WAWebChatStateBridge');
-        await ChatState.sendChatStatePaused(wid);
-      } catch (_) {}
-    }, chatId).catch(() => {});
-
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('whatsapp-typing', { zapId: String(zapId), chatId, isTyping: false });
-    }
-  } catch (_) {}
+  return typingService.clear(zapId, chatId);
 }
 
 // Espera o tempo que uma pessoa levaria digitando essa mensagem
 // (2,5 caracteres por segundo = 2s a cada 5 digitos, minimo 5s visivel).
 // Renova o indicador a cada 20s porque o WhatsApp expira "digitando" em ~25s.
 async function waitRealisticTyping(zapId, chatId, typingStart, text) {
-  // Velocidade realista (8-12 chars/s = ~0,1s por char) com teto 3-12s (T1).
-  const CARACTERES_POR_SEGUNDO = 10;
-  const chars = String(text || '').length;
-  const humanTypingMs = Math.round((chars / CARACTERES_POR_SEGUNDO) * 1000);
-  const targetTypingMs = Math.min(12000, Math.max(3000, humanTypingMs));
-  const typingElapsed = Date.now() - typingStart;
-  const remainingMs = targetTypingMs - typingElapsed;
-
-  sendLog(zapId, 'info',
-    `Digitacao realista: ${chars} caracteres = ~${(humanTypingMs / 1000).toFixed(1)}s de pessoa digitando; ` +
-    `indicador ligado ha ${(typingElapsed / 1000).toFixed(1)}s (alvo ${(targetTypingMs / 1000).toFixed(1)}s).`);
-
-  if (remainingMs > 0) {
-    sendLog(zapId, 'info', `Faltam ${(remainingMs / 1000).toFixed(1)}s com "digitando..." antes de enviar...`);
-    const deadline = Date.now() + remainingMs;
-    while (Date.now() < deadline) {
-      const left = deadline - Date.now();
-      await new Promise(resolve => setTimeout(resolve, Math.min(20000, left)));
-      // O WhatsApp expira o estado "digitando" em ~25s - renova ate o fim
-      if (Date.now() < deadline) await sendTypingIndicator(zapId, chatId, true);
-    }
-  }
+  return typingService.waitRealistic(zapId, chatId, typingStart, text);
 }
 
 // ------------------------------------------------------------
@@ -927,464 +823,16 @@ async function transcribeAudio(audio, providersData, zapId, apiKeySelections) {
 // que chegaram. Sem isso, com o tempo aleatorio de resposta (15/25/35s),
 // a IA poderia responder a segunda mensagem antes da primeira.
 // ------------------------------------------------------------
-const chatQueues = new Map();
-
 async function handleIncomingMessage(messageData) {
-  const cid = (messageData.chat && messageData.chat.id) || messageData.from || messageData.to || '';
-  const key = `${messageData.zapId}|${cid}`;
-  const prev = chatQueues.get(key) || Promise.resolve();
-  const run = prev
-    .catch(() => {})
-    .then(() => processMessage(messageData))
-    .catch(e => console.error('handleIncomingMessage erro:', e));
-  chatQueues.set(key, run);
-  run.then(() => { if (chatQueues.get(key) === run) chatQueues.delete(key); });
-  return run;
+  return getMessagePipeline().handleIncomingMessage(messageData);
 }
 
 // ------------------------------------------------------------
 // Core: handle incoming WhatsApp message -> IA -> reply
+// Implementacao no nucleo compartilhado (src/core/messaging/pipeline.js).
 // ------------------------------------------------------------
 async function processMessage(messageData) {
-  const { zapId, body, from, to, fromMe, chat, contact, audio } = messageData;
-  const contactName = contact?.name || from;
-  const chatId = chat?.id || from;
-  const audioFailed = !!messageData.audioFailed;
-  // Horario da mensagem que disparou a IA (segundos). Serve para saber se o
-  // dono do numero respondeu DEPOIS dela antes de a IA mandar a resposta.
-  const triggerTs = messageData.timestamp || Math.floor(Date.now() / 1000);
-
-  // ================= GRUPOS: CORTE NO TOPO =================
-  // Nenhuma mensagem de grupo/canal/transmissao pode chegar na IA.
-  // Nem log de "IA iniciando", nem transcricao de audio, nada.
-  const jidRef = String(chatId || from || to || '');
-  const isGroupMsg = !!messageData.isGroup ||
-    !!(chat && chat.isGroup) ||
-    jidRef.includes('@g.us') ||
-    jidRef.includes('@newsletter') ||
-    jidRef.includes('@broadcast');
-  if (isGroupMsg) {
-    console.log(`[GRUPO] mensagem de grupo nao processada (zap ${zapId}) - IA bloqueada`);
-    return;
-  }
-
-  // Bot desligado pelo painel: recebe a mensagem (e mostra no terminal), mas
-  // nao chama a IA nem envia resposta.
-  if (!serverMode && isServerPaused()) {
-    sendLog(zapId, 'info', 'Servidor desligado pelo painel - IA ignorada.');
-    return;
-  }
-
-  if (fromMe) {
-    // So mensagens do AUTOCHAT (enviadas para o proprio numero) chegam aqui.
-    // As respostas da IA sao bloqueadas no whatsapp-manager (anti-loop).
-    if (!messageData.selfChat) {
-      sendLog(zapId, 'info', 'Ignorada: mensagem enviada por mim para outro contato.');
-      return;
-    }
-    sendLog(zapId, 'ai', `Autochat: IA iniciando para o proprio numero (${(to || from || '').split('@')[0]}): "${body}"`);
-  } else {
-    sendLog(zapId, 'ai', `IA iniciando para ${contactName}: "${body}"`);
-  }
-
-  const zapsData = loadZapsData();
-  const providersData = loadProvidersData();
-  const trainingsAll = loadTrainingsData();
-  const zapTrainings = trainingsAll[String(zapId)] || [];
-  const zap = zapsData.find(z => String(z.id) === String(zapId));
-
-  if (!zap) {
-    sendLog(zapId, 'error', 'Zap nao encontrado no arquivo.');
-    return;
-  }
-  if (zap.enabled === false) {
-    sendLog(zapId, 'warning', 'Zap desativado. Ignorando mensagem.');
-    return;
-  }
-  // ================= PLANO DE PAGAMENTO =================
-  const billing = checkBillingActive(String(zapId));
-  if (!billing.active && billing.reason !== 'own_use' && billing.reason !== 'no_plan') {
-    sendLog(zapId, 'warning', 'Zap suspenso por atraso de pagamento (mes ' + billing.todayKey + '). Mensagem ignorada.');
-    return;
-  }
-  if (zap.autoReply === false) {
-    sendLog(zapId, 'warning', 'Auto-reply desativado para este Zap');
-    return;
-  }
-
-  // Horario de atendimento: fora da janela a mensagem nem chega na IA e nada
-  // e enviado ao cliente (a conversa tambem nao e registrada).
-  if (zap.workHours && zap.workHours.enabled === true && !isWithinWorkHours(zap.workHours)) {
-    sendLog(zapId, 'info', `Fora do horario de atendimento (${zap.workHours.start}-${zap.workHours.end}) - mensagem ignorada, nao enviada a IA.`);
-    return;
-  }
-  // blockedContacts stores contact.id which may be @s.whatsapp.net or @c.us - normalize to number part
-  if (zap.blockedContacts && zap.blockedContacts.length) {
-    const fromNumber = (from || '').split('@')[0];
-    const isBlocked = zap.blockedContacts.some(b => {
-      if (!b) return false;
-      if (b.includes('@')) return b === from || b.split('@')[0] === fromNumber;
-      return b === fromNumber || b === from;
-    });
-    if (isBlocked) {
-      sendLog(zapId, 'warning', `Contato ${contactName} nao autorizado para IA. Ignorando.`);
-      return;
-    }
-  }
-
-  const enabledTrainings = zapTrainings.filter(t => t && t.enabled !== false);
-  sendLog(zapId, 'info', `Config: modelo=${zap.model || 'auto'}, personalidade=${zap.personality || 'padrao'}, treinos=${enabledTrainings.length}`);
-
-  let convResult = null;
-  if (conversationStore) {
-    try {
-      convResult = conversationStore.ensure(zapId, chatId, Date.now());
-      if (convResult.created) {
-        sendLog(zapId, 'info', `Nova conversa iniciada com ${contactName} (historico anterior: ${conversationStore.countFor(zapId, chatId) - 1} conversa(s))`);
-      }
-    } catch (e) {
-      sendLog(zapId, 'warning', `Memoria indisponivel: ${e.message}`);
-      convResult = null;
-    }
-  }
-  // ---- Memoria de conversas (ultimos 3 dias) ----
-  let memoryText = '';
-  try {
-    if (conversationStore) {
-      memoryText = conversationStore.memoryText(zapId, chatId, { days: MEMORY_DAYS, maxChars: MEMORY_MAX_CHARS });
-    }
-  } catch (e) {
-    sendLog(zapId, 'warning', `Memoria indisponivel: ${e.message}`);
-  }
-  if (memoryText) {
-    try {
-      const mdir = path.join(getDataDir(), 'memorias', String(zapId));
-      fs.mkdirSync(mdir, { recursive: true });
-      const safeChat = String(chatId).replace(/[^A-Za-z0-9@._-]/g, '_');
-      const mfile = path.join(mdir, `${safeChat}.txt`);
-      fs.writeFileSync(mfile, memoryFileText(contactName, zapId, chatId, memoryText));
-      sendLog(zapId, 'info', `Memoria de conversas anexada (${memoryText.split('\n').length} linha(s)) -> ${path.relative(getDataDir(), mfile)}`);
-    } catch (e) {
-      sendLog(zapId, 'warning', `Nao foi possivel gravar o arquivo de memoria: ${e.message}`);
-    }
-  }
-
-  const conversationInfo = Object.assign(
-    convResult ? {
-      label: new Date(convResult.conversation.startedAt).toTimeString().substring(0, 5),
-      count: convResult.conversation.messages.length
-    } : {},
-    memoryText ? { memoryText } : {}
-  );
-
-  let finalBody = body;
-
-  // Audio detectado mas download falhou (mesmo apos retries): em vez de
-  // ignorar em silencio, responde pedindo para mandar como texto
-  // (se tinha legenda, segue com a legenda mesmo)
-  const bodyIsAudioPlaceholder = !body || body.trim() === '' || body === '[AUDIO]';
-  if (audioFailed && (!audio || !audio.data) && bodyIsAudioPlaceholder) {
-    sendLog(zapId, 'warning', `Audio de ${contactName} nao pôde ser baixado. Pedindo para enviar como texto.`);
-    await sendErrorToWhatsApp(zapId, chatId, 'Nao consegui baixar seu audio, pode mandar como texto?');
-    sendLog(zapId, 'outgoing', 'Mensagem de audio nao baixado respondida.');
-    return;
-  }
-
-  if (audio && (body === '[AUDIO]' || !body || body.trim() === '')) {
-    sendLog(zapId, 'info', `Audio recebido de ${contactName}. Transcrevendo...`);
-    try {
-      finalBody = await transcribeAudio(audio, providersData, zapId, zap.apiKeySelections);
-      if (!finalBody || !finalBody.trim() || finalBody.trim().length < 2) {
-        sendLog(zapId, 'warning', 'Transcricao vazia ou invalida. Pedindo para repetir.');
-        await whatsappManager.sendMessage(String(zapId), chatId, 'Nao consegui entender seu audio, pode repetir?', { source: 'ai' });
-        sendLog(zapId, 'outgoing', 'Mensagem de audio nao compreendido enviada.');
-        return;
-      }
-      // Heuristic invalid transcription check
-      if (finalBody.length < 3 || /^\W+$/.test(finalBody)) {
-        sendLog(zapId, 'warning', `Transcricao parece invalida: "${finalBody}". Pedindo para repetir.`);
-        await whatsappManager.sendMessage(String(zapId), chatId, 'Nao entendi seu audio, pode mandar de novo?', { source: 'ai' });
-        sendLog(zapId, 'outgoing', 'Mensagem de audio invalida respondida.');
-        return;
-      }
-      sendLog(zapId, 'success', `Audio transcrito: "${finalBody.substring(0, 100)}"`);
-    } catch (e) {
-      sendLog(zapId, 'error', `Erro na transcricao: ${e.message}`);
-      await sendErrorToWhatsApp(zapId, chatId, 'Tive um problema para entender seu audio. Pode enviar como texto?');
-      return;
-    }
-  }
-
-  // Build modelsToTry
-  let modelsToTry = [];
-  if (aiResponder && typeof aiResponder.getModelsToTry === 'function') {
-    modelsToTry = aiResponder.getModelsToTry(zap, providersData);
-  } else {
-    // Fallback: build from providersData
-    if (zap.model === 'auto' || !zap.model) {
-      sendLog(zapId, 'info', 'Modo automatico: tentar todos os modelos disponiveis');
-      for (const p of providersData) {
-        const resolved = resolveProviderKey(p);
-        if (!resolved.apiKey) continue;
-        for (const m of (p.models || [])) {
-          modelsToTry.push({ provider: resolved, model: m });
-        }
-      }
-    } else {
-      // Single model
-      outer: for (const p of providersData) {
-        for (const m of (p.models || [])) {
-          if (m.id === zap.model) {
-            const resolved = resolveProviderKey(p);
-            modelsToTry.push({ provider: resolved, model: m });
-            break outer;
-          }
-        }
-      }
-    }
-  }
-
-  if (!modelsToTry || modelsToTry.length === 0) {
-    sendLog(zapId, 'error', 'Nenhum modelo disponivel em nenhum provedor');
-    await sendErrorToWhatsApp(zapId, chatId, 'No momento estou sem conexao com a IA. Tente novamente em instantes.');
-    return;
-  }
-  sendLog(zapId, 'info', `${modelsToTry.length} modelo(s) disponivel(is) para tentar`);
-
-  // ---- 1) SORTEIO DO TEMPO ANTES DE COMECAR A RESPONDER (2s, 3s ou 5s) ----
-  // Simula uma pessoa lendo a mensagem / pensando na resposta. Nesse periodo
-  // NADA aparece para o contato (sem "digitando").
-  if (zap.instantReply) {
-    sendLog(zapId, 'info', 'Resposta instantanea ativada - sorteio de tempo ignorado.');
-  } else {
-    const delayOptions = [2000, 3000, 5000];
-    const preDelay = delayOptions[Math.floor(Math.random() * delayOptions.length)];
-    sendLog(zapId, 'info', `Sorteio de tempo de resposta: ${(preDelay / 1000)}s antes de comecar a digitar...`);
-    await new Promise(resolve => setTimeout(resolve, preDelay));
-  }
-
-  // ---- 2) INDICADOR "DIGITANDO" LIGA AQUI ----
-  const typingStart = Date.now();
-  await sendTypingIndicator(zapId, chatId);
-  sendLog(zapId, 'info', 'Indicador "digitando" ativado - IA gerando a resposta...');
-
-  let response = null;
-  let lastError = null;
-
-  // Try each model - delegate to aiResponder.generateResponse which has internal fallback,
-  // but we also loop here for per-model logging and to support both signatures.
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const entry = modelsToTry[i];
-    const hasKey = !!(entry.provider && entry.provider.apiKey);
-    sendLog(zapId, 'ai', `[${i + 1}/${modelsToTry.length}] Tentando ${entry.provider.name} / ${entry.model.id} (chave: ${hasKey ? 'ok' : 'AUSENTE'})...`);
-
-    const zapConfig = {
-      aiName: zap.aiName || '',
-      personality: zap.personality || 'padrao',
-      area: zap.area || '',
-      customPrompt: zap.customPrompt || '',
-      provider: resolveProviderKey(entry.provider),
-      model: entry.model,
-      trainings: enabledTrainings,
-      conversationInfo
-    };
-
-    try {
-      // ai-responder signature is (messageData, zapConfig, allProviders) with internal fallback.
-      // We pass finalBody by overriding messageData.body
-      const msgForAI = { ...messageData, body: finalBody };
-      // Try new signature first (with allProviders for fallback), fallback to old
-      let r = null;
-      if (aiResponder.generateResponse.length >= 3) {
-        r = await aiResponder.generateResponse(msgForAI, zapConfig, providersData);
-      } else {
-        r = await aiResponder.generateResponse(msgForAI, zapConfig, providersData);
-      }
-      const isJunk = !!(aiResponder && typeof aiResponder.isJunkResponse === 'function' && aiResponder.isJunkResponse(r));
-      if (r && r.trim().length > 0 && !isJunk) {
-        response = r;
-        sendLog(zapId, 'success', `Resposta obtida com ${entry.provider.name} / ${entry.model.id}`);
-        break;
-      } else if (r && r.trim().length > 0) {
-        // Artefato interno da IA (ex: "Check Constreainsts:*** Max") - NUNCA vai ao cliente
-        sendLog(zapId, 'warning', `${entry.provider.name} / ${entry.model.id} retornou texto invalido - descartado: "${r.trim().substring(0, 80)}"`);
-        lastError = 'Resposta invalida do modelo (texto de sistema)';
-      } else {
-        sendLog(zapId, 'warning', `${entry.provider.name} / ${entry.model.id} retornou vazio`);
-        lastError = 'Resposta vazia';
-      }
-    } catch (e) {
-      lastError = e.message;
-      sendLog(zapId, 'error', `${entry.provider.name} / ${entry.model.id} falhou: ${e.message}`);
-    }
-  }
-
-  if (!response) {
-    sendLog(zapId, 'error', `Todos os modelos falharam. Ultimo erro: ${lastError}`);
-    await clearTypingIndicator(zapId, chatId);
-    await sendErrorToWhatsApp(zapId, chatId, 'Desculpe, tive um problema tecnico. Pode repetir sua mensagem?');
-    return;
-  }
-
-  // Resolve imagem/link da resposta: marcadores da IA + fallback por intencao
-  const media = resolveReplyMedia(response, finalBody, enabledTrainings, (type, msg) => sendLog(zapId, type, msg));
-  const resolvedImages = media.images;
-  const resolvedLinks = media.links;
-
-  // ---- 3) MENSAGENS MULTIPLAS ----
-  // A IA separa com [QUEBRA] (ou, se nao marcou e o texto e grande, separamos
-  // por frases). Curto = 1 mensagem. No maximo 4 baloes.
-  const rawParts = (aiResponder && typeof aiResponder.splitMessages === 'function')
-    ? aiResponder.splitMessages(media.text)
-    : (String(media.text || '').trim() ? [String(media.text || '').trim()] : []);
-
-  // ---- 3.1) VERIFICADOR FINAL ----
-  // Ultimo portao antes do envio: nada de codigo, JSON, markdown, marcador
-  // vazado, texto de sistema, meta ou ingles. Reprova balao por balao.
-  const parts = [];
-  for (const p of rawParts) {
-    const v = verifyMessage(p, { incoming: finalBody });
-    if (v.ok) parts.push(p);
-    else sendLog(zapId, 'warning', `Mensagem reprovada pelo verificador (${v.reason}) - NAO enviada: "${p.substring(0, 80)}"`);
-  }
-  if (rawParts.length > 0 && parts.length === 0) {
-    sendLog(zapId, 'error', 'Todas as mensagens foram reprovadas pelo verificador - enviando aviso padrao.');
-    await clearTypingIndicator(zapId, chatId);
-    await sendErrorToWhatsApp(zapId, chatId, 'Desculpe, tive um problema tecnico. Pode repetir sua mensagem?');
-    return;
-  }
-
-  if (aiResponder && typeof aiResponder.updateLastAssistant === 'function') {
-    const delivered = parts.length ? parts.join(' ') : (String(media.text || '').trim() || '(mensagem sem texto)');
-    try { aiResponder.updateLastAssistant(zapId, chatId, delivered); } catch (_) {}
-  }
-
-  if (parts.length > 1) {
-    sendLog(zapId, 'info', `Resposta separada em ${parts.length} mensagens (maximo 4).`);
-  }
-
-  if (parts.length === 0) {
-    // Sobe imagem/link sem texto: garante que o "digitando" nao fica preso
-    await clearTypingIndicator(zapId, chatId);
-  }
-
-  // ---- 3.3) CITACAO EVENTUAL ----
-  // As vezes (nem sempre), numa resposta com varias mensagens, UMA delas sai
-  // como "responder citando" a mensagem do cliente - mostra qual mensagem
-  // esta sendo respondida sem escrever isso no texto.
-  let quoteIndex = -1;
-  if (parts.length > 1 && messageData.id && Math.random() < QUOTE_CHANCE) {
-    quoteIndex = Math.floor(Math.random() * parts.length);
-    sendLog(zapId, 'info', `Resposta tera 1 mensagem citando a mensagem do cliente (balão ${quoteIndex + 1}/${parts.length}).`);
-  }
-
-  // ---- 4) ENTREGA: DIGITACAO REALISTA ENTRE CADA MENSAGEM ----
-  for (let i = 0; i < parts.length; i++) {
-    const text = parts[i];
-
-    // 1a mensagem: o indicador ja esta ligado desde a geracao da IA (typingStart).
-    // Demais mensagens: religa agora - a pausa entre baloes e o tempo digitando.
-    const partTypingStart = i === 0 ? typingStart : Date.now();
-    if (i > 0) await sendTypingIndicator(zapId, chatId);
-
-    await waitRealisticTyping(zapId, chatId, partTypingStart, text);
-    // Nao espera o indicador de digitacao sumir antes de enviar: isso somava
-    // ~1s de atraso por mensagem. Dispara em paralelo e segue para o envio.
-    clearTypingIndicator(zapId, chatId).catch(() => {});
-
-    // Portao final NO EXATO MOMENTO DO ENVIO: se o dono do numero ja respondeu
-    // depois da mensagem do cliente (inclusive durante o sorteio/digitacao),
-    // a IA NAO manda por cima. So vale para a PRIMEIRA parte: depois de comecar
-    // a responder, e melhor terminar do que deixar o cliente com meia resposta.
-    let ownerReplied = false;
-    if (i === 0 && whatsappManager && typeof whatsappManager.hasOwnerReplied === 'function') {
-      try {
-        ownerReplied = await whatsappManager.hasOwnerReplied(String(zapId), chatId, triggerTs, { live: true });
-      } catch (e) {
-        // Fail-closed: em erro, nao arrisca falar por cima do dono.
-        console.warn('[OWNER] falha ao checar resposta do dono:', e && e.message ? e.message : e);
-        ownerReplied = true;
-      }
-    }
-    if (ownerReplied) {
-      sendLog(zapId, 'info', 'Dono do numero ja respondeu esta conversa - IA nao vai responder por cima.');
-      return;
-    }
-
-    const preview = text.substring(0, 80);
-    const label = parts.length > 1 ? `[${i + 1}/${parts.length}] ` : '';
-    const citLabel = i === quoteIndex ? ' (citando a mensagem do cliente)' : '';
-    sendLog(zapId, 'outgoing', `Enviando ${label}${citLabel}: "${preview}..."`);
-    try {
-      const _sendT0 = Date.now();
-      if (i === quoteIndex && typeof whatsappManager.replyMessage === 'function') {
-        await whatsappManager.replyMessage(String(zapId), chatId, text, messageData.id);
-      } else {
-        await whatsappManager.sendMessage(String(zapId), chatId, text, { source: 'ai' });
-      }
-      const _sendSecs = ((Date.now() - _sendT0) / 1000).toFixed(1);
-      sendLog(zapId, 'success', parts.length > 1
-        ? `Mensagem ${i + 1}/${parts.length} enviada!${citLabel} (${_sendSecs}s)`
-        : `Mensagem enviada com sucesso!${citLabel} (${_sendSecs}s)`);
-    } catch (error) {
-      sendLog(zapId, 'error', `ERRO ao enviar: ${error.message}`);
-      throw error;
-    }
-  }
-
-  // Send training images resolved from [SEND_IMAGE:id] (or intent fallback)
-  const sentImageLabels = [];
-  for (const found of resolvedImages) {
-    const imgId = found.id;
-    const label = found.name || found.filename || imgId;
-    const rel = found.file || null;
-    if (!rel) {
-      if (found.data) {
-        try {
-          await whatsappManager.sendMedia(String(zapId), chatId, { data: found.data, mimeType: found.mimeType || 'image/jpeg', name: found.filename || `${imgId}.jpg` }, { source: 'ai' });
-          sendLog(zapId, 'success', `Imagem enviada: ${label}`);
-          sentImageLabels.push(label);
-        } catch (e) {
-          sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
-        }
-        continue;
-      }
-      sendLog(zapId, 'warning', `Arquivo da imagem ${imgId} nao encontrado no disco`);
-      continue;
-    }
-    const abs = resolveDataPath(rel);
-    if (!abs || !fs.existsSync(abs)) {
-      sendLog(zapId, 'warning', `Arquivo da imagem ${imgId} nao encontrado no disco`);
-      continue;
-    }
-    try {
-      const b64 = fs.readFileSync(abs).toString('base64');
-      await whatsappManager.sendMedia(String(zapId), chatId, { data: b64, mimeType: found.mimeType || 'image/jpeg', name: found.filename || path.basename(abs) }, { source: 'ai' });
-      sendLog(zapId, 'success', `Imagem enviada: ${label}`);
-      sentImageLabels.push(label);
-    } catch (e) {
-      sendLog(zapId, 'error', `Falha ao enviar imagem ${imgId}: ${e.message}`);
-    }
-  }
-
-  if (resolvedLinks.length > 0) {
-    sendLog(zapId, 'success', `Link(s) enviado(s): ${resolvedLinks.map(l => l.name || l.description || l.url).join(', ')}`);
-  }
-
-  const sentNotes = [];
-  if (sentImageLabels.length) sentNotes.push(`imagem: ${sentImageLabels.join(', ')}`);
-  if (resolvedLinks.length) sentNotes.push(`link: ${resolvedLinks.map(l => l.name || l.description || l.url).join(', ')}`);
-  if (sentNotes.length && conversationStore) {
-    try {
-      conversationStore.append(zapId, chatId, 'assistant', `[enviou ${sentNotes.join(' | ')}]`);
-    } catch (e) {
-      console.error('[CONV] falha ao registrar midia no historico:', e.message);
-    }
-  }
-
-  if (parts.length === 0 && resolvedImages.length === 0 && resolvedLinks.length === 0) {
-    sendLog(zapId, 'warning', 'Resposta vazia apos remocao de marcadores de imagem');
-  }
+  return getMessagePipeline().processMessage(messageData);
 }
 
 // ------------------------------------------------------------
@@ -2111,10 +1559,13 @@ function initAutoMessage() {
       try { return whatsappManager.getContactName(String(zapId), String(phone)); } catch (_) { return ''; }
     },
     onLog: (entry) => {
+      coreEvents.emit('auto-msg-log', entry);
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('auto-msg-log', entry);
     },
     onUpdate: () => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('auto-msg-update', autoMessage.getState());
+      const state = autoMessage.getState();
+      coreEvents.emit('auto-msg-update', state);
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('auto-msg-update', state);
     },
     logger: console.log
   });
@@ -2162,13 +1613,37 @@ if (!isPackaged) {
     app.commandLine.appendSwitch('disable-dev-shm-usage');
   } catch (_) {}
 }
-app.whenReady().then(() => {
+const ready = app.whenReady().then(() => {
   if (!isPackaged) {
     app.setPath('userData', path.join(__dirname, 'data'));
   }
   ensureDataDir();
   loadTerminalFromDisk();
+
+  // Aplica a configuracao de servidor remoto salva ANTES de criar a janela:
+  // o preload le LINK_API_URL no proprio processo do renderer.
+  try {
+    const savedRemote = loadRemoteConfig();
+    if (savedRemote && !String(process.env.LINK_API_URL || '').trim()) {
+      process.env.LINK_API_URL = savedRemote.url;
+      process.env.LINK_API_PREFIX = savedRemote.apiPrefix;
+    }
+  } catch (_) {}
+
   if (!isHeadless()) createWindow();
+
+  // Modo cliente remoto: toda a logica roda no backend. O Setup apenas
+  // renderiza a UI e envia comandos via HTTP/WS (preload/api-client).
+  if (isRemoteClientMode()) {
+    try {
+      appendServerTerminalEntry({
+        level: 'success',
+        source: 'PAINEL',
+        msg: `Modo cliente: conectado ao servidor ${String(process.env.LINK_API_URL || '').trim()}. O WhatsApp roda na VPS.`
+      });
+    } catch (_) {}
+    return;
+  }
 
   // Modo servidor: o app local e apenas o painel. As configuracoes vao para
   // o clone do repo de dados e o servidor 24h as aplica (nao conectamos o
@@ -2213,6 +1688,15 @@ app.whenReady().then(() => {
   });
 
   whatsappManager = new WhatsAppManager(mainWindow);
+  // Todo evento do gerenciador (status, QR, mensagens) tambem vai para o
+  // barramento do nucleo, que alimenta o WebSocket do backend.
+  if (typeof whatsappManager.sendToRenderer === 'function') {
+    const originalSend = whatsappManager.sendToRenderer.bind(whatsappManager);
+    whatsappManager.sendToRenderer = (channel, data) => {
+      try { coreEvents.emit(channel, data); } catch (_) {}
+      return originalSend(channel, data);
+    };
+  }
   aiResponder = new AIResponder();
   initConversationStore();
   
@@ -2363,22 +1847,23 @@ ipcMain.on('window-drag-move', (e, dx, dy) => {
 // ------------------------------------------------------------
 // IPC - WhatsApp
 // ------------------------------------------------------------
-ipcMain.handle('whatsapp-connect', (e, zapId, phone, method) => {
-  if (serverMode || serverModeRequested) return { status: 'readonly', error: 'zap gerenciado pelo servidor - nao conecte pelo PC' };
+handle('whatsapp-connect', (e, zapId, phone, method) => {
+  // No backend headless o proprio processo e o servidor 24h: ele PODE conectar.
+  if (!isHeadless() && (serverMode || serverModeRequested)) return { status: 'readonly', error: 'zap gerenciado pelo servidor - nao conecte pelo PC' };
   return whatsappManager.connectZap(String(zapId), phone, method);
 });
-ipcMain.handle('whatsapp-disconnect', (e, zapId) => {
-  if (serverMode || serverModeRequested) return { ok: false, error: 'zap gerenciado pelo servidor' };
+handle('whatsapp-disconnect', (e, zapId) => {
+  if (!isHeadless() && (serverMode || serverModeRequested)) return { ok: false, error: 'zap gerenciado pelo servidor' };
   return whatsappManager.disconnectZap(String(zapId));
 });
-ipcMain.handle('whatsapp-status', (e, zapId) => {
+handle('whatsapp-status', (e, zapId) => {
   if (serverMode && serverSync) {
     const s = serverSync.getZapStatus(String(zapId));
     if (s) return s;
   }
   return whatsappManager.getStatus(String(zapId));
 });
-ipcMain.handle('pick-zap-icon', async () => {
+handle('pick-zap-icon', async () => {
   try {
     const res = await dialog.showOpenDialog(mainWindow, {
       title: 'Escolher icone do Zap',
@@ -2401,7 +1886,7 @@ ipcMain.handle('pick-zap-icon', async () => {
     return { ok: false, error: e.message };
   }
 });
-ipcMain.handle('whatsapp-send', async (e, zapId, phone, text, chatId) => {
+handle('whatsapp-send', async (e, zapId, phone, text, chatId) => {
   const target = chatId || phone;
   const r = await whatsappManager.sendMessage(String(zapId), target, text, { source: 'owner' });
   // Marca resposta do dono pelo chatId real e pelo numero (a IA cancela a resposta)
@@ -2409,9 +1894,9 @@ ipcMain.handle('whatsapp-send', async (e, zapId, phone, text, chatId) => {
   if (chatId && phone && chatId !== phone) whatsappManager.markOwnerReply(String(zapId), phone);
   return r;
 });
-ipcMain.handle('whatsapp-conversations', (e, zapId) => whatsappManager.getConversations(String(zapId)));
-ipcMain.handle('whatsapp-messages', (e, zapId, chatId) => whatsappManager.getMessages(String(zapId), chatId));
-ipcMain.handle('whatsapp-chat-history', async (e, zapId, chatId, limit) => {
+handle('whatsapp-conversations', (e, zapId) => whatsappManager.getConversations(String(zapId)));
+handle('whatsapp-messages', (e, zapId, chatId) => whatsappManager.getMessages(String(zapId), chatId));
+handle('whatsapp-chat-history', async (e, zapId, chatId, limit) => {
   try {
     return await whatsappManager.fetchChatHistory(String(zapId), chatId, limit);
   } catch (err) {
@@ -2422,8 +1907,11 @@ ipcMain.handle('whatsapp-chat-history', async (e, zapId, chatId, limit) => {
 ipcMain.on('whatsapp-set-active-chat', (e, zapId, chatId) => {
   try { whatsappManager.setActiveChat(zapId, chatId); } catch (_) { /* ignora */ }
 });
+handle('whatsapp-set-active-chat', (e, zapId, chatId) => {
+  try { whatsappManager.setActiveChat(zapId, chatId); return { ok: true }; } catch (err) { return { ok: false, error: err.message }; }
+});
 // Midia de uma mensagem do historico (audio para tocar, imagem/figurinha para exibir)
-ipcMain.handle('whatsapp-chat-media', async (e, zapId, chatId, msgId, hint) => {
+handle('whatsapp-chat-media', async (e, zapId, chatId, msgId, hint) => {
   try {
     return await whatsappManager.fetchMessageMedia(String(zapId), chatId, msgId, hint || {});
   } catch (err) {
@@ -2431,7 +1919,7 @@ ipcMain.handle('whatsapp-chat-media', async (e, zapId, chatId, msgId, hint) => {
     return { success: false, error: err.message };
   }
 });
-ipcMain.handle('whatsapp-send-media', async (e, zapId, phone, media) => {
+handle('whatsapp-send-media', async (e, zapId, phone, media) => {
   const r = await whatsappManager.sendMedia(String(zapId), phone, media || {});
   whatsappManager.markOwnerReply(String(zapId), phone);
   return r;
@@ -2440,14 +1928,14 @@ ipcMain.handle('whatsapp-send-media', async (e, zapId, phone, media) => {
 // ------------------------------------------------------------
 // IPC - Mensagem Automatica
 // ------------------------------------------------------------
-ipcMain.handle('auto-msg-state', () => (autoMessage ? autoMessage.getState() : null));
-ipcMain.handle('auto-msg-chat', (e, payload) => autoMsgChat(payload));
-ipcMain.handle('auto-msg-stop', () => {
+handle('auto-msg-state', () => (autoMessage ? autoMessage.getState() : null));
+handle('auto-msg-chat', (e, payload) => autoMsgChat(payload));
+handle('auto-msg-stop', () => {
   if (autoMessage) autoMessage.stop();
   return autoMessage ? autoMessage.getState() : null;
 });
 // Linha de sistema no historico (ex: resposta recebida de um contato)
-ipcMain.handle('auto-msg-note', (e, payload) => {
+handle('auto-msg-note', (e, payload) => {
   payload = payload || {};
   if (autoMessage && payload.text && payload.zapId) {
     autoMessage.pushSystem(String(payload.text).substring(0, 300), String(payload.zapId));
@@ -2456,7 +1944,7 @@ ipcMain.handle('auto-msg-note', (e, payload) => {
   }
   return autoMessage ? autoMessage.getState() : null;
 });
-ipcMain.handle('auto-msg-transcribe', async (e, audio, zapId) => {
+handle('auto-msg-transcribe', async (e, audio, zapId) => {
   const providersData = loadProvidersData();
   const zid = String(zapId || '');
   const zap = loadZapsData().find(z => String(z.id) === zid);
@@ -2466,7 +1954,7 @@ ipcMain.handle('auto-msg-transcribe', async (e, audio, zapId) => {
 // ------------------------------------------------------------
 // IPC - Agente IA do Dashboard (controla o app)
 // ------------------------------------------------------------
-ipcMain.handle('agent-chat', async (e, payload) => {
+handle('agent-chat', async (e, payload) => {
   if (!appAgent) return { reply: 'Agente ainda nao inicializado. Reinicie o app.', steps: [] };
   try {
     return await appAgent.run(payload || {});
@@ -2483,8 +1971,8 @@ ipcMain.handle('agent-chat', async (e, payload) => {
 // ------------------------------------------------------------
 // IPC - Data persistence
 // ------------------------------------------------------------
-ipcMain.handle('billing-check', (e, zapId) => checkBillingActive(String(zapId)));
-ipcMain.handle('billing-save', (e, zapId, data) => {
+handle('billing-check', (e, zapId) => checkBillingActive(String(zapId)));
+handle('billing-save', (e, zapId, data) => {
   try {
     const zaps = loadZapsData();
     const z = zaps.find(z => String(z.id) === String(zapId));
@@ -2494,7 +1982,7 @@ ipcMain.handle('billing-save', (e, zapId, data) => {
   } catch (err) { return { ok: false, error: err.message }; }
 });
 
-ipcMain.handle('load-zaps', () => {
+handle('load-zaps', () => {
   if (!fs.existsSync(getFilePath('zaps.json'))) return null;
   const data = loadZapsData();
   if (isConfigUnsafe('zaps.json')) {
@@ -2503,7 +1991,7 @@ ipcMain.handle('load-zaps', () => {
   }
   return data;
 });
-ipcMain.handle('save-zaps', (e, data, opts) => {
+handle('save-zaps', (e, data, opts) => {
   const problem = validateZapsPayload(data);
   if (problem) {
     console.error(`save-zaps recusado: ${problem}`);
@@ -2553,8 +2041,8 @@ ipcMain.handle('save-zaps', (e, data, opts) => {
   if (serverSync) serverSync.scheduleSync();
   return true;
 });
-ipcMain.handle('load-providers', () => loadProvidersData());
-ipcMain.handle('save-providers', (e, data) => {
+handle('load-providers', () => loadProvidersData());
+handle('save-providers', (e, data) => {
   if (!Array.isArray(data)) {
     console.error('save-providers recusado: payload nao e uma lista');
     return false;
@@ -2579,8 +2067,8 @@ ipcMain.handle('save-providers', (e, data) => {
   if (serverSync) serverSync.scheduleSync();
   return true;
 });
-ipcMain.handle('load-trainings', () => loadTrainingsData());
-ipcMain.handle('save-trainings', (e, data, deletedFiles) => {
+handle('load-trainings', () => loadTrainingsData());
+handle('save-trainings', (e, data, deletedFiles) => {
   ensureDataDir();
   // Handle image files: data contains trainings with images that have `data` (base64) for new images
   // Write files to disk and replace `data` with `file` relative path
@@ -2635,7 +2123,7 @@ ipcMain.handle('save-trainings', (e, data, deletedFiles) => {
   if (serverSync) serverSync.scheduleSync();
   return true;
 });
-ipcMain.handle('delete-trainings-for-zap', (e, zapId) => {
+handle('delete-trainings-for-zap', (e, zapId) => {
   const zid = String(zapId);
   const all = loadTrainingsData();
   const list = all[zid] || [];
@@ -2693,9 +2181,86 @@ function serverConfigPublic() {
   };
 }
 
-ipcMain.handle('server-config-get', () => serverConfigPublic());
+handle('server-config-get', () => serverConfigPublic());
 
-ipcMain.handle('server-config-pick', async () => {
+// ------------------------------------------------------------
+// Conexao do Setup com o backend na VPS (modo cliente remoto)
+// ------------------------------------------------------------
+function normalizeRemoteUrl(raw) {
+  const value = String(raw || '').trim().replace(/\/+$/, '');
+  if (!value) throw new Error('informe o endereco do servidor');
+  let parsed;
+  try { parsed = new URL(value); } catch (_) { throw new Error('endereco invalido'); }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('use http:// ou https://');
+  }
+  return value;
+}
+
+async function probeRemoteServer(url) {
+  const base = normalizeRemoteUrl(url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(base + '/health', { signal: controller.signal });
+    const health = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(`o servidor respondeu ${res.status}`);
+    if (!health || health.ok !== true) throw new Error('resposta inesperada do servidor');
+    return { ok: true, health, url: base };
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw new Error('tempo esgotado ao testar o servidor');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+handle('remote-config-get', () => {
+  const cfg = loadRemoteConfig();
+  return {
+    mode: isRemoteClientMode() ? 'remote' : 'local',
+    enabled: isRemoteClientMode(),
+    url: cfg ? cfg.url : String(process.env.LINK_API_URL || '').trim(),
+    apiPrefix: cfg ? cfg.apiPrefix : String(process.env.LINK_API_PREFIX || '/api/v1'),
+    savedAt: cfg ? cfg.savedAt : null
+  };
+});
+handle('remote-config-test', async (e, url) => {
+  try {
+    const result = await probeRemoteServer(url);
+    return { ok: true, url: result.url, health: result.health };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+handle('remote-config-save', (e, data) => {
+  try {
+    const url = normalizeRemoteUrl(data && data.url);
+    const cfg = {
+      enabled: true,
+      url,
+      apiPrefix: String((data && data.apiPrefix) || '/api/v1'),
+      savedAt: new Date().toISOString()
+    };
+    saveJsonAtomic(getFilePath('remote-server.json'), cfg);
+    return { ok: true, ...cfg, requiresRestart: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+handle('remote-config-disable', () => {
+  try {
+    saveJsonAtomic(getFilePath('remote-server.json'), {
+      enabled: false,
+      disabledAt: new Date().toISOString()
+    });
+    return { ok: true, requiresRestart: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+handle('server-config-pick', async () => {
   try {
     const res = await dialog.showOpenDialog(mainWindow, {
       title: 'Escolha a pasta do repositorio de dados do servidor',
@@ -2722,7 +2287,7 @@ ipcMain.handle('server-config-pick', async () => {
   }
 });
 
-ipcMain.handle('server-config-clone', async (e, payload) => {
+handle('server-config-clone', async (e, payload) => {
   payload = payload || {};
   const repoUrl = String(payload.repoUrl || '').trim();
   const token = String(payload.token || '').trim();
@@ -2760,7 +2325,7 @@ ipcMain.handle('server-config-clone', async (e, payload) => {
   }
 });
 
-ipcMain.handle('server-config-disable', () => {
+handle('server-config-disable', () => {
   const cfg = loadServerRepoConfig() || {};
   saveServerRepoConfig(Object.assign({}, cfg, {
     enabled: false,
@@ -2769,7 +2334,7 @@ ipcMain.handle('server-config-disable', () => {
   return { ok: true };
 });
 
-ipcMain.handle('server-relaunch', () => {
+handle('server-relaunch', () => {
   try {
     app.relaunch();
     app.exit(0);
@@ -2779,7 +2344,7 @@ ipcMain.handle('server-relaunch', () => {
   }
 });
 
-ipcMain.handle('server-terminal-export', async () => {
+handle('server-terminal-export', async () => {
   try {
     const res = await dialog.showSaveDialog(mainWindow, {
       title: 'Salvar log do servidor',
@@ -2798,14 +2363,14 @@ ipcMain.handle('server-terminal-export', async () => {
   }
 });
 
-ipcMain.handle('server-info', () => ({
+handle('server-info', () => ({
   enabled: serverMode,
   dataDir: serverSync ? serverSync.dataDir : null,
   status: serverSync ? serverSync.getStatus() : { enabled: false, state: 'disabled' }
 }));
-ipcMain.handle('server-sync-now', () => (serverSync ? serverSync.syncNow() : { ok: false, disabled: true, error: 'sincronizacao desativada' }));
-ipcMain.handle('server-sync-status', () => (serverSync ? serverSync.getStatus() : { enabled: false, state: 'disabled' }));
-ipcMain.handle('server-delete-zap-session', (e, zapId) => {
+handle('server-sync-now', () => (serverSync ? serverSync.syncNow() : { ok: false, disabled: true, error: 'sincronizacao desativada' }));
+handle('server-sync-status', () => (serverSync ? serverSync.getStatus() : { enabled: false, state: 'disabled' }));
+handle('server-delete-zap-session', (e, zapId) => {
   const id = String(zapId);
   // Sempre apaga a sessao local, mesmo sem server-sync (modo local)
   for (const suffix of ['', '.cache-keep']) {
@@ -2816,7 +2381,7 @@ ipcMain.handle('server-delete-zap-session', (e, zapId) => {
   if (serverSync) return serverSync.deleteZapSession(id);
   return { ok: true, localOnly: true };
 });
-ipcMain.handle('server-status', () => {
+handle('server-status', () => {
   const base = serverSync ? serverSync.getBotStatus() : null;
   const errors = [];
   try {
@@ -2828,10 +2393,10 @@ ipcMain.handle('server-status', () => {
   } catch (_) {}
   return { ...(base || {}), errors, updatedAt: Date.now() };
 });
-ipcMain.handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
+handle('server-pairing-codes', () => (serverSync ? serverSync.getPairingCodes() : {}));
 
 // Codigo de pareamento atual do servidor para a tela de conexao do painel.
-ipcMain.handle('server-current-qr', async (e, zapId) => {
+handle('server-current-qr', async (e, zapId) => {
   if (!serverMode || !serverSync) return { ok: false, error: 'modo servidor inativo' };
   const id = String(zapId || '');
   const st = serverSync.getZapStatus(id) || {};
@@ -2852,7 +2417,7 @@ ipcMain.handle('server-current-qr', async (e, zapId) => {
 // Pede ao servidor 24h que pareie um zap por codigo. Grava o pedido no repo
 // de dados (connect-requests.json); o container le, limpa a sessao antiga e
 // publica o codigo em pairing-codes.json.
-ipcMain.handle('server-connect-zap', async (e, zapId, phone) => {
+handle('server-connect-zap', async (e, zapId, phone) => {
   const id = String(zapId || '');
   const cleanPhone = String(phone || '').replace(/\D/g, '');
   if (!id) return { ok: false, error: 'zap invalido' };
@@ -3080,6 +2645,7 @@ async function setServerRunning(running) {
         });
       }
       // Notifica todas as janelas para atualizar o painel imediatamente
+      coreEvents.emit('server-power-updated', { running: want, paused: isServerPaused() });
       const { BrowserWindow } = require('electron');
       BrowserWindow.getAllWindows().forEach(w => {
         if (!w.isDestroyed()) w.webContents.send('server-power-updated', { running: want, paused: isServerPaused() });
@@ -3291,10 +2857,10 @@ async function runServerCommand(text) {
   return { ok: true };
 }
 
-ipcMain.handle('server-overview', () => getServerOverview());
-ipcMain.handle('server-power', (e, running) => setServerRunning(!!running));
+handle('server-overview', () => getServerOverview());
+handle('server-power', (e, running) => setServerRunning(!!running));
 
-ipcMain.handle('zap-block-all-existing', (e, zapRef) => {
+handle('zap-block-all-existing', (e, zapRef) => {
   try {
     const AppAgent = require('./src/js/app-agent');
     const agent = new AppAgent({
@@ -3308,21 +2874,66 @@ ipcMain.handle('zap-block-all-existing', (e, zapRef) => {
     return { ok: false, error: err.message };
   }
 });
-ipcMain.handle('server-terminal-logs', () => {
+handle('server-terminal-logs', () => {
   loadTerminalFromDisk();
   return terminalLog.slice(-TERMINAL_MAX_LINES);
 });
-ipcMain.handle('server-terminal-clear', () => {
+handle('server-terminal-clear', () => {
   clearServerTerminal();
   return { ok: true };
 });
-ipcMain.handle('server-command', (e, text) => runServerCommand(text));
+handle('server-command', (e, text) => runServerCommand(text));
+
+// Fachada para o backend: acesso ao estado vivo + superficie de comandos.
+function getRuntime() {
+  return {
+    ready,
+    paths: corePaths,
+    events: coreEvents,
+    typing: typingService,
+    invoke: invokeCommand,
+    hasCommand,
+    listCommands,
+    getWhatsapp: () => whatsappManager,
+    getAiResponder: () => aiResponder,
+    getConversationStore: () => conversationStore,
+    getAutoMessage: () => autoMessage,
+    getAppAgent: () => appAgent,
+    loadZapsData,
+    loadProvidersData,
+    loadTrainingsData,
+    buildStatusState,
+    getLogRing,
+    getBillingForZap,
+    checkBillingActive,
+    setServerRunning,
+    getServerOverview,
+    isServerPaused,
+    persistBotStatus,
+    runServerCommand,
+    encryptProviderKey,
+    decryptProviderKey,
+    decryptAllProvidersKeys,
+    encryptAllProvidersKeys,
+    serverConfigPublic,
+    loadServerRepoConfig,
+    saveServerRepoConfig,
+    isHeadless,
+    isRemoteClientMode
+  };
+}
 
 module.exports = {
+  ready,
+  getRuntime,
+  invokeCommand,
+  hasCommand,
+  listCommands,
   getDataDir,
   getFilePath,
   ensureDataDir,
   isHeadless,
+  isRemoteClientMode,
   buildStatusState,
   startStatusServer,
   getStatusServer,

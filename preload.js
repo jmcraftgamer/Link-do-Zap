@@ -1,10 +1,45 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('electronAPI', {
-  // Chaves de IA removidas do preload (exfiltração via XSS).
-  // Toda chamada de IA passa pelo processo principal; chaves vêm de providers.json / safeStorage.
-  // compat: manutenção — leia apenas providers.json no renderer.
+// ---------------------------------------------------------------------------
+// Modo local (padrao): tudo por IPC, o bot roda neste PC.
+// Modo cliente remoto (LINK_API_URL definido): dados/WhatsApp/IA vao para a VPS
+// via HTTP + WebSocket; controles da janela continuam locais.
+// ---------------------------------------------------------------------------
+const API_URL = String(process.env.LINK_API_URL || '').trim();
+const API_PREFIX = String(process.env.LINK_API_PREFIX || '/api/v1');
 
+function safeStorageKey(url) {
+  return `link.api.token:${String(url || '').replace(/\/+$/, '')}`;
+}
+
+function createTokenStore(url) {
+  let memory = '';
+  const key = safeStorageKey(url);
+  return {
+    get() {
+      try { return localStorage.getItem(key) || memory || ''; } catch (_) { return memory; }
+    },
+    set(value) {
+      memory = String(value || '');
+      try {
+        if (memory) localStorage.setItem(key, memory);
+        else localStorage.removeItem(key);
+      } catch (_) { /* memoria serve para a sessao */ }
+    }
+  };
+}
+
+let remote = null;
+if (API_URL) {
+  const { createRemoteApi } = require('./src/js/api-client');
+  remote = createRemoteApi({
+    baseUrl: API_URL,
+    apiPrefix: API_PREFIX,
+    tokenStore: createTokenStore(API_URL)
+  });
+}
+
+const localWindowApi = {
   // Window controls
   minimize: () => ipcRenderer.send('window-minimize'),
   maximize: () => ipcRenderer.send('window-maximize'),
@@ -16,6 +51,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   nativeAlert: (msg) => ipcRenderer.sendSync('app-alert', msg),
   nativeConfirm: (msg) => ipcRenderer.sendSync('app-confirm', msg),
 
+  // Conexao com o backend na VPS (sempre via processo principal)
+  remoteConfigGet: () => ipcRenderer.invoke('remote-config-get'),
+  remoteConfigTest: (url) => ipcRenderer.invoke('remote-config-test', url),
+  remoteConfigSave: (data) => ipcRenderer.invoke('remote-config-save', data),
+  remoteConfigDisable: () => ipcRenderer.invoke('remote-config-disable')
+};
+
+const localDataApi = {
   // WhatsApp
   whatsappConnect: (zapId, phoneNumber, method) => ipcRenderer.invoke('whatsapp-connect', zapId, phoneNumber, method),
   whatsappDisconnect: (zapId) => ipcRenderer.invoke('whatsapp-disconnect', zapId),
@@ -90,4 +133,36 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadTrainings: () => ipcRenderer.invoke('load-trainings'),
   saveTrainings: (data, deletedFiles) => ipcRenderer.invoke('save-trainings', data, deletedFiles || []),
   deleteTrainingsForZap: (zapId) => ipcRenderer.invoke('delete-trainings-for-zap', zapId)
-});
+};
+
+function buildRemoteApi(api) {
+  // Remove os objetos internos (nao serializaveis pelo contextBridge).
+  const { _http, _events, ...safe } = api;
+  return {
+    ...localWindowApi,
+    ...safe,
+    isRemoteMode: true,
+    remoteAuth: {
+      isRemoteMode: true,
+      getServerUrl: () => safe.getServerUrl(),
+      setServerUrl: (url) => safe.setServerUrl(url),
+      hasToken: () => safe.hasToken(),
+      login: (password) => safe.login(password),
+      logout: () => safe.logout(),
+      health: () => safe.health(),
+      me: () => safe.me(),
+      connectEvents: () => safe.connectEvents()
+    }
+  };
+}
+
+const exposed = remote
+  ? buildRemoteApi(remote)
+  : {
+    ...localWindowApi,
+    ...localDataApi,
+    isRemoteMode: false,
+    remoteAuth: null
+  };
+
+contextBridge.exposeInMainWorld('electronAPI', exposed);

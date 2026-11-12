@@ -6922,6 +6922,92 @@ async function cloneServerRepo() {
   }
 }
 
+// ------------------------------------------------------------
+// Conexao do Setup com o backend na VPS (modo cliente remoto)
+// ------------------------------------------------------------
+function setRemoteConnectStatus(text, kind) {
+  const hint = document.getElementById('remoteConnectHint');
+  if (!hint) return;
+  hint.textContent = text || '';
+  hint.style.color = kind === 'error' ? '#b3261e' : (kind === 'success' ? '#1a7f37' : '');
+}
+
+async function refreshRemoteConnectCard() {
+  if (!window.electronAPI || !window.electronAPI.remoteConfigGet) return;
+  const card = document.getElementById('remoteConnectCard');
+  const input = document.getElementById('remoteServerUrl');
+  const off = document.getElementById('remoteConnectOff');
+  let cfg = null;
+  try { cfg = await window.electronAPI.remoteConfigGet(); } catch (_) { cfg = null; }
+  if (!cfg) return;
+  if (input && cfg.url) input.value = cfg.url;
+  if (card) card.classList.toggle('is-connected', !!cfg.enabled);
+  if (off) off.style.display = cfg.enabled ? '' : 'none';
+  if (cfg.enabled) {
+    setRemoteConnectStatus(`Conectado ao servidor ${cfg.url}. O bot roda na VPS; este PC e apenas o painel.`, 'success');
+  } else {
+    setRemoteConnectStatus('Conecte este Setup ao backend 24h que roda na VPS. O bot continua no ar mesmo com o PC desligado.');
+  }
+}
+
+async function testRemoteConnection() {
+  const input = document.getElementById('remoteServerUrl');
+  const btn = document.getElementById('remoteConnectTest');
+  if (!window.electronAPI || !window.electronAPI.remoteConfigTest || !input) return;
+  const url = input.value.trim();
+  if (!url) { setRemoteConnectStatus('Informe o endereco do servidor.', 'error'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Testando...'; }
+  setRemoteConnectStatus('Testando conexao...');
+  try {
+    const r = await window.electronAPI.remoteConfigTest(url);
+    if (r && r.ok) {
+      const up = r.health && r.health.uptime != null ? ` (no ar ha ${Math.floor(r.health.uptime / 60)} min)` : '';
+      setRemoteConnectStatus(`Servidor respondeu${up}. Pode salvar para conectar.`, 'success');
+    } else {
+      setRemoteConnectStatus((r && r.error) || 'Nao foi possivel falar com o servidor.', 'error');
+    }
+  } catch (e) {
+    setRemoteConnectStatus('Erro ao testar: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Testar conexao'; }
+  }
+}
+
+async function saveRemoteConnection() {
+  const input = document.getElementById('remoteServerUrl');
+  const btn = document.getElementById('remoteConnectSave');
+  if (!window.electronAPI || !window.electronAPI.remoteConfigSave || !input) return;
+  const url = input.value.trim();
+  if (!url) { setRemoteConnectStatus('Informe o endereco do servidor.', 'error'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Salvando...'; }
+  try {
+    const r = await window.electronAPI.remoteConfigSave({ url });
+    if (r && r.ok) {
+      setRemoteConnectStatus('Configurado. Reiniciando no modo cliente...', 'success');
+      alert('Servidor configurado! O programa vai reiniciar e pedir a senha administrativa.');
+      await restartForServerConfig();
+      return;
+    }
+    setRemoteConnectStatus((r && r.error) || 'Nao foi possivel salvar.', 'error');
+  } catch (e) {
+    setRemoteConnectStatus('Erro ao salvar: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Salvar e reiniciar'; }
+  }
+}
+
+async function disableRemoteConnection() {
+  if (!window.electronAPI || !window.electronAPI.remoteConfigDisable) return;
+  if (!confirm('Voltar a rodar o bot neste PC? O programa vai reiniciar no modo local.')) return;
+  const r = await window.electronAPI.remoteConfigDisable();
+  if (r && r.ok) {
+    alert('Modo local restaurado. O programa vai reiniciar.');
+    await restartForServerConfig();
+    return;
+  }
+  setRemoteConnectStatus((r && r.error) || 'Nao foi possivel desativar.', 'error');
+}
+
 function initServerPage() {
   if (!window.electronAPI || !window.electronAPI.serverOverview) return;
 
@@ -6974,8 +7060,21 @@ function initServerPage() {
       if (!window.electronAPI || !window.electronAPI.serverTerminalExport) return;
       try {
         const r = await window.electronAPI.serverTerminalExport();
-        if (r && r.ok) downloadBtn.textContent = 'Salvo!';
-        else if (r && !r.canceled) alert(r.error || 'Nao foi possivel salvar o log.');
+        // No modo local r e {ok, path}, no modo remoto r e a lista de linhas
+        if (Array.isArray(r)) {
+          const blob = new Blob([r.map(e => `[${e.time || ''}][${e.source || ''}] ${e.msg || ''}`).join('\n')], { type: 'text/plain' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `terminal-log-${new Date().toISOString().slice(0, 10)}.txt`;
+          a.click();
+          URL.revokeObjectURL(url);
+          downloadBtn.textContent = 'Baixado!';
+        } else if (r && r.ok) {
+          downloadBtn.textContent = 'Salvo!';
+        } else if (r && !r.canceled) {
+          alert(r.error || 'Nao foi possivel salvar o log.');
+        }
       } catch (e) {
         alert('Erro ao salvar o log: ' + e.message);
       }
@@ -6999,6 +7098,14 @@ function initServerPage() {
   if (cloneCancel && clonePanel) cloneCancel.addEventListener('click', () => { clonePanel.style.display = 'none'; });
 
   refreshServerConnectCard();
+  refreshRemoteConnectCard();
+
+  const remoteTest = document.getElementById('remoteConnectTest');
+  if (remoteTest) remoteTest.addEventListener('click', testRemoteConnection);
+  const remoteSave = document.getElementById('remoteConnectSave');
+  if (remoteSave) remoteSave.addEventListener('click', saveRemoteConnection);
+  const remoteOff = document.getElementById('remoteConnectOff');
+  if (remoteOff) remoteOff.addEventListener('click', disableRemoteConnection);
 
   const form = document.getElementById('serverTerminalForm');
   if (form) {
@@ -7048,7 +7155,9 @@ function initServerPage() {
 // ============================================
 // Start App
 // ============================================
-document.addEventListener('DOMContentLoaded', () => {
+// O app.js pode ser carregado dinamicamente (modo remoto, apos o login).
+// Por isso o boot considera o DOMContentLoaded ja ter passado.
+function startApp() {
   try { init(); } catch (e) { console.error('Erro no init:', e); }
   try { initWhatsApp(); } catch (e) { console.error('Erro no initWhatsApp:', e); }
   try { initServerPage(); } catch (e) { console.error('Erro em initServerPage:', e); }
@@ -7059,4 +7168,10 @@ document.addEventListener('DOMContentLoaded', () => {
       refreshServerOverview();
     });
   }
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', startApp);
+} else {
+  startApp();
+}
