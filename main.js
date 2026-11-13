@@ -350,7 +350,16 @@ function loadRemoteConfig() {
   return null;
 }
 
+// O processo do backend (VPS) NUNCA pode virar cliente de si mesmo: se um
+// remote-server.json for copiado junto com os dados, ele seria ignorado.
+function isServerRole() {
+  if (String(process.env.LINK_ROLE || '').toLowerCase() === 'server') return true;
+  if (isHeadless()) return true;
+  return false;
+}
+
 function isRemoteClientMode() {
+  if (isServerRole()) return false;
   if (String(process.env.LINK_API_URL || '').trim()) return true;
   return !!loadRemoteConfig();
 }
@@ -1624,7 +1633,7 @@ const ready = app.whenReady().then(() => {
   // o preload le LINK_API_URL no proprio processo do renderer.
   try {
     const savedRemote = loadRemoteConfig();
-    if (savedRemote && !String(process.env.LINK_API_URL || '').trim()) {
+    if (savedRemote && !isServerRole() && !String(process.env.LINK_API_URL || '').trim()) {
       process.env.LINK_API_URL = savedRemote.url;
       process.env.LINK_API_PREFIX = savedRemote.apiPrefix;
     }
@@ -2235,6 +2244,9 @@ handle('remote-config-test', async (e, url) => {
 });
 handle('remote-config-save', (e, data) => {
   try {
+    if (isServerRole()) {
+      return { ok: false, error: 'Este processo e o servidor: ele nao pode virar cliente de outro servidor.' };
+    }
     const url = normalizeRemoteUrl(data && data.url);
     const cfg = {
       enabled: true,

@@ -4,6 +4,8 @@
 // ferramenta desconhecida, get_stats, block_contact, mencao @ e erro
 // de provedor sem chave.
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
@@ -269,6 +271,35 @@ async function run() {
     assert.ok(contents.includes('crie um zap'), 'historico user ausente');
     assert.ok(contents.includes('zap criado'), 'historico assistant ausente');
     assert.ok(contents.includes('e agora?'), 'mensagem atual ausente');
+  });
+
+  // M) block_all_existing le memorias/conversas do LINK_DATA_DIR do backend
+  testAsync('agente: block_all_existing usa LINK_DATA_DIR (VPS)', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zap-agent-'));
+    const zapId = String(zaps.find((z) => z.name === 'Teste').id);
+    fs.mkdirSync(path.join(tmp, 'memorias', zapId), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'memorias', zapId, 'contato.txt'), 'Falar com 5511966665555');
+    fs.writeFileSync(path.join(tmp, 'conversations.json'), JSON.stringify([
+      { zapId, contact: { id: '5511944443333@c.us' } }
+    ]));
+
+    const previous = process.env.LINK_DATA_DIR;
+    process.env.LINK_DATA_DIR = tmp;
+    try {
+      fetchQueue = [
+        googleOk('{"tool":"block_all_existing","args":{"zap":"Teste"}}'),
+        googleOk('Pronto, todos bloqueados.')
+      ];
+      const res = await agent.run({ message: 'Bloqueia todos os contatos existentes' });
+      assert.strictEqual(res.steps[0].ok, true);
+      const blocked = zaps.find((z) => z.name === 'Teste').blockedContacts;
+      assert.ok(blocked.includes('5511966665555'), 'numero da memoria nao foi bloqueado: ' + blocked);
+      assert.ok(blocked.includes('11944443333'), 'numero das conversas nao foi bloqueado: ' + blocked);
+    } finally {
+      if (previous === undefined) delete process.env.LINK_DATA_DIR;
+      else process.env.LINK_DATA_DIR = previous;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   for (const p of pending) {

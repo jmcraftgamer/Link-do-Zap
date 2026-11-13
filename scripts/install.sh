@@ -29,7 +29,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 
 BASE_PKGS=(
-  curl ca-certificates gnupg git unzip xvfb
+  curl ca-certificates gnupg git unzip xvfb ffmpeg
   libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2
   libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
   libgbm1 libpangocairo-1.0-0 libpango-1.0-0 libcairo2
@@ -50,6 +50,32 @@ ok "Node $(node -v) / npm $(npm -v)"
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
   info "Criando usuario do servico: $APP_USER"
   useradd --system --create-home --shell /usr/sbin/nologin "$APP_USER"
+fi
+
+# Fuso horario: vencimento, carencia e campanhas dependem da data local.
+if [[ "${SKIP_TIMEZONE:-0}" != "1" ]] && command -v timedatectl >/dev/null 2>&1; then
+  info "Ajustando fuso horario para America/Sao_Paulo"
+  timedatectl set-timezone America/Sao_Paulo || true
+fi
+
+# Swap: Electron + varias paginas do WhatsApp podem estourar 8 GB de RAM.
+if [[ "${SKIP_SWAP:-0}" != "1" ]]; then
+  if ! swapon --show 2>/dev/null | grep -q .; then
+    info "Criando swap de ${SWAP_SIZE:-4G}"
+    if fallocate -l "${SWAP_SIZE:-4G}" /swapfile 2>/dev/null; then
+      chmod 600 /swapfile
+      mkswap /swapfile >/dev/null
+      swapon /swapfile
+      grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
+      sysctl -p >/dev/null 2>&1 || true
+      ok "swap ativo"
+    else
+      echo "aviso: nao foi possivel criar swap (seguindo sem swap)"
+    fi
+  else
+    ok "swap ja existe"
+  fi
 fi
 
 if [[ ! -d "$APP_DIR/.git" && ! -f "$APP_DIR/package.json" ]]; then
@@ -76,22 +102,33 @@ fi
 if [[ ! -f "$APP_DIR/.env" ]]; then
   info "Criando .env com senha administrativa aleatoria"
   PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)"
+  JWT_SECRET="$(openssl rand -hex 32)"
   cat > "$APP_DIR/.env" <<EOF
 DATA_DIR=$APP_DIR/data
 HOST=127.0.0.1
 PORT=$PORT
 API_PREFIX=/api/v1
 ADMIN_PASSWORD=$PASSWORD
+JWT_SECRET=$JWT_SECRET
 TOKEN_TTL_SECONDS=604800
 CORS_ORIGINS=*
 MAX_BODY_MB=30
 LINK_SERVER_SYNC=0
 HEADLESS=1
+TZ=America/Sao_Paulo
+# Pareamento automatico: gera o codigo no painel e salva em data/pairing-codes.json
+LINK_AUTO_PAIR=1
 EOF
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
 else
   ok ".env existente preservado"
+  # Atualiza instalacoes antigas sem sobrescrever o que o usuario ja ajustou.
+  grep -q '^JWT_SECRET=' "$APP_DIR/.env" || echo "JWT_SECRET=$(openssl rand -hex 32)" >> "$APP_DIR/.env"
+  grep -q '^TZ=' "$APP_DIR/.env" || echo 'TZ=America/Sao_Paulo' >> "$APP_DIR/.env"
+  grep -q '^LINK_AUTO_PAIR=' "$APP_DIR/.env" || echo 'LINK_AUTO_PAIR=1' >> "$APP_DIR/.env"
+  chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
+  chmod 600 "$APP_DIR/.env"
 fi
 
 if [[ "$SKIP_NGINX" == "1" ]]; then

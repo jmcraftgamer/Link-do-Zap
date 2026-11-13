@@ -55,7 +55,11 @@ const localWindowApi = {
   remoteConfigGet: () => ipcRenderer.invoke('remote-config-get'),
   remoteConfigTest: (url) => ipcRenderer.invoke('remote-config-test', url),
   remoteConfigSave: (data) => ipcRenderer.invoke('remote-config-save', data),
-  remoteConfigDisable: () => ipcRenderer.invoke('remote-config-disable')
+  remoteConfigDisable: () => ipcRenderer.invoke('remote-config-disable'),
+
+  // Dialogos locais: o arquivo e escolhido no PC do usuario (funciona nos dois modos)
+  pickZapIcon: () => ipcRenderer.invoke('pick-zap-icon'),
+  serverRelaunch: () => ipcRenderer.invoke('server-relaunch')
 };
 
 const localDataApi = {
@@ -70,7 +74,6 @@ const localDataApi = {
   whatsappChatHistory: (zapId, chatId, limit) => ipcRenderer.invoke('whatsapp-chat-history', zapId, chatId, limit),
   whatsappChatMedia: (zapId, chatId, msgId, hint) => ipcRenderer.invoke('whatsapp-chat-media', zapId, chatId, msgId, hint),
   whatsappSetActiveChat: (zapId, chatId) => ipcRenderer.send('whatsapp-set-active-chat', zapId, chatId),
-  pickZapIcon: () => ipcRenderer.invoke('pick-zap-icon'),
 
   // Sincronizacao com o servidor 24h (painel)
   serverInfo: () => ipcRenderer.invoke('server-info'),
@@ -87,7 +90,6 @@ const localDataApi = {
   serverConfigPick: () => ipcRenderer.invoke('server-config-pick'),
   serverConfigClone: (repoUrl, token) => ipcRenderer.invoke('server-config-clone', { repoUrl, token }),
   serverConfigDisable: () => ipcRenderer.invoke('server-config-disable'),
-  serverRelaunch: () => ipcRenderer.invoke('server-relaunch'),
 
   // Painel de gerenciamento do servidor (status, power e terminal)
   serverOverview: () => ipcRenderer.invoke('server-overview'),
@@ -137,7 +139,9 @@ const localDataApi = {
 
 function buildRemoteApi(api) {
   // Remove os objetos internos (nao serializaveis pelo contextBridge).
-  const { _http, _events, ...safe } = api;
+  // `pickZapIcon` e `serverRelaunch` ficam com a versao LOCAL (IPC): o dialogo
+  // de arquivo e o restart acontecem no PC do usuario, nao na VPS.
+  const { _http, _events, pickZapIcon, serverRelaunch, ...safe } = api;
   return {
     ...localWindowApi,
     ...safe,

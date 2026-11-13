@@ -5,6 +5,10 @@
 process.env.HEADLESS = process.env.HEADLESS || '1';
 process.env.LINK_SERVER_SYNC = process.env.LINK_SERVER_SYNC || '0';
 process.env.LINK_CONNECT_READONLY = '0';
+// Este processo E o servidor: nunca deve agir como cliente remoto, mesmo que
+// um data/remote-server.json tenha sido copiado junto com os dados.
+process.env.LINK_ROLE = 'server';
+process.env.LINK_API_URL = '';
 
 const { app } = require('electron');
 const { loadConfig } = require('./src/config');

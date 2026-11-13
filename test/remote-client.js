@@ -9,7 +9,7 @@
 //     WebSocket e timers falsos, sem rede).
 const assert = require('assert');
 const http = require('http');
-const { createRemoteApi, createHttpClient, createEventSocket, trimSlash } =
+const { createRemoteApi, createHttpClient, createEventSocket, trimSlash, TIMEOUTS } =
   require('../src/js/api-client');
 
 const pending = [];
@@ -34,10 +34,18 @@ function createTokenStore(initial = '') {
 
 function createFakeHttp() {
   const calls = [];
+  const callOptions = [];
   const httpStub = {
     calls,
-    request(method, path, body) {
+    callOptions,
+    request(method, path, body, opts) {
       calls.push({ method, path, body });
+      callOptions.push({ method, path, opts });
+      if (method === 'GET' && path === '/api/v1/me' && httpStub.meFails) {
+        const err = new Error('nao autorizado');
+        err.status = 401;
+        return Promise.reject(err);
+      }
       if (method === 'POST' && path === '/api/v1/auth/login') {
         if (!body || body.password !== 'senha') {
           const err = new Error('senha invalida');
@@ -76,11 +84,11 @@ function createFakeHttp() {
       return Promise.resolve({ ok: true });
     }
   };
-  httpStub.get = (p) => httpStub.request('GET', p);
-  httpStub.post = (p, b) => httpStub.request('POST', p, b === undefined ? {} : b);
-  httpStub.put = (p, b) => httpStub.request('PUT', p, b === undefined ? {} : b);
-  httpStub.patch = (p, b) => httpStub.request('PATCH', p, b === undefined ? {} : b);
-  httpStub.del = (p) => httpStub.request('DELETE', p);
+  httpStub.get = (p, o) => httpStub.request('GET', p, undefined, o);
+  httpStub.post = (p, b, o) => httpStub.request('POST', p, b === undefined ? {} : b, o);
+  httpStub.put = (p, b, o) => httpStub.request('PUT', p, b === undefined ? {} : b, o);
+  httpStub.patch = (p, b, o) => httpStub.request('PATCH', p, b === undefined ? {} : b, o);
+  httpStub.del = (p, o) => httpStub.request('DELETE', p, undefined, o);
   return httpStub;
 }
 
@@ -219,6 +227,36 @@ async function main() {
     assert.deepStrictEqual(lastCall(httpStub), { method: 'GET', path: '/api/v1/me', body: undefined });
     await remote.health();
     assert.deepStrictEqual(lastCall(httpStub), { method: 'GET', path: '/health', body: undefined });
+  });
+
+  testAsync('cliente remoto: timeouts por tipo de operacao', async () => {
+    const { remote, httpStub } = makeRemote(createTokenStore('tok-1'));
+
+    assert.strictEqual(TIMEOUTS.defaultMs, 120000);
+    assert.strictEqual(TIMEOUTS.heavyMs, 180000);
+    assert.strictEqual(TIMEOUTS.healthMs, 8000);
+
+    await remote.health();
+    assert.strictEqual(httpStub.callOptions.at(-1).opts.timeoutMs, TIMEOUTS.healthMs);
+
+    await remote.agentChat({ action: 'status' });
+    assert.strictEqual(httpStub.callOptions.at(-1).opts.timeoutMs, TIMEOUTS.heavyMs);
+
+    await remote.autoMsgChat({ zapId: 'z1', message: 'oi' });
+    assert.strictEqual(httpStub.callOptions.at(-1).opts.timeoutMs, TIMEOUTS.heavyMs);
+
+    await remote.autoMsgTranscribe('base64', 'z1');
+    assert.strictEqual(httpStub.callOptions.at(-1).opts.timeoutMs, TIMEOUTS.heavyMs);
+
+    await remote.whatsappSend('z1', '5511@c.us', 'oi');
+    assert.strictEqual(httpStub.callOptions.at(-1).opts.timeoutMs, TIMEOUTS.heavyMs);
+
+    await remote.whatsappSendMedia('z1', '5511@c.us', { data: 'x' });
+    assert.strictEqual(httpStub.callOptions.at(-1).opts.timeoutMs, TIMEOUTS.heavyMs);
+
+    // Operacoes comuns usam o timeout padrao do httpClient (120s).
+    await remote.loadZaps();
+    assert.strictEqual(httpStub.callOptions.at(-1).opts, undefined);
   });
 
   testAsync('cliente remoto: zaps com id codificado na rota', async () => {
@@ -414,7 +452,8 @@ async function main() {
       ['onServerPowerUpdated', 'server-power-updated'],
       ['onAutoMsgLog', 'auto-msg-log'],
       ['onAutoMsgUpdate', 'auto-msg-update'],
-      ['onConnectionChange', 'connection']
+      ['onConnectionChange', 'connection'],
+      ['onAuthExpired', 'auth-expired']
     ];
     assert.strictEqual(typeof remote.connectEvents, 'function');
     for (const [method, channel] of channels) {
@@ -441,6 +480,10 @@ async function main() {
         headers: req.headers,
         body: raw ? JSON.parse(raw) : null
       };
+      if (req.url === '/api/v1/auth/login' && received.body && received.body.password === 'errada') {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'senha invalida' }));
+      }
       if (req.url === '/api/v1/me' && req.headers.authorization !== 'Bearer tok-ok') {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: 'token invalido' }));
@@ -499,8 +542,35 @@ async function main() {
     assert.strictEqual(unauthorized, 1);
   });
 
-  testAsync('http client: erro HTTP traz status e corpo', async () => {
-    const client = createHttpClient({ getBaseUrl: () => baseUrl, getToken: () => '' });
+  testAsync('cliente remoto: 401 em /me limpa token e emite auth-expired', async () => {
+    const tokenStore = createTokenStore('tok-errado');
+    const events = createFakeEvents();
+    const remote = createRemoteApi({
+      baseUrl, apiPrefix: '/api/v1', tokenStore, eventSocket: events
+    });
+    let expired = 0;
+    remote.onAuthExpired(() => { expired++; });
+    await assert.rejects(() => remote.me(), (err) => {
+      assert.strictEqual(err.status, 401);
+      return true;
+    });
+    assert.strictEqual(tokenStore.peek(), '', 'token invalido deveria ser apagado');
+    assert.strictEqual(expired, 1, 'gate deveria ser avisado uma vez');
+  });
+
+  testAsync('cliente remoto: senha errada nao emite auth-expired', async () => {
+    const tokenStore = createTokenStore('');
+    const events = createFakeEvents();
+    const remote = createRemoteApi({
+      baseUrl, apiPrefix: '/api/v1', tokenStore, eventSocket: events
+    });
+    let expired = 0;
+    remote.onAuthExpired(() => { expired++; });
+    await assert.rejects(() => remote.login('errada'), /senha invalida/);
+    assert.strictEqual(expired, 0, '401 do login e senha errada, nao sessao expirada');
+  });
+
+  testAsync('http client: erro HTTP traz status e corpo', async () => {    const client = createHttpClient({ getBaseUrl: () => baseUrl, getToken: () => '' });
     await assert.rejects(() => client.get('/api/v1/falha'), (err) => {
       assert.strictEqual(err.status, 422);
       assert.strictEqual(err.message, 'dados invalidos');

@@ -14,7 +14,17 @@ if [[ -z "$FILE" || ! -f "$FILE" ]]; then
 fi
 
 echo "Parando o servico..."
-systemctl stop assistente-zap || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl stop assistente-zap || true
+  for _ in $(seq 1 15); do
+    systemctl is-active --quiet assistente-zap || break
+    sleep 1
+  done
+  sleep 2
+fi
+
+# Garante que o servico volte mesmo se a extracao falhar.
+trap 'command -v systemctl >/dev/null 2>&1 && systemctl start assistente-zap || true' EXIT
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 if [[ -d "$DATA_DIR" ]]; then
@@ -28,7 +38,9 @@ tar -xzf "$FILE" -C "$(dirname "$DATA_DIR")"
 chown -R "$APP_USER:$APP_USER" "$DATA_DIR"
 
 echo "Iniciando o servico..."
-systemctl start assistente-zap
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl start assistente-zap
+fi
 
 PORT="$(grep -E '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"
 PORT="${PORT:-3000}"

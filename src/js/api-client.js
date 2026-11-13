@@ -13,11 +13,16 @@ function encodePath(value) {
   return encodeURIComponent(String(value == null ? '' : value));
 }
 
+// Operacoes de IA/audio podem demorar bem mais que uma chamada comum.
+const DEFAULT_TIMEOUT_MS = 120000;
+const HEAVY_TIMEOUT_MS = 180000;
+const HEALTH_TIMEOUT_MS = 8000;
+
 function createHttpClient(options) {
   const getToken = options.getToken || (() => '');
   const onUnauthorized = options.onUnauthorized || (() => {});
 
-  function request(method, path, body) {
+  function request(method, path, body, requestOptions) {
     const base = trimSlash(options.getBaseUrl());
     if (!base) return Promise.reject(new Error('servidor nao configurado'));
     const url = new URL(base + path);
@@ -30,7 +35,8 @@ function createHttpClient(options) {
       headers['Content-Length'] = Buffer.byteLength(payload);
     }
     const mod = url.protocol === 'https:' ? https : http;
-    const timeoutMs = Number(options.timeoutMs) || 30000;
+    const timeoutMs = Number(requestOptions && requestOptions.timeoutMs) ||
+      Number(options.timeoutMs) || DEFAULT_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
       const req = mod.request(
@@ -50,7 +56,7 @@ function createHttpClient(options) {
             if (text) {
               try { parsed = JSON.parse(text); } catch (_) { parsed = text; }
             }
-            if (res.statusCode === 401) onUnauthorized();
+            if (res.statusCode === 401 && !(requestOptions && requestOptions.skipAuthEvent)) onUnauthorized();
             if (res.statusCode >= 400) {
               const err = new Error((parsed && parsed.error) || `HTTP ${res.statusCode}`);
               err.status = res.statusCode;
@@ -71,11 +77,11 @@ function createHttpClient(options) {
   }
 
   return {
-    get: (p) => request('GET', p),
-    post: (p, b) => request('POST', p, b === undefined ? {} : b),
-    put: (p, b) => request('PUT', p, b === undefined ? {} : b),
-    patch: (p, b) => request('PATCH', p, b === undefined ? {} : b),
-    del: (p) => request('DELETE', p),
+    get: (p, o) => request('GET', p, undefined, o),
+    post: (p, b, o) => request('POST', p, b === undefined ? {} : b, o),
+    put: (p, b, o) => request('PUT', p, b === undefined ? {} : b, o),
+    patch: (p, b, o) => request('PATCH', p, b === undefined ? {} : b, o),
+    del: (p, o) => request('DELETE', p, undefined, o),
     request
   };
 }
@@ -170,7 +176,7 @@ function createEventSocket(options) {
   }
   function isOpen() { return !!ws && ws.readyState === 1; }
 
-  return { on, start, stop, send, isOpen, listeners };
+  return { on, start, stop, send, isOpen, listeners, emit };
 }
 
 function createRemoteApi(options) {
@@ -187,7 +193,13 @@ function createRemoteApi(options) {
   const httpClient = options.httpClient || createHttpClient({
     getBaseUrl: () => currentBase,
     getToken: () => tokenStore.get(),
-    onUnauthorized: () => tokenStore.set(''),
+    onUnauthorized: () => {
+      tokenStore.set('');
+      // O painel escuta este evento para voltar ao gate sem recarregar a pagina.
+      if (typeof events.emit === 'function') {
+        try { events.emit('auth-expired', {}); } catch (_) {}
+      }
+    },
     timeoutMs: options.timeoutMs
   });
 
@@ -217,7 +229,8 @@ function createRemoteApi(options) {
     },
     hasToken: () => !!tokenStore.get(),
     login: async (password) => {
-      const res = await httpClient.post(api('/auth/login'), { password });
+      // 401 no login significa senha errada, nao sessao expirada.
+      const res = await httpClient.post(api('/auth/login'), { password }, { skipAuthEvent: true });
       if (res && res.token) {
         tokenStore.set(res.token);
         events.stop();
@@ -229,8 +242,8 @@ function createRemoteApi(options) {
       tokenStore.set('');
       events.stop();
     },
-    me: () => httpClient.get(api('/me')),
-    health: () => httpClient.get('/health'),
+    me: () => httpClient.get(api('/me'), { timeoutMs: 20000 }),
+    health: () => httpClient.get('/health', { timeoutMs: HEALTH_TIMEOUT_MS }),
     connectEvents: () => events.start(),
 
     // ---------------------------------------------------------- WhatsApp
@@ -238,9 +251,11 @@ function createRemoteApi(options) {
     whatsappDisconnect: (zapId) => httpClient.post(api(`/zaps/${encodePath(zapId)}/disconnect`)),
     whatsappStatus: (zapId) => httpClient.get(api(`/zaps/${encodePath(zapId)}/status`)),
     whatsappSend: (zapId, phone, text, chatId) =>
-      httpClient.post(api(`/zaps/${encodePath(zapId)}/send`), { phone, chatId: chatId || phone, text }),
+      httpClient.post(api(`/zaps/${encodePath(zapId)}/send`), { phone, chatId: chatId || phone, text },
+        { timeoutMs: HEAVY_TIMEOUT_MS }),
     whatsappSendMedia: (zapId, phone, media) =>
-      httpClient.post(api(`/zaps/${encodePath(zapId)}/send-media`), { phone, media }),
+      httpClient.post(api(`/zaps/${encodePath(zapId)}/send-media`), { phone, media },
+        { timeoutMs: HEAVY_TIMEOUT_MS }),
     whatsappConversations: (zapId) => httpClient.get(api(`/zaps/${encodePath(zapId)}/conversations`)),
     whatsappMessages: (zapId, chatId) =>
       httpClient.get(api(`/zaps/${encodePath(zapId)}/conversations/${encodePath(chatId)}/messages`)),
@@ -283,13 +298,16 @@ function createRemoteApi(options) {
 
     // ---------------------------------------------------------- mensagem automatica
     autoMsgState: () => httpClient.get(api('/auto-message/state')),
-    autoMsgChat: (payload) => httpClient.post(api('/auto-message/chat'), payload || {}),
+    autoMsgChat: (payload) => httpClient.post(api('/auto-message/chat'), payload || {},
+      { timeoutMs: HEAVY_TIMEOUT_MS }),
     autoMsgStop: () => httpClient.post(api('/auto-message/stop')),
     autoMsgNote: (zapId, text) => httpClient.post(api('/auto-message/note'), { zapId, text }),
-    autoMsgTranscribe: (audio, zapId) => httpClient.post(api('/auto-message/transcribe'), { audio, zapId }),
+    autoMsgTranscribe: (audio, zapId) => httpClient.post(api('/auto-message/transcribe'), { audio, zapId },
+      { timeoutMs: HEAVY_TIMEOUT_MS }),
 
     // ---------------------------------------------------------- agente
-    agentChat: (payload) => httpClient.post(api('/agent/chat'), payload || {}),
+    agentChat: (payload) => httpClient.post(api('/agent/chat'), payload || {},
+      { timeoutMs: HEAVY_TIMEOUT_MS }),
 
     // ---------------------------------------------------------- dados
     loadZaps: () => httpClient.get(api('/zaps')),
@@ -317,6 +335,7 @@ function createRemoteApi(options) {
     onAutoMsgLog: (cb) => subscribe('auto-msg-log', cb),
     onAutoMsgUpdate: (cb) => subscribe('auto-msg-update', cb),
     onConnectionChange: (cb) => subscribe('connection', cb),
+    onAuthExpired: (cb) => subscribe('auth-expired', cb),
 
     // expostos para diagnostico
     _http: httpClient,
@@ -327,4 +346,10 @@ function createRemoteApi(options) {
   return remote;
 }
 
-module.exports = { createRemoteApi, createHttpClient, createEventSocket, trimSlash };
+const TIMEOUTS = {
+  defaultMs: DEFAULT_TIMEOUT_MS,
+  heavyMs: HEAVY_TIMEOUT_MS,
+  healthMs: HEALTH_TIMEOUT_MS
+};
+
+module.exports = { createRemoteApi, createHttpClient, createEventSocket, trimSlash, TIMEOUTS };

@@ -383,8 +383,14 @@ Regras:
         let added = 0;
         const fs = require('fs');
         const path = require('path');
-        const dataDir = (require('electron') && require('electron').app && require('electron').app.getPath) ? require('electron').app.getPath('userData') : (process.env.APPDATA || process.env.USERPROFILE || require('os').homedir());
-        const memoDir = path.join(dataDir, 'link-no-whatsapp', 'memorias', String(z.id));
+        // Mesma pasta de dados do backend (LINK_DATA_DIR na VPS) e do modo local.
+        const { createPaths } = require('../core/paths');
+        const dataDir = createPaths({
+          getApp: () => {
+            try { return require('electron').app; } catch (_) { return null; }
+          }
+        }).getDataDir();
+        const memoDir = path.join(dataDir, 'memorias', String(z.id));
         const blockedSet = new Set(z.blockedContacts.map(b => String(b).replace(/\D/g, '').replace(/^55/, '')));
         try {
           if (fs.existsSync(memoDir)) {
@@ -401,7 +407,7 @@ Regras:
           }
         } catch (_) {}
         try {
-          const convFile = path.join(dataDir, 'link-no-whatsapp', 'conversations.json');
+          const convFile = path.join(dataDir, 'conversations.json');
           if (fs.existsSync(convFile)) {
             const data = JSON.parse(fs.readFileSync(convFile, 'utf8'));
             if (Array.isArray(data)) {

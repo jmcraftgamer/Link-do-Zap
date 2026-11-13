@@ -6,6 +6,8 @@
   const api = window.electronAPI;
   const appScript = 'js/app.js';
   let started = false;
+  let appLoaded = false;
+  let pendingReload = false;
 
   function loadApp() {
     if (started) return;
@@ -64,6 +66,8 @@
   }
 
   function showGate(reason) {
+    const existing = document.getElementById('remoteGate');
+    if (existing) existing.remove();
     injectStyles();
     const gate = document.createElement('div');
     gate.id = 'remoteGate';
@@ -123,6 +127,12 @@
         setStatus('Conectado. Abrindo o painel...', 'success');
         api.remoteAuth.connectEvents();
         gate.remove();
+        if (pendingReload) {
+          // O painel ja estava carregado com dados de uma sessao expirada.
+          window.location.reload();
+          return;
+        }
+        appLoaded = true;
         loadApp();
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
@@ -143,13 +153,41 @@
     return;
   }
 
-  // Modo remoto: se ja existe token salvo, confia nele e abre o painel.
-  // Uma resposta 401 faz o cliente limpar o token; o proximo boot pede login.
-  if (api.remoteAuth && api.remoteAuth.hasToken()) {
-    try { api.remoteAuth.connectEvents(); } catch (_) {}
-    loadApp();
-    return;
+  // Sessao expirada no meio do uso: volta ao gate em vez de deixar o painel
+  // numa enxurrada de 401. O login seguinte recarrega a pagina para limpar o
+  // estado antigo do app.
+  if (typeof api.onAuthExpired === 'function') {
+    try {
+      api.onAuthExpired(() => {
+        if (document.getElementById('remoteGate')) return;
+        pendingReload = appLoaded;
+        showGate('Sua sessao expirou. Entre novamente.');
+      });
+    } catch (_) {}
   }
 
-  showGate();
+  (async () => {
+    // Modo remoto: valida o token salvo antes de abrir o painel. Assim uma
+    // VPS recriada ou um JWT_SECRET trocado nao gera um app quebrado.
+    if (api.remoteAuth && api.remoteAuth.hasToken()) {
+      try {
+        await api.remoteAuth.me();
+        try { api.remoteAuth.connectEvents(); } catch (_) {}
+        appLoaded = true;
+        loadApp();
+        return;
+      } catch (err) {
+        const status = err && err.status;
+        if (status === 401 || status === 403) {
+          api.remoteAuth.logout();
+          showGate('Sua sessao expirou. Entre novamente.');
+          return;
+        }
+        showGate('Nao foi possivel falar com o servidor. Confira o IP e se o servico esta no ar.');
+        return;
+      }
+    }
+
+    showGate();
+  })();
 })();

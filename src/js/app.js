@@ -393,6 +393,9 @@ let saveZapsQueued = false;
 async function saveZaps(opts) {
   try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
   if (!window.electronAPI || !window.electronAPI.saveZaps) return true;
+  // Lista vazia so pode ir para o disco quando a exclusao foi confirmada pelo
+  // usuario (allowEmpty). Boot/poll com cache velho nao pode "limpar" o arquivo.
+  if (!zapsData.length && !(opts && opts.allowEmpty)) return true;
   if (saveZapsInFlight) {
     // Ja existe uma gravacao em andamento: agenda outra com o estado mais novo.
     saveZapsQueued = true;
@@ -6832,6 +6835,7 @@ async function sendServerCommand() {
 }
 
 const SERVER_TERM_RENDER_MAX = 5000;
+let serverConnectMode = 'local';
 
 async function refreshServerConnectCard() {
   if (!window.electronAPI || !window.electronAPI.serverConfigGet) return;
@@ -6843,28 +6847,33 @@ async function refreshServerConnectCard() {
   let cfg = null;
   try { cfg = await window.electronAPI.serverConfigGet(); } catch (_) { cfg = null; }
   if (!cfg) return;
+  serverConnectMode = cfg.mode || 'local';
 
   if (cfg.mode === 'server') {
     if (title) title.textContent = 'Servidor 24h conectado';
     if (hint) hint.textContent = 'O bot roda no servidor, 24 horas. Este PC e apenas o painel: fechar o programa nao para o WhatsApp.';
     if (pathEl) pathEl.textContent = `Repositorio de dados: ${cfg.repoDir || '?'}`;
-    if (pick) pick.textContent = 'Trocar pasta do repositorio';
+    if (pick) { pick.textContent = 'Trocar pasta do repositorio'; pick.style.display = ''; pick.disabled = false; }
     if (clone) clone.style.display = 'none';
-    pick.disabled = false;
   } else if (cfg.mode === 'server-missing') {
     if (title) title.textContent = 'Servidor 24h sem conexao';
     if (hint) hint.textContent = 'O servidor esta configurado, mas a pasta do repositorio de dados nao foi encontrada. O WhatsApp NAO sera iniciado neste PC.';
     if (pathEl) pathEl.textContent = cfg.repoDir ? `Ultimo caminho: ${cfg.repoDir}` : '';
-    if (pick) pick.textContent = 'Reconectar pasta do repositorio';
+    if (pick) { pick.textContent = 'Reconectar pasta do repositorio'; pick.style.display = ''; pick.disabled = false; }
     if (clone) clone.style.display = '';
-    pick.disabled = false;
+  } else if (cfg.mode === 'remote') {
+    // Modo VPS: o bot roda no servidor remoto; este PC e somente o painel.
+    if (title) title.textContent = 'Servidor na VPS conectado';
+    if (hint) hint.textContent = 'O bot roda na VPS, 24 horas. Este PC e apenas o painel: fechar o programa nao para o WhatsApp.';
+    if (pathEl) pathEl.textContent = cfg.url ? `Servidor: ${cfg.url}` : '';
+    if (pick) { pick.textContent = 'Voltar ao modo local'; pick.style.display = ''; pick.disabled = false; }
+    if (clone) clone.style.display = 'none';
   } else {
     if (title) title.textContent = 'Este PC esta hospedando o bot';
     if (hint) hint.textContent = 'Neste modo o bot so funciona enquanto este programa estiver aberto. Para funcionar 24h sem o PC ligado, conecte o servidor abaixo.';
     if (pathEl) pathEl.textContent = '';
-    if (pick) pick.textContent = 'Usar pasta do repositorio';
+    if (pick) { pick.textContent = 'Usar pasta do repositorio'; pick.style.display = ''; pick.disabled = false; }
     if (clone) clone.style.display = '';
-    pick.disabled = false;
   }
 }
 
@@ -6882,6 +6891,17 @@ async function restartForServerConfig() {
 
 async function pickServerRepoFolder() {
   if (!window.electronAPI || !window.electronAPI.serverConfigPick) return;
+  if (serverConnectMode === 'remote') {
+    if (!confirm('Voltar a rodar o bot neste PC? O programa vai reiniciar no modo local.')) return;
+    const r = await window.electronAPI.remoteConfigDisable();
+    if (r && r.ok) {
+      alert('Modo local restaurado. O programa vai reiniciar.');
+      await restartForServerConfig();
+      return;
+    }
+    alert((r && r.error) || 'Nao foi possivel voltar ao modo local.');
+    return;
+  }
   const btn = document.getElementById('serverConnectPick');
   if (btn) { btn.disabled = true; btn.textContent = 'Abrindo...'; }
   try {
