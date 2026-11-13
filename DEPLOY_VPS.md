@@ -252,19 +252,19 @@ cd /opt/assistente-zap && git pull && npm ci && systemctl restart assistente-zap
 
 ---
 
-## 10. Arquivos legados (não usados por este deploy)
+## 10. Estrutura oficial de deploy
 
-Estes arquivos existem no repositório mas **não fazem parte** do fluxo acima.
-Podem ser removidos com segurança:
+Este é o único caminho de produção (os rascunhos antigos de PM2 e os docs
+duplicados foram removidos do repositório):
 
-- `VPS_SETUP.md`, `VPS_INSTALL_GUIDE.md`, `VPS_READINESS_CHECKLIST.md`, `DASHBOARD_ANALYSIS.md`, `IMPLEMENTATION_SUMMARY.md` — rascunhos antigos, conteúdo duplicado/desatualizado.
-- `ecosystem.config.js` e `config/production.json` — configuração de PM2 que **não** é usada (o serviço roda por **systemd**).
-- `scripts/prepare-vps.js` e `scripts/setup-production.js` — geradores desses arquivos de PM2.
+| Arquivo | Função |
+|---|---|
+| `scripts/install.sh` | instalação/atualização completa (idempotente) |
+| `deploy/assistente-zap.service` | unit do **systemd** que roda o backend 24h |
+| `deploy/nginx-assistente-zap.conf` | proxy HTTP + WebSocket na porta 80 |
+| `scripts/backup.sh` | backup diário dos dados |
+| `scripts/restore.sh` | restauração de um backup |
+| `.env.example` | referência de todas as variáveis do backend |
+| `backend/electron-entry.js` | ponto de entrada do modo servidor |
 
-O caminho oficial é: `scripts/install.sh` + `deploy/assistente-zap.service` + `deploy/nginx-assistente-zap.conf`.
-
-```bash
-# remover os legados (opcional)
-cd /opt/assistente-zap   # ou no seu PC
-rm -f VPS_SETUP.md VPS_INSTALL_GUIDE.md VPS_READINESS_CHECKLIST.md DASHBOARD_ANALYSIS.md IMPLEMENTATION_SUMMARY.md ecosystem.config.js config/production.json scripts/prepare-vps.js scripts/setup-production.js
-```
+Não há PM2 neste projeto: o serviço é gerenciado por `systemctl`.
