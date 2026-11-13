@@ -6,6 +6,10 @@
 # Por padrao o servico e parado durante a copia: o WhatsApp grava na sessao o
 # tempo todo e um tar "ao vivo" pode gerar um backup inconsistente.
 # Use BACKUP_STOP_SERVICE=0 para copiar com o servico no ar (nao recomendado).
+#
+# Os dados contem conversas e contatos de clientes (LGPD). Para criptografar:
+#   BACKUP_PASSPHRASE='frase-longa-e-secreta' bash scripts/backup.sh
+# O arquivo sai como .tar.gz.enc e o restore.sh pede a mesma frase.
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/assistente-zap}"
@@ -73,11 +77,19 @@ if [[ "$status" -gt 1 ]]; then
   exit 1
 fi
 
+if [[ -n "${BACKUP_PASSPHRASE:-}" ]]; then
+  command -v openssl >/dev/null 2>&1 || { echo "BACKUP_PASSPHRASE definido, mas openssl nao esta instalado" >&2; exit 1; }
+  echo "Criptografando backup (AES-256)..."
+  openssl enc -aes-256-cbc -pbkdf2 -salt -in "$FILE" -out "$FILE.enc" -pass env:BACKUP_PASSPHRASE
+  rm -f "$FILE"
+  FILE="$FILE.enc"
+fi
+
 SIZE="$(du -h "$FILE" | cut -f1)"
 echo "Backup criado: $FILE ($SIZE)"
 
-# Mantem os N mais recentes
-mapfile -t OLD < <(ls -1t "$DEST"/assistente-zap_*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) || true)
+# Mantem os N mais recentes (inclui os criptografados)
+mapfile -t OLD < <(ls -1t "$DEST"/assistente-zap_*.tar.gz* 2>/dev/null | tail -n +$((KEEP + 1)) || true)
 for f in "${OLD[@]:-}"; do
   [[ -n "$f" ]] || continue
   echo "Removendo backup antigo: $f"

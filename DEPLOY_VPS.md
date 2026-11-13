@@ -111,6 +111,20 @@ PORT=3000 NODE_MAJOR=20 bash scripts/install.sh
 
 No fim ele imprime a URL do painel, o caminho do `.env` e os comandos de log/backup.
 
+### 3.1 HTTPS (recomendado antes do primeiro cliente)
+
+Com HTTP puro a senha do painel viaja sem criptografia. Com um domínio apontando
+para o IP da VPS (registro **A**), o certificado é emitido em minutos:
+
+```bash
+DOMAIN=zap.seudominio.com EMAIL=voce@email.com sudo bash scripts/setup-https.sh
+```
+
+O script instala o `certbot`, emite o certificado Let's Encrypt, liga o redirect
+HTTP→HTTPS, abre a porta 443 e deixa a renovação automática ativa.
+
+Depois disso, use no Setup: `LINK_API_URL=https://zap.seudominio.com`.
+
 ---
 
 ## 4. Senha do painel
@@ -217,8 +231,12 @@ systemctl restart assistente-zap
 # Backup manual (para o serviço, copia e volta a subir)
 bash /opt/assistente-zap/scripts/backup.sh
 
-# Restaurar um backup
+# Backup criptografado (recomendado: os dados têm conversas de clientes)
+BACKUP_PASSPHRASE='frase-longa-e-secreta' bash /opt/assistente-zap/scripts/backup.sh
+
+# Restaurar um backup (o .enc pede a mesma frase)
 bash /opt/assistente-zap/scripts/restore.sh /opt/assistente-zap/backups/arquivo.tar.gz
+BACKUP_PASSPHRASE='frase-longa-e-secreta' bash /opt/assistente-zap/scripts/restore.sh /opt/assistente-zap/backups/arquivo.tar.gz.enc
 ```
 
 Backup automático diário às 3h (guarda os 7 últimos):
@@ -226,7 +244,7 @@ Backup automático diário às 3h (guarda os 7 últimos):
 ```bash
 crontab -e
 # adicione:
-0 3 * * * BACKUP_STOP_SERVICE=1 /opt/assistente-zap/scripts/backup.sh >/var/log/zap-backup.log 2>&1
+0 3 * * * BACKUP_STOP_SERVICE=1 BACKUP_PASSPHRASE='frase-longa-e-secreta' /opt/assistente-zap/scripts/backup.sh >/var/log/zap-backup.log 2>&1
 ```
 
 Atualizar o sistema depois de novos commits:
@@ -262,9 +280,19 @@ duplicados foram removidos do repositório):
 | `scripts/install.sh` | instalação/atualização completa (idempotente) |
 | `deploy/assistente-zap.service` | unit do **systemd** que roda o backend 24h |
 | `deploy/nginx-assistente-zap.conf` | proxy HTTP + WebSocket na porta 80 |
-| `scripts/backup.sh` | backup diário dos dados |
+| `scripts/backup.sh` | backup diário dos dados (com opção de criptografia) |
 | `scripts/restore.sh` | restauração de um backup |
+| `scripts/setup-https.sh` | domínio + certificado Let's Encrypt + redirect HTTPS |
 | `.env.example` | referência de todas as variáveis do backend |
 | `backend/electron-entry.js` | ponto de entrada do modo servidor |
 
 Não há PM2 neste projeto: o serviço é gerenciado por `systemctl`.
+
+---
+
+## 11. Vender o serviço
+
+O modelo comercial (1 Zap = 1 cliente, cobrança com vencimento/carência e
+suspensão automática) está em **[GUIA-COMERCIAL.md](GUIA-COMERCIAL.md)**, com
+capacidade, precificação, onboarding, contrato, LGPD e checklist do primeiro
+cliente pagante.
