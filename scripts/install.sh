@@ -103,6 +103,7 @@ if [[ ! -f "$APP_DIR/.env" ]]; then
   info "Criando .env com senha administrativa aleatoria"
   PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)"
   JWT_SECRET="$(openssl rand -hex 32)"
+  BACKUP_PASS="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)"
   cat > "$APP_DIR/.env" <<EOF
 DATA_DIR=$APP_DIR/data
 HOST=127.0.0.1
@@ -118,6 +119,8 @@ HEADLESS=1
 TZ=America/Sao_Paulo
 # Pareamento automatico: gera o codigo no painel e salva em data/pairing-codes.json
 LINK_AUTO_PAIR=1
+# Frase do backup criptografado. GUARDE FORA DA VPS (gerenciador de senhas).
+BACKUP_PASSPHRASE=$BACKUP_PASS
 EOF
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
@@ -127,6 +130,18 @@ else
   grep -q '^JWT_SECRET=' "$APP_DIR/.env" || echo "JWT_SECRET=$(openssl rand -hex 32)" >> "$APP_DIR/.env"
   grep -q '^TZ=' "$APP_DIR/.env" || echo 'TZ=America/Sao_Paulo' >> "$APP_DIR/.env"
   grep -q '^LINK_AUTO_PAIR=' "$APP_DIR/.env" || echo 'LINK_AUTO_PAIR=1' >> "$APP_DIR/.env"
+  grep -qE '^BACKUP_PASSPHRASE=.+' "$APP_DIR/.env" || echo "BACKUP_PASSPHRASE=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)" >> "$APP_DIR/.env"
+  chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
+  chmod 600 "$APP_DIR/.env"
+fi
+
+# Frase usada pelo cron e pelo teste de backup.
+BACKUP_PASS="$(grep -E '^BACKUP_PASSPHRASE=' "$APP_DIR/.env" | head -n1 | cut -d= -f2- || true)"
+if [[ -z "$BACKUP_PASS" ]]; then
+  # .env antigo com a variavel vazia: gera uma frase e substitui a linha.
+  BACKUP_PASS="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)"
+  sed -i '/^BACKUP_PASSPHRASE=/d' "$APP_DIR/.env"
+  echo "BACKUP_PASSPHRASE=$BACKUP_PASS" >> "$APP_DIR/.env"
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
 fi
@@ -162,6 +177,17 @@ if command -v ufw >/dev/null 2>&1; then
   ufw --force enable >/dev/null || true
 fi
 
+if [[ -n "$BACKUP_PASS" ]]; then
+  info "Agendando backup diario criptografado (03:00)"
+  cat > /etc/cron.d/assistente-zap-backup <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+0 3 * * * root BACKUP_STOP_SERVICE=1 BACKUP_PASSPHRASE='$BACKUP_PASS' /usr/bin/env bash $APP_DIR/scripts/backup.sh >> /var/log/zap-backup.log 2>&1
+EOF
+  chmod 600 /etc/cron.d/assistente-zap-backup
+  ok "backup diario agendado"
+fi
+
 info "Aguardando o backend responder em /health"
 for i in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -179,12 +205,27 @@ else
   URL="http://$IP"
 fi
 
+if [[ -n "$BACKUP_PASS" ]]; then
+  info "Testando backup e restauracao"
+  if BACKUP_PASSPHRASE="$BACKUP_PASS" APP_DIR="$APP_DIR" DATA_DIR="$APP_DIR/data" \
+      bash "$APP_DIR/scripts/verify-backup.sh"; then
+    ok "backup e restauracao validados"
+  else
+    echo "aviso: o teste de backup falhou (o servico continua no ar). Veja a saida acima." >&2
+  fi
+fi
+
 echo
 ok "Instalacao concluida"
 echo "  Painel/API:   $URL"
 echo "  Health:       $URL/health"
-echo "  Senha admin:  $APP_DIR/.env (ADMIN_PASSWORD) ou $APP_DIR/data/ADMIN_PASSWORD.txt"
+echo "  Senha admin:  $APP_DIR/.env (ADMIN_PASSWORD)"
+echo "  Backup:       diario 03:00, criptografado -> $APP_DIR/backups"
+echo "  Frase backup: $APP_DIR/.env (BACKUP_PASSPHRASE) - guarde FORA da VPS"
 echo "  Logs:         journalctl -u assistente-zap -f"
-echo "  Backup:       bash $APP_DIR/scripts/backup.sh"
+echo "  Restaurar:    bash $APP_DIR/scripts/restore.sh <arquivo.tar.gz.enc>"
+echo
+echo "Proximo passo (HTTPS):"
+echo "  DOMAIN=seu.dominio.com EMAIL=voce@email.com sudo bash $APP_DIR/scripts/setup-https.sh"
 echo
 echo "No Setup, defina LINK_API_URL=$URL antes de abrir o painel."

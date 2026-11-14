@@ -111,10 +111,10 @@ PORT=3000 NODE_MAJOR=20 bash scripts/install.sh
 
 No fim ele imprime a URL do painel, o caminho do `.env` e os comandos de log/backup.
 
-### 3.1 HTTPS (recomendado antes do primeiro cliente)
+### 3.1 HTTPS (obrigatório)
 
-Com HTTP puro a senha do painel viaja sem criptografia. Com um domínio apontando
-para o IP da VPS (registro **A**), o certificado é emitido em minutos:
+Com HTTP puro a senha do painel viaja sem criptografia. Compre um domínio,
+crie um registro **A** apontando para o IP da VPS e rode:
 
 ```bash
 DOMAIN=zap.seudominio.com EMAIL=voce@email.com sudo bash scripts/setup-https.sh
@@ -145,63 +145,48 @@ systemctl restart assistente-zap
 
 ---
 
-## 5. Migrar os dados do PC para a VPS
+## 5. Dados: a VPS começa vazia
 
-### 5.1 Copiar (do seu PC, dentro da pasta do projeto)
+Não há nada a migrar. Todos os Zaps/dados do seu PC são de teste; o servidor
+começa com `data/` vazia e você cadastra/pareia os Zaps do zero pelo painel.
 
-```powershell
-$IP = "SEU_IP"
-scp data/zaps.json data/contacts.json data/providers.json data/conversations.json data/trainings.json root@${IP}:/opt/assistente-zap/data/
-scp -r data/trainings data/memorias root@${IP}:/opt/assistente-zap/data/
-# Opcional (estado de mensagens automáticas e status do bot):
-scp data/auto-msg-state.json data/bot-status.json root@${IP}:/opt/assistente-zap/data/
-```
+O que o servidor cria sozinho no primeiro boot:
 
-### 5.2 Ajustar permissões (no servidor)
-
-```bash
-chown -R zap:zap /opt/assistente-zap/data
-chmod 600 /opt/assistente-zap/data/*.json
-systemctl restart assistente-zap
-```
-
-### 5.3 O que **não** copiar (e por quê)
-
-| Item | Motivo |
+| Arquivo | Conteúdo |
 |---|---|
-| `remote-server.json`, `server-repo.json` | configuração do modo cliente local; no servidor não se aplica |
-| `.env`, `backend-auth.json`, `ADMIN_PASSWORD.txt` | o servidor gera os próprios segredos/senha |
-| `link-no-whatsapp/`, `.wwebjs_cache/` | sessão do WhatsApp/Chromium — **pareie de novo** na VPS |
-| `Cache/`, `Code Cache/`, `GPUCache/`, `DawnCache/`, `blob_storage/`, `Session Storage/`, `Local Storage/`, `Network/` | caches do navegador embutido |
-| `qr-*.png`, `*.log` | QR antigos e logs de desenvolvimento |
+| `data/backend-auth.json` | hash da senha e segredo dos tokens |
+| `data/pairing-codes.json` | códigos de pareamento gerados |
+| `data/sessions/<zapId>/` | sessão do WhatsApp de cada Zap |
+| `data/zaps.json`, `contacts.json`, ... | criados conforme o uso |
 
-> `providers.json` contém as **chaves de IA**. Copiá-lo já leva as chaves.
-> Se preferir não migrá-las, copie o arquivo e recadastre as chaves no painel.
+> Nunca copie `.env`, `backend-auth.json` ou `data/sessions/` do PC: são
+> específicos da máquina e da sessão de WhatsApp.
 
 ---
 
 ## 6. Apontar o Setup para o servidor
 
 **Pela interface (mais simples):** abra o Setup → card **“Servidor na VPS (API)”**
-→ informe `http://SEU_IP` → entre com a senha admin. A tela salva sozinha em
+→ informe `https://seu.dominio` → entre com a senha admin. A tela salva sozinha em
 `data/remote-server.json`.
 
 **Por variável de ambiente** (antes de abrir o app):
 
 ```
-LINK_API_URL=http://SEU_IP
+LINK_API_URL=https://seu.dominio
 LINK_API_PREFIX=/api/v1
 ```
 
-Depois disso, **pareie os Zaps** no painel remoto (QR ou código de pareamento —
-o servidor está com `LINK_AUTO_PAIR=1`, então o código aparece no painel).
+Depois disso, **cadastre e pareie os Zaps** no painel remoto (o servidor está com
+`LINK_AUTO_PAIR=1`, então o código aparece no painel). O passo a passo está em
+**[MANUAL-OPERACAO.md](MANUAL-OPERACAO.md)**.
 
 ---
 
 ## 7. Validar o serviço
 
 ```bash
-curl -s http://SEU_IP/health
+curl -s https://seu.dominio/health
 systemctl status assistente-zap
 journalctl -u assistente-zap -n 80 --no-pager
 ```
@@ -209,13 +194,13 @@ journalctl -u assistente-zap -n 80 --no-pager
 Checklist:
 
 - [ ] `/health` responde OK
-- [ ] Login no Setup funciona
-- [ ] Os Zaps migrados aparecem no painel
-- [ ] QR/código de pareamento é gerado
+- [ ] Login no Setup funciona por HTTPS
+- [ ] O Zap de teste aparece no painel
+- [ ] O código de pareamento é gerado (Zap com telefone cadastrado)
 - [ ] Envio de mensagem de texto funciona
 - [ ] Áudio é gerado (ffmpeg instalado)
 - [ ] Status/terminal atualizam ao vivo (WebSocket `/ws`)
-- [ ] Vencimento e carência batem (fuso `America/Sao_Paulo`)
+- [ ] Backup diário agendado e teste de restauração passou
 
 ---
 
@@ -239,12 +224,14 @@ bash /opt/assistente-zap/scripts/restore.sh /opt/assistente-zap/backups/arquivo.
 BACKUP_PASSPHRASE='frase-longa-e-secreta' bash /opt/assistente-zap/scripts/restore.sh /opt/assistente-zap/backups/arquivo.tar.gz.enc
 ```
 
-Backup automático diário às 3h (guarda os 7 últimos):
+Backup automático: o `install.sh` já agenda às **03:00**, com criptografia e
+parando o serviço durante a cópia (`/etc/cron.d/assistente-zap-backup`).
+
+Para verificar se o mecanismo funciona (cria, decifra, extrai e valida):
 
 ```bash
-crontab -e
-# adicione:
-0 3 * * * BACKUP_STOP_SERVICE=1 BACKUP_PASSPHRASE='frase-longa-e-secreta' /opt/assistente-zap/scripts/backup.sh >/var/log/zap-backup.log 2>&1
+BACKUP_PASSPHRASE="$(grep '^BACKUP_PASSPHRASE=' /opt/assistente-zap/.env | cut -d= -f2-)" \
+  bash /opt/assistente-zap/scripts/verify-backup.sh
 ```
 
 Atualizar o sistema depois de novos commits:
@@ -280,8 +267,9 @@ duplicados foram removidos do repositório):
 | `scripts/install.sh` | instalação/atualização completa (idempotente) |
 | `deploy/assistente-zap.service` | unit do **systemd** que roda o backend 24h |
 | `deploy/nginx-assistente-zap.conf` | proxy HTTP + WebSocket na porta 80 |
-| `scripts/backup.sh` | backup diário dos dados (com opção de criptografia) |
-| `scripts/restore.sh` | restauração de um backup |
+| `scripts/backup.sh` | backup dos dados (criptografia opcional via `BACKUP_PASSPHRASE`) |
+| `scripts/restore.sh` | restauração de um backup (`.tar.gz` ou `.tar.gz.enc`) |
+| `scripts/verify-backup.sh` | testa o mecanismo: cria, decifra, extrai e valida |
 | `scripts/setup-https.sh` | domínio + certificado Let's Encrypt + redirect HTTPS |
 | `.env.example` | referência de todas as variáveis do backend |
 | `backend/electron-entry.js` | ponto de entrada do modo servidor |
@@ -290,9 +278,10 @@ Não há PM2 neste projeto: o serviço é gerenciado por `systemctl`.
 
 ---
 
-## 11. Vender o serviço
+## 11. Operar o serviço
 
-O modelo comercial (1 Zap = 1 cliente, cobrança com vencimento/carência e
-suspensão automática) está em **[GUIA-COMERCIAL.md](GUIA-COMERCIAL.md)**, com
-capacidade, precificação, onboarding, contrato, LGPD e checklist do primeiro
-cliente pagante.
+O dia a dia (cadastrar cliente, parear, re-parear, rotina, queda de Zap, backup
+e monitor) está em **[MANUAL-OPERACAO.md](MANUAL-OPERACAO.md)**.
+
+Modelo de contrato de prestação de serviço: **[CONTRATO-MODELO.md](CONTRATO-MODELO.md)**
+(revisar com advogado antes de usar).
