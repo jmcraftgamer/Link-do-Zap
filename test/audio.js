@@ -5,6 +5,8 @@ const path = require('path');
 
 const { decryptWhatsAppMedia } = require(path.join(__dirname, '..', 'src', 'js', 'media-crypto'));
 const WhatsAppManager = require(path.join(__dirname, '..', 'src', 'js', 'whatsapp-manager'));
+const AIResponder = require(path.join(__dirname, '..', 'src', 'js', 'ai-responder'));
+const { sanitizeMessage, sanitizeMessages } = require(path.join(__dirname, '..', 'src', 'core', 'audio-history'));
 
 let passed = 0;
 const failures = [];
@@ -241,7 +243,137 @@ async function testFallbackManual() {
   }
 }
 
+// ---------------------------------------------------------------
+// Historico da conversa nao guarda base64 de audio
+// ---------------------------------------------------------------
+
+test('historico: remove o base64 do audio e preserva mimetype/size', () => {
+  const msg = { body: '[AUDIO]', audio: { data: 'QUJD', mimetype: 'audio/ogg; codecs=opus', size: 3 } };
+  const out = sanitizeMessage(msg);
+  assert.strictEqual(out.audio.data, undefined, 'base64 nao pode ir para o historico');
+  assert.strictEqual(out.audio.mimetype, 'audio/ogg; codecs=opus');
+  assert.strictEqual(out.audio.size, 3);
+  assert.strictEqual(out.body, '[AUDIO]');
+  assert.strictEqual(msg.audio.data, 'QUJD', 'o objeto em voo (IA) precisa manter o audio');
+});
+
+test('historico: devolve o mesmo objeto quando ja esta limpo', () => {
+  const texto = { body: 'oi' };
+  assert.strictEqual(sanitizeMessage(texto), texto);
+  const limpo = { body: '[AUDIO]', audio: { mimetype: 'audio/ogg', size: 3 } };
+  assert.strictEqual(sanitizeMessage(limpo), limpo, 'getMessages nao pode copiar 200 mensagens por chamada');
+});
+
+test('historico: sanitizeMessages tolera entrada invalida', () => {
+  assert.deepStrictEqual(sanitizeMessages(null), []);
+  assert.deepStrictEqual(sanitizeMessages('x'), []);
+  assert.strictEqual(sanitizeMessages([{ body: 'a' }, null]).length, 2);
+});
+
+async function testGeminiUsaBase64SemBuffer() {
+  const responder = new AIResponder();
+  const b64 = Buffer.from('audio-gemini').toString('base64');
+  let seen = null;
+  const previousFetch = global.fetch;
+  global.fetch = async (url, opts) => {
+    seen = { url, opts, body: JSON.parse(opts.body) };
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ content: { parts: [{ text: 'texto transcrito' }] } }] })
+    };
+  };
+  try {
+    const text = await responder.transcribeAudio(
+      { data: b64, mimetype: 'audio/ogg; codecs=opus', size: 12 },
+      [{ id: 'g', name: 'Google Gemini', apiKey: 'k', models: [{ id: 'gemini-3.6-flash' }] }],
+      'zap1'
+    );
+    assert.strictEqual(text, 'texto transcrito');
+    const part = seen.body.contents[0].parts[0];
+    assert.strictEqual(part.inline_data.data, b64, 'Gemini deve receber o base64 puro');
+    assert.ok(seen.opts.signal, 'fetch de transcricao precisa de signal de timeout');
+  } finally {
+    global.fetch = previousFetch;
+  }
+}
+
+async function testFilaDeTranscricao() {
+  const previousEnv = process.env.LINK_TRANSCRIBE_CONCURRENCY;
+  process.env.LINK_TRANSCRIBE_CONCURRENCY = '1';
+  const responder = new AIResponder();
+  let active = 0;
+  let peak = 0;
+  const previousFetch = global.fetch;
+  global.fetch = async () => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((r) => setTimeout(r, 60));
+    active--;
+    return { ok: true, json: async () => ({ text: 'ok' }) };
+  };
+  try {
+    const audio = { data: Buffer.from('audio').toString('base64'), mimetype: 'audio/ogg', size: 5 };
+    const providers = [{ id: 'o', name: 'OpenAI', apiKey: 'k' }];
+    await Promise.all([
+      responder.transcribeAudio(audio, providers, 'zap1'),
+      responder.transcribeAudio(audio, providers, 'zap2'),
+      responder.transcribeAudio(audio, providers, 'zap3')
+    ]);
+    assert.strictEqual(peak, 1, `a fila nao limitou as transcricoes (pico ${peak})`);
+  } finally {
+    global.fetch = previousFetch;
+    if (previousEnv === undefined) delete process.env.LINK_TRANSCRIBE_CONCURRENCY;
+    else process.env.LINK_TRANSCRIBE_CONCURRENCY = previousEnv;
+  }
+}
+
+async function testTimeoutDeTranscricao() {
+  const previousEnv = process.env.LINK_TRANSCRIBE_TIMEOUT_MS;
+  process.env.LINK_TRANSCRIBE_TIMEOUT_MS = '80';
+  const responder = new AIResponder();
+  const previousFetch = global.fetch;
+  global.fetch = (url, opts) => new Promise((resolve, reject) => {
+    if (opts && opts.signal) {
+      opts.signal.addEventListener('abort', () => {
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    }
+  });
+  try {
+    await assert.rejects(
+      () => responder.transcribeAudio(
+        { data: Buffer.from('audio').toString('base64'), mimetype: 'audio/ogg', size: 5 },
+        [{ id: 'o', name: 'OpenAI', apiKey: 'k' }],
+        'zap1'
+      ),
+      /excedeu/,
+      'transcricao travada precisa abortar no timeout'
+    );
+  } finally {
+    global.fetch = previousFetch;
+    if (previousEnv === undefined) delete process.env.LINK_TRANSCRIBE_TIMEOUT_MS;
+    else process.env.LINK_TRANSCRIBE_TIMEOUT_MS = previousEnv;
+  }
+}
+
+async function rodar(name, fn) {
+  try {
+    await fn();
+    passed++;
+    console.log(`ok - ${name}`);
+  } catch (e) {
+    failures.push({ name, error: e.message });
+    console.log(`FAIL - ${name}`);
+    console.log(`      ${e.message}`);
+  }
+}
+
 async function runAsyncTests() {
+  await rodar('transcricao: Gemini recebe base64 puro e signal de timeout', testGeminiUsaBase64SemBuffer);
+  await rodar('transcricao: fila limita as transcricoes simultaneas', testFilaDeTranscricao);
+  await rodar('transcricao: timeout aborta provedor travado', testTimeoutDeTranscricao);
   try {
     await testRegressaoMimetypePtt();
   } catch (e) {

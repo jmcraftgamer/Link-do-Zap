@@ -213,6 +213,29 @@ Retorna `ram` (total, livre, % em uso), `swap`, memória do processo, `loadavg`
 e número de CPUs. O `/api/v1/server/status` (com token) traz o mesmo bloco —
 é o que o app mobile futuro vai consumir para alertar.
 
+### Áudio (transcrição)
+
+O áudio do WhatsApp é baixado, descriptografado e enviado para Whisper
+(OpenAI/Groq) ou Gemini. **Não roda nada localmente** — não há ffmpeg nem
+modelo na VPS; só rede e memória.
+
+O que segura o consumo de RAM:
+
+- **O base64 do áudio não fica no histórico.** Ele existe só durante a
+  transcrição e é liberado logo depois. A interface baixa a mídia sob demanda.
+- **Fila de transcrição** (`LINK_TRANSCRIBE_CONCURRENCY`, padrão 2): no máximo
+  dois áudios sobem para a IA ao mesmo tempo. Os demais esperam alguns segundos.
+- **Timeout** (`LINK_TRANSCRIBE_TIMEOUT_MS`, padrão 60 s): provedor travado é
+  abandonado e a próxima opção da lista assume, em vez de pendurar a conversa.
+
+```bash
+LINK_TRANSCRIBE_CONCURRENCY=2
+LINK_TRANSCRIBE_TIMEOUT_MS=60000
+```
+
+Se chegar uma rajada de áudios, a resposta atrasa (fila), mas nada trava nem
+consome memória proporcional ao número de áudios ao mesmo tempo.
+
 ---
 
 ## 11. O que não prometer ao cliente

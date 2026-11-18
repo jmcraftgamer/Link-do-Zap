@@ -247,6 +247,10 @@ function createMessagePipeline(deps) {
         log(zapId, 'error', `Erro na transcricao: ${e.message}`);
         await sendErrorToWhatsApp(zapId, chatId, 'Tive um problema para entender seu audio. Pode enviar como texto?');
         return { ok: false, reason: 'audio_error' };
+      } finally {
+        // O base64 do audio ja cumpriu o papel (transcricao). Liberar agora
+        // evita que ele fique na RAM ate o GC passar, inclusive nos erros.
+        try { if (audio && audio.data) delete audio.data; } catch (_) { /* congelado */ }
       }
     }
 

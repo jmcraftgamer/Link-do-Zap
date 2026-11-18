@@ -1,9 +1,17 @@
 const { verifyMessage, buildCorrectionPrompt } = require('./message-guard');
+const { ConnectQueue } = require('../core/connect-queue');
 
 class AIResponder {
   constructor() {
     this.conversationHistory = new Map();
     this.historyStore = null;
+    // Fila de transcricao: cada audio vira um upload de ate alguns MB.
+    // Sem limite, 30 audios simultaneos empilham 30 corpos de requisicao
+    // ao mesmo tempo e o pico de memoria derruba o processo.
+    this._transcribeQueue = new ConnectQueue({
+      maxConcurrent: Number(process.env.LINK_TRANSCRIBE_CONCURRENCY) || 2,
+      minGapMs: 0
+    });
     this.HISTORY_MAX_MESSAGES = 40;
     this.HISTORY_MAX_CHARS = 12000;
     this.failedModels = new Map(); // modelKey -> timestamp of last failure
@@ -591,33 +599,61 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
     const commaIdx = b64.indexOf(',');
     if (b64.startsWith('data:') && commaIdx !== -1) b64 = b64.slice(commaIdx + 1);
     b64 = b64.trim();
-    const buf = Buffer.from(b64, 'base64');
+    // Buffer so quando o Whisper for realmente usado. O Gemini aceita o
+    // base64 direto, entao criar o Buffer antes era uma copia desperdicada
+    // do audio inteiro em memoria.
+    let buf = null;
+    const getBuf = () => (buf || (buf = Buffer.from(b64, 'base64')));
     const mime = (audio.mimetype || 'audio/ogg').split(';')[0].trim();
 
     let lastErr = null;
-    for (const c of candidates) {
-      try {
-        console.log(`[TRANSCRIBE][${zapId}] tentando ${c.p.name}...`);
-        say('info', `Transcrevendo audio com ${c.p.name}...`);
-        let text;
-        if (gemini.includes(c)) {
-          text = await this._transcribeWithGemini(c.key, b64, mime, c.p);
-        } else {
-          text = await this._transcribeWithWhisper(c, buf, mime);
+    await this._transcribeQueue.acquire();
+    try {
+      for (const c of candidates) {
+        try {
+          console.log(`[TRANSCRIBE][${zapId}] tentando ${c.p.name}...`);
+          say('info', `Transcrevendo audio com ${c.p.name}...`);
+          let text;
+          if (gemini.includes(c)) {
+            text = await this._transcribeWithGemini(c.key, b64, mime, c.p);
+          } else {
+            text = await this._transcribeWithWhisper(c, getBuf(), mime);
+          }
+          if (text && text.trim()) {
+            console.log(`[TRANSCRIBE][${zapId}] sucesso com ${c.p.name}`);
+            say('success', `Transcricao feita com ${c.p.name}.`);
+            return text.trim();
+          }
+          throw new Error('Transcricao vazia');
+        } catch (e) {
+          lastErr = e;
+          console.warn(`[TRANSCRIBE][${zapId}] falhou em ${c.p.name}: ${e.message}`);
+          say('warning', `Transcricao com ${c.p.name} falhou: ${e.message}`);
         }
-        if (text && text.trim()) {
-          console.log(`[TRANSCRIBE][${zapId}] sucesso com ${c.p.name}`);
-          say('success', `Transcricao feita com ${c.p.name}.`);
-          return text.trim();
-        }
-        throw new Error('Transcricao vazia');
-      } catch (e) {
-        lastErr = e;
-        console.warn(`[TRANSCRIBE][${zapId}] falhou em ${c.p.name}: ${e.message}`);
-        say('warning', `Transcricao com ${c.p.name} falhou: ${e.message}`);
       }
+    } finally {
+      this._transcribeQueue.release();
     }
     throw lastErr || new Error('Falha na transcricao');
+  }
+
+  // fetch com timeout. Sem isso, um provedor engasgado deixa a conversa
+  // pendurada ate o timeout do sistema operacional - e ocupa a vaga da fila
+  // de transcricao enquanto isso.
+  async _fetchWithTimeout(url, opts, label) {
+    const ms = Number(process.env.LINK_TRANSCRIBE_TIMEOUT_MS) || 60000;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), ms);
+    try {
+      return await fetch(url, { ...opts, signal: ac.signal });
+    } catch (e) {
+      if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) {
+        throw new Error(`${label || 'requisicao'} excedeu ${ms}ms`);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async _transcribeWithWhisper(c, buf, mime) {
@@ -637,7 +673,7 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
       headers['HTTP-Referer'] = 'https://link-no-whatsapp.app';
       headers['X-Title'] = 'Link no WhatsApp';
     }
-    const resp = await fetch(url, { method: 'POST', headers, body: form });
+    const resp = await this._fetchWithTimeout(url, { method: 'POST', headers, body: form }, 'whisper');
     const j = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(j.error?.message || `HTTP ${resp.status}`);
     return j.text || j.transcription || '';
@@ -661,11 +697,11 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
         temperature: 0
       }
     };
-    const resp = await fetch(url, {
+    const resp = await this._fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    });
+    }, 'gemini');
     const j = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(j.error?.message || `HTTP ${resp.status}`);
     const parts = j.candidates?.[0]?.content?.parts || [];

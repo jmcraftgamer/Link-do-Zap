@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { decryptWhatsAppMedia } = require('./media-crypto');
 const { ConnectQueue } = require('../core/connect-queue');
+const { sanitizeMessage, sanitizeMessages } = require('../core/audio-history');
 
 class WhatsAppManager {
   constructor(mainWindow) {
@@ -1027,8 +1028,11 @@ class WhatsAppManager {
           conversation.contact.number = messageData.contact.number;
         }
       }
-      conversation.messages.push(messageData);
-      conversation.lastMessage = messageData;
+      // Historico guarda a versao sem base64. O `messageData` original segue
+      // completo para o pipeline da IA transcrever; so o que fica na RAM e limpo.
+      const historyEntry = sanitizeMessage(messageData);
+      conversation.messages.push(historyEntry);
+      conversation.lastMessage = historyEntry;
       // Mantem o historico da UI enxuto
       if (conversation.messages.length > 200) {
         conversation.messages = conversation.messages.slice(-200);
@@ -1037,8 +1041,9 @@ class WhatsAppManager {
       // Persist contacts to disk so they survive restarts
       this.persistContacts();
 
-      // Envia para a tela do app (sempre)
-      this.sendToRenderer('whatsapp-message', messageData);
+      // Envia para a tela do app (sempre). Sem o base64: o renderer nao usa
+      // `.audio` e o payload cai de megabytes para kilobytes.
+      this.sendToRenderer('whatsapp-message', historyEntry);
 
       // =============================================
       // DECISAO: Chamar a IA ou nao?
@@ -2963,7 +2968,9 @@ class WhatsAppManager {
     if (!zapConversations || !zapConversations.has(chatId)) {
       return [];
     }
-    return zapConversations.get(chatId).messages;
+    // Defensivo: mensagens antigas (ou vindas de outro caminho) podem ter
+    // sido guardadas com o base64 do audio. Nunca mandar isso pelo IPC.
+    return sanitizeMessages(zapConversations.get(chatId).messages);
   }
 
   // Localiza a conversa pelo chatId ou, como fallback, pelo numero do contato.
