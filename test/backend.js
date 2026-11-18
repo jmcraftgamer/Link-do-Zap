@@ -146,6 +146,10 @@ async function main() {
     assert.strictEqual(r.status, 200);
     assert.strictEqual(r.data.ok, true);
     assert.strictEqual(r.data.service, 'assistente-zap-backend');
+    assert.ok(r.data.resources && r.data.resources.ram, 'resources ausente no /health');
+    assert.ok(r.data.resources.ram.totalMB > 0, 'RAM total invalida no /health');
+    assert.ok(typeof r.data.resources.ram.usedPct === 'number', 'uso de RAM ausente');
+    assert.ok(r.data.resources.cpus >= 1, 'numero de CPUs ausente');
   });
 
   testAsync('backend: rota protegida exige token', async () => {
@@ -242,6 +246,8 @@ async function main() {
     assert.strictEqual(r.data.running, true, 'deve manter os campos do handler server-status');
     assert.ok(Array.isArray(r.data.zaps), 'zaps ausentes no server/status');
     assert.strictEqual(r.data.zaps[0].id, 'z1');
+    assert.ok(r.data.resources && r.data.resources.ram.totalMB > 0, 'resources ausente no server/status');
+    assert.ok(r.data.resources.swap && typeof r.data.resources.swap.usedMB === 'number', 'swap ausente no server/status');
   });
 
   testAsync('backend: /status traz o estado do runtime', async () => {

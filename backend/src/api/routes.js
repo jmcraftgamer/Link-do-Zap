@@ -1,7 +1,47 @@
 // Rotas da API v1. Cada rota delega para o mesmo handler que o IPC do Setup
 // usa (runtime.invoke), mantendo uma unica implementacao da regra de negocio.
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
 const billingCore = require('../../../src/core/billing');
+
+// RAM/swap reais do servidor. Em Linux usa MemAvailable (o MemFree puro
+// ignora cache e mostra a maquina "cheia" sem motivo). Fallback para os.*
+// em Windows/macOS, onde o teste roda.
+function readMemory() {
+  try {
+    const txt = fs.readFileSync('/proc/meminfo', 'utf8');
+    const read = (key) => {
+      const m = txt.match(new RegExp(`^${key}:\\s+(\\d+) kB`, 'm'));
+      return m ? Number(m[1]) * 1024 : null;
+    };
+    const total = read('MemTotal');
+    const available = read('MemAvailable');
+    const swapTotal = read('SwapTotal') || 0;
+    const swapFree = read('SwapFree');
+    if (total && available != null) {
+      return { total, available, swapTotal, swapUsed: swapFree == null ? 0 : Math.max(0, swapTotal - swapFree) };
+    }
+  } catch (_) { /* nao e Linux */ }
+  const total = os.totalmem();
+  const available = os.freemem();
+  return { total, available, swapTotal: 0, swapUsed: 0 };
+}
+
+// Bloco de recursos exposto em /health e /server/status. O app mobile futuro
+// consome o mesmo endpoint para avisar quando a VPS estiver no limite.
+function resourcesSnapshot() {
+  const mem = readMemory();
+  const mb = (bytes) => Math.round(Number(bytes) / 1048576);
+  const usedPct = mem.total ? Math.round(((mem.total - mem.available) / mem.total) * 100) : 0;
+  return {
+    ram: { totalMB: mb(mem.total), availableMB: mb(mem.available), usedPct },
+    swap: { totalMB: mb(mem.swapTotal), usedMB: mb(mem.swapUsed) },
+    processMB: mb(process.memoryUsage().rss),
+    loadavg: os.loadavg().map((n) => Math.round(n * 100) / 100),
+    cpus: (os.cpus() || []).length
+  };
+}
 
 function asArray(value, fallback = []) {
   return Array.isArray(value) ? value : fallback;
@@ -105,7 +145,8 @@ function createRoutes({ runtime, config }) {
         version: config.version || '1.0.0',
         uptime: Math.floor(process.uptime()),
         dataDir: config.dataDir,
-        time: new Date().toISOString()
+        time: new Date().toISOString(),
+        resources: resourcesSnapshot()
       })
     },
     {
@@ -143,7 +184,7 @@ function createRoutes({ runtime, config }) {
         let extra = {};
         try { extra = (await invoke('server-status')) || {}; } catch (_) {}
         const state = runtime.buildStatusState ? runtime.buildStatusState() : {};
-        return { ...extra, ...state, ok: true };
+        return { ...extra, ...state, ok: true, resources: resourcesSnapshot() };
       }
     },
     {

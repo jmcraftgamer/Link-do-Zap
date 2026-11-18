@@ -1304,6 +1304,64 @@ function startServerReconciler(intervalMs = 15000) {
 }
 
 // ------------------------------------------------------------
+// Reciclagem noturna das sessoes
+// ------------------------------------------------------------
+// O WhatsApp Web acumula memoria ao longo dos dias dentro do Chromium.
+// Reconectar preservando a sessao (LocalAuth no disco) devolve essa memoria
+// sem re-parear o cliente. Um Zap por vez, espacado, de madrugada.
+function startSessionRecycler() {
+  if (!isHeadless() || !whatsappManager) return null;
+  const rawEnv = process.env.LINK_RECYCLE_HOUR;
+  const raw = String(rawEnv == null || rawEnv === '' ? '4' : rawEnv).trim().toLowerCase();
+  if (['off', 'false', 'no', 'disable', 'disabled'].includes(raw)) {
+    console.log('[RECYCLE] reciclagem noturna desativada (LINK_RECYCLE_HOUR)');
+    return null;
+  }
+  const parsed = Number(raw);
+  const hour = Number.isInteger(parsed) && parsed >= 0 && parsed <= 23 ? parsed : 4;
+  if (hour !== parsed) console.log(`[RECYCLE] LINK_RECYCLE_HOUR invalido ("${raw}") - usando ${hour}h`);
+  const gapMs = Math.max(30000, Number(process.env.LINK_RECYCLE_GAP_MS) || 120000);
+  let lastDay = '';
+  let running = false;
+
+  const run = async () => {
+    if (running) return;
+    running = true;
+    const list = loadZapsData().filter((z) => z && z.enabled !== false);
+    let done = 0;
+    try {
+      for (const z of list) {
+        const id = String(z.id);
+        const st = whatsappManager.getStatus(id) || { status: 'disconnected' };
+        if (st.status !== 'ready') continue;
+        try {
+          console.log(`[RECYCLE] reiniciando sessao do zap ${id} (${z.name || id}) para liberar memoria`);
+          await whatsappManager._forceReconnect(id);
+          done++;
+        } catch (e) {
+          console.error(`[RECYCLE] falha no zap ${id}: ${e.message}`);
+        }
+        await new Promise((r) => setTimeout(r, gapMs));
+      }
+    } finally {
+      running = false;
+    }
+    console.log(`[RECYCLE] concluido: ${done} zap(s) reciclado(s)`);
+  };
+
+  const timer = setInterval(() => {
+    const now = new Date();
+    const day = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+    if (now.getHours() !== hour || now.getMinutes() > 20 || lastDay === day) return;
+    lastDay = day;
+    run().catch((e) => console.error('[RECYCLE] falhou:', e.message));
+  }, 5 * 60 * 1000);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  console.log(`[RECYCLE] reciclagem diaria as ${String(hour).padStart(2, '0')}:00 (1 zap a cada ${Math.round(gapMs / 1000)}s)`);
+  return timer;
+}
+
+// ------------------------------------------------------------
 // Mensagem Automatica - agente de campanha (ChatBox)
 // ------------------------------------------------------------
 async function deleteSentMessage(zapId, msgId) {
@@ -1781,6 +1839,7 @@ const ready = app.whenReady().then(() => {
     startServerReconciler();
     startConnectionWatchdog();
     startPairingRequestWatcher();
+    startSessionRecycler();
   }
   const statusTimer = setInterval(persistBotStatus, 30000);
   if (statusTimer && typeof statusTimer.unref === 'function') statusTimer.unref();

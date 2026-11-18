@@ -99,13 +99,15 @@ O script é **idempotente** (pode rodar de novo para atualizar sem apagar dados)
 | systemd | instala e habilita `assistente-zap.service` |
 | Nginx | publica na porta 80 com proxy de `/api/v1` e do WebSocket `/ws` |
 | Firewall | libera 22/80 (e a porta da API se `SKIP_NGINX=1`) |
+| Capacidade | swap de 8 GB + zram (RAM comprimida) |
 | Health | espera `http://127.0.0.1:3000/health` responder |
 
 Variações úteis:
 
 ```bash
 SKIP_NGINX=1 bash scripts/install.sh     # API direto na porta 3000 (HOST=0.0.0.0)
-SWAP_SIZE=8G bash scripts/install.sh     # swap maior
+SWAP_SIZE=16G bash scripts/install.sh    # swap maior
+SKIP_ZRAM=1 bash scripts/install.sh      # sem RAM comprimida
 PORT=3000 NODE_MAJOR=20 bash scripts/install.sh
 ```
 

@@ -170,9 +170,48 @@ Atualize fora do horário de atendimento.
 
 ## 10. Capacidade
 
-- **5 a 7 Zaps** por VPS de 8 GB (comece com 5).
-- Sinais de hora de uma 2ª VPS: RAM acima de ~80% constante, pareamento lento,
-  demora no envio.
+Cada Zap abre um **Chromium próprio** (o WhatsApp Web inteiro). Medição real
+com o mesmo Chrome do projeto:
+
+| Item | Consumo |
+|---|---|
+| 1 Zap ocioso (só conectado) | **~150–190 MB** de RAM |
+| 1 Zap ativo (conversas carregadas) | ~250–300 MB |
+| Perfil em disco por Zap | ~26 MB (cresce com mídia) |
+| Node + Electron + sistema | ~1 GB |
+
+Com as otimizações já aplicadas (fila de conexão, reciclagem noturna e teto de
+memória), **30 Zaps cabem numa VPS de 12 GB** com tráfego leve/moderado:
+
+- **12 GB**: 30 Zaps, sem 30 contas recebendo áudio/IA ao mesmo tempo.
+- **16 GB**: 30 Zaps com folga para pico.
+- **8 GB**: até ~15 Zaps.
+
+Sinais de hora de uma 2ª VPS: RAM acima de ~85% constante, swap sendo usado
+todo dia, pareamento lento, demora no envio.
+
+### Ajustes de capacidade (`.env`)
+
+```bash
+LINK_CONNECT_CONCURRENCY=2   # Chromium subindo ao mesmo tempo (padrao 2)
+LINK_CONNECT_GAP_MS=2000     # intervalo entre inicios (ms)
+LINK_RECYCLE_HOUR=4          # reciclagem diaria; "off" desativa
+LINK_RECYCLE_GAP_MS=120000   # 2 min entre um Zap e o proximo
+```
+
+A **reciclagem noturna** reconecta um Zap por vez às 04:00 preservando a sessão
+(não pede código de novo) para devolver a memória que o WhatsApp Web acumula
+em execuções longas. Com 30 Zaps leva cerca de 1 hora.
+
+### Ver a memória do servidor
+
+```bash
+curl -s https://seu.dominio/health | jq .resources
+```
+
+Retorna `ram` (total, livre, % em uso), `swap`, memória do processo, `loadavg`
+e número de CPUs. O `/api/v1/server/status` (com token) traz o mesmo bloco —
+é o que o app mobile futuro vai consumir para alertar.
 
 ---
 

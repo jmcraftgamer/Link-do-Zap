@@ -58,16 +58,17 @@ if [[ "${SKIP_TIMEZONE:-0}" != "1" ]] && command -v timedatectl >/dev/null 2>&1;
   timedatectl set-timezone America/Sao_Paulo || true
 fi
 
-# Swap: Electron + varias paginas do WhatsApp podem estourar 8 GB de RAM.
+# Swap: Electron + varios Chromium podem estourar a RAM. Em VPS de 12 GB com
+# 30 Zaps, 8 GB de swap e o minimo para aguentar pico de boot/audio.
 if [[ "${SKIP_SWAP:-0}" != "1" ]]; then
   if ! swapon --show 2>/dev/null | grep -q .; then
-    info "Criando swap de ${SWAP_SIZE:-4G}"
-    if fallocate -l "${SWAP_SIZE:-4G}" /swapfile 2>/dev/null; then
+    info "Criando swap de ${SWAP_SIZE:-8G}"
+    if fallocate -l "${SWAP_SIZE:-8G}" /swapfile 2>/dev/null; then
       chmod 600 /swapfile
       mkswap /swapfile >/dev/null
       swapon /swapfile
       grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
+      grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=60' >> /etc/sysctl.conf
       sysctl -p >/dev/null 2>&1 || true
       ok "swap ativo"
     else
@@ -75,6 +76,32 @@ if [[ "${SKIP_SWAP:-0}" != "1" ]]; then
     fi
   else
     ok "swap ja existe"
+  fi
+fi
+
+# zram: RAM comprimida. Paginas paradas de Chromium comprimem bem e isso da
+# folga real em pico, sem comprar mais RAM.
+if [[ "${SKIP_ZRAM:-0}" != "1" ]]; then
+  if swapon --show 2>/dev/null | grep -q zram; then
+    ok "zram ja ativo"
+  else
+    info "Configurando zram (RAM comprimida)"
+    apt-get install -y systemd-zram-generator >/dev/null 2>&1 || true
+    if [[ -d /etc/systemd ]]; then
+      cat > /etc/systemd/zram-generator.conf <<EOF
+[zram0]
+zram-size = min(ram / 2, 8192)
+compression-algorithm = zstd
+swap-priority = 100
+EOF
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl start systemd-zram-setup@zram0.service >/dev/null 2>&1 || true
+    fi
+    if swapon --show 2>/dev/null | grep -q zram; then
+      ok "zram ativo"
+    else
+      echo "aviso: zram nao subiu neste kernel (seguindo so com swap em disco)"
+    fi
   fi
 fi
 

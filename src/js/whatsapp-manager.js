@@ -2,6 +2,7 @@ const { Client, LocalAuth, MessageMedia } = require('wwebjs-electron');
 const path = require('path');
 const fs = require('fs');
 const { decryptWhatsAppMedia } = require('./media-crypto');
+const { ConnectQueue } = require('../core/connect-queue');
 
 class WhatsAppManager {
   constructor(mainWindow) {
@@ -11,6 +12,13 @@ class WhatsAppManager {
     this.onMessageCallback = null;
     // Zaps em reconexao forcada (pagina morta durante envio)
     this._reconnecting = new Set();
+    // Fila de conexao: sem limite, 30 Zaps com sessao salva abrem 30 Chromium
+    // ao mesmo tempo no boot e o pico de memoria derruba a VPS.
+    this._connectQueue = new ConnectQueue({
+      maxConcurrent: process.env.LINK_CONNECT_CONCURRENCY || 2,
+      minGapMs: process.env.LINK_CONNECT_GAP_MS || 2000,
+      maxHoldMs: process.env.LINK_CONNECT_HOLD_MS || 240000
+    });
     // Fila por chat para garantir ordem de chegada (evita audio lento processar depois de texto rapido)
     this._chatQueues = new Map();
     
@@ -756,7 +764,7 @@ class WhatsAppManager {
         // No autochat a mensagem manual do dono E a entrada da IA, entao so
         // descartamos o que sabemos ser envio nosso.
         if (isOwnSend) {
-          if (msgId && data.aiSentIds) data.aiSentIds.add(msgId);
+          if (msgId && data.aiSentIds) { data.aiSentIds.add(msgId); this._trimSet(data.aiSentIds, 500); }
           this.logToApp(zapId, 'info', `Autochat: resposta da IA ignorada (anti-loop): "${bodyTxt.substring(0, 60)}"`);
           return;
         }
@@ -786,10 +794,27 @@ class WhatsAppManager {
       const pollBrowser = setInterval(() => {
         if (tBrowser === null && client.pupPage) tBrowser = Date.now();
       }, 50);
+      // Fila global: no maximo N Chromium subindo ao mesmo tempo. Cobre boot,
+      // auto-pareamento, pedido do painel e reconexao automatica.
+      await this._connectQueue.acquire();
+      let slotHeld = true;
+      // initialize travado nao pode segurar a vaga para sempre.
+      const slotTimer = setTimeout(() => {
+        if (!slotHeld) return;
+        slotHeld = false;
+        this._connectQueue.release();
+        console.warn(`[CONNECT] Zap ${zapId}: initialize passou de ${Math.round(this._connectQueue.maxHoldMs / 1000)}s - vaga liberada`);
+      }, this._connectQueue.maxHoldMs);
+      if (slotTimer && typeof slotTimer.unref === 'function') slotTimer.unref();
       try {
         await client.initialize();
       } finally {
         clearInterval(pollBrowser);
+        clearTimeout(slotTimer);
+        if (slotHeld) {
+          slotHeld = false;
+          this._connectQueue.release();
+        }
       }
       await this._patchMediaMsgAttrs(client);
       const sec = (a, b) => ((b - a) / 1000).toFixed(1);
@@ -894,6 +919,12 @@ class WhatsAppManager {
         const clientData = this.clients.get(zapId);
         if (clientData && clientData.chats) {
           clientData.chats.set(chatId, chat);
+          // Teto: em numero com milhares de conversas o mapa crescia sem fim.
+          // Cada Chat guarda o objeto inteiro do wwebjs.
+          if (clientData.chats.size > 200) {
+            const oldest = clientData.chats.keys().next().value;
+            if (oldest !== undefined) clientData.chats.delete(oldest);
+          }
         }
       } catch (e) {
         console.log('Aviso: nao foi possivel obter chat, usando dados basicos');
@@ -1987,6 +2018,18 @@ class WhatsAppManager {
   }
 
   // Espera o zap ficar 'ready'
+  // Set limitado: descarta os itens mais antigos para nao crescer sem fim.
+  _trimSet(set, max) {
+    if (!set || set.size <= max) return;
+    const extra = set.size - max;
+    const it = set.values();
+    for (let i = 0; i < extra; i++) {
+      const v = it.next();
+      if (v.done) break;
+      set.delete(v.value);
+    }
+  }
+
   async _waitReady(zapId, maxMs) {
     const t0 = Date.now();
     while (Date.now() - t0 < maxMs) {
@@ -2130,10 +2173,7 @@ class WhatsAppManager {
       if (d && sid) {
         if (!d.aiSentIds) d.aiSentIds = new Set();
         d.aiSentIds.add(sid);
-        if (d.aiSentIds.size > 500) {
-          const first = d.aiSentIds.values().next().value;
-          d.aiSentIds.delete(first);
-        }
+        this._trimSet(d.aiSentIds, 500);
       }
     };
 
@@ -2233,6 +2273,7 @@ class WhatsAppManager {
       if (d2 && sid) {
         if (!d2.aiSentIds) d2.aiSentIds = new Set();
         d2.aiSentIds.add(sid);
+        this._trimSet(d2.aiSentIds, 500);
       }
       this.logToApp(zapId, 'success', `Midia enviada para ${targetId}: ${mediaData.name}`);
       this._recordOutgoing(zapId, targetId, mediaData.name || '[mídia]', source, sentMsg, { hasMedia: true, mimetype: mediaData.mimeType || '' });
@@ -2447,7 +2488,7 @@ class WhatsAppManager {
           if (!target) continue;
           const key = this._ensureMsgKey(target);
           if (key && data.processedMsgKeys && data.processedMsgKeys.has(key)) continue;
-          if (key) data.processedMsgKeys.add(key);
+          if (key) { data.processedMsgKeys.add(key); this._trimSet(data.processedMsgKeys, 2000); }
           // Marca antes de processar: se o envio falhar, nao repete em loop.
           this._setChatCursor(zapId, id, Number(target.timestamp) || 0);
           processed++;
@@ -2623,6 +2664,7 @@ class WhatsAppManager {
       if (d2 && sid) {
         if (!d2.aiSentIds) d2.aiSentIds = new Set();
         d2.aiSentIds.add(sid);
+        this._trimSet(d2.aiSentIds, 500);
       }
       this.logToApp(zapId, 'success', `Mensagem enviada citando a mensagem anterior para ${targetId}`);
       this._recordOutgoing(zapId, targetId, msgText, 'ai', sentMsg);
