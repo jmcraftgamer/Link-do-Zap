@@ -196,12 +196,24 @@ if [[ "$SKIP_NGINX" != "1" ]]; then
   systemctl restart nginx
 fi
 
-info "Configurando firewall (22/80)"
+info "Configurando firewall (SSH/80)"
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow 22/tcp >/dev/null || true
+  # Provedores como HostGator movem o SSH para outra porta (ex.: 22022).
+  # Liberar so a 22 e ligar o ufw derrubaria o acesso na proxima conexao.
+  SSH_PORT="${SSH_PORT:-}"
+  if [[ -z "$SSH_PORT" && -f /etc/ssh/sshd_config ]]; then
+    SSH_PORT="$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config | awk '{print $2}' | head -n1 || true)"
+  fi
+  if [[ -z "$SSH_PORT" ]] && command -v ss >/dev/null 2>&1; then
+    SSH_PORT="$(ss -lntp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | head -n1 || true)"
+  fi
+  SSH_PORT="${SSH_PORT:-22}"
+  ufw allow "$SSH_PORT/tcp" >/dev/null || true
+  [[ "$SSH_PORT" != "22" ]] && ufw allow 22/tcp >/dev/null || true
   ufw allow 80/tcp >/dev/null || true
   [[ "$SKIP_NGINX" == "1" ]] && ufw allow "$PORT"/tcp >/dev/null || true
   ufw --force enable >/dev/null || true
+  ok "firewall ativo (porta SSH $SSH_PORT liberada)"
 fi
 
 if [[ -n "$BACKUP_PASS" ]]; then
