@@ -178,11 +178,39 @@ if [[ "$SKIP_NGINX" == "1" ]]; then
   sed -i "s/^HOST=.*/HOST=0.0.0.0/" "$APP_DIR/.env"
 fi
 
+# Transcricao local (whisper.cpp): binario + modelo + servico systemd.
+# Roda ANTES do backend para o motor estar no ar quando o bot subir. Falha
+# aqui nao impede o bot de funcionar: os audios ficam na fila persistente.
+if [[ "${SKIP_STT:-0}" != "1" && -f "$APP_DIR/scripts/install-stt.sh" ]]; then
+  info "Instalando transcricao local (whisper.cpp)"
+  bash "$APP_DIR/scripts/install-stt.sh" || echo "aviso: STT local nao instalado; o bot continua no ar" >&2
+fi
+
 info "Instalando servico systemd"
 install -m 0644 "$APP_DIR/deploy/assistente-zap.service" /etc/systemd/system/assistente-zap.service
 systemctl daemon-reload
 systemctl enable assistente-zap >/dev/null
 systemctl restart assistente-zap
+
+# ------------------------------------------------------------
+# Reinicio da VPS pelo painel
+# ------------------------------------------------------------
+# O botao "Reiniciar servidor" do painel precisa reiniciar a maquina. O
+# backend roda como usuario comum, entao a permissao fica num script root
+# dedicado: nada de liberar "systemctl" inteiro no sudoers.
+info "Liberando reinicio da VPS para o painel"
+cat > /usr/local/sbin/link-reboot <<'EOF'
+#!/bin/sh
+# Unico comando que o usuario do bot pode rodar como root.
+exec /usr/bin/systemctl reboot --no-block
+EOF
+chmod 0755 /usr/local/sbin/link-reboot
+chown root:root /usr/local/sbin/link-reboot
+cat > /etc/sudoers.d/assistente-zap-reboot <<EOF
+$APP_USER ALL=(root) NOPASSWD: /usr/local/sbin/link-reboot
+EOF
+chmod 0440 /etc/sudoers.d/assistente-zap-reboot
+visudo -cf /etc/sudoers.d/assistente-zap-reboot >/dev/null || rm -f /etc/sudoers.d/assistente-zap-reboot
 
 if [[ "$SKIP_NGINX" != "1" ]]; then
   info "Configurando Nginx na porta 80"

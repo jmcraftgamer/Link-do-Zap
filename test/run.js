@@ -1,12 +1,14 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const root = path.join(__dirname, '..');
 const resolver = require(path.join(root, 'src', 'js', 'media-resolver'));
 const AIResponder = require(path.join(root, 'src', 'js', 'ai-responder'));
 const ConversationStore = require(path.join(root, 'src', 'js', 'conversation-store'));
 const WhatsAppManager = require(path.join(root, 'src', 'js', 'whatsapp-manager'));
+const { BotMonitor } = require(path.join(root, 'src', 'js', 'monitor'));
 
 let passed = 0;
 const failures = [];
@@ -322,6 +324,263 @@ function makeManager(sendImpl) {
   return { mgr, state };
 }
 
+function makeWhatsAppPage(socket, hasSynced) {
+  return {
+    closed: false,
+    isClosed: () => false,
+    isClosed() { return this.closed; },
+    async close() { this.closed = true; },
+    async evaluate(fn) {
+      return vm.runInNewContext(`(${fn.toString()})()`, {
+        window: { require: () => ({ Socket: { state: socket, hasSynced } }) }
+      });
+    }
+  };
+}
+
+testAsync('inicializacao: escolhe a pagina sincronizada e fecha abas restauradas', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.logToApp = () => {};
+  const current = makeWhatsAppPage('UNLAUNCHED', false);
+  const active = makeWhatsAppPage('CONNECTED', true);
+  const extra = makeWhatsAppPage('UNLAUNCHED', false);
+  const client = { pupPage: current, pupBrowser: { pages: async () => [current, active, extra] } };
+  await mgr._prepareWhatsAppPage(client, 'zap1');
+  assert.strictEqual(client.pupPage, active);
+  assert.strictEqual(current.closed, true);
+  assert.strictEqual(extra.closed, true);
+  assert.strictEqual(active.closed, false);
+});
+
+testAsync('inicializacao: reexecuta o handler oficial se o sync ja aconteceu', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.logToApp = () => {};
+  mgr.clients.set('zap1', { status: 'connecting' });
+  let calls = 0;
+  const windowMock = {
+    require: () => ({ Socket: { state: 'CONNECTED', hasSynced: true } }),
+    onAppStateHasSyncedEvent: async () => { calls++; windowMock.WWebJS = {}; }
+  };
+  const page = {
+    isClosed: () => false,
+    evaluate: async (fn) => vm.runInNewContext(`(${fn.toString()})()`, { window: windowMock })
+  };
+  await mgr._finalizeSyncedWhatsApp({ pupPage: page }, 'zap1');
+  assert.strictEqual(calls, 1);
+  assert.ok(windowMock.WWebJS);
+});
+
+testAsync('heartbeat: Zap conectado e ocioso permanece saudavel', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.logToApp = () => {};
+  const page = makeWhatsAppPage('CONNECTED', true);
+  mgr.clients.set('zap1', { status: 'ready', client: { pupPage: page } });
+  mgr._lastHeartbeat.set('zap1', Date.now() - mgr._heartbeatTimeout - 1000);
+  let reconnects = 0;
+  mgr._forceReconnect = async () => { reconnects++; };
+
+  await mgr._checkHeartbeat('zap1');
+
+  assert.strictEqual(reconnects, 0);
+  assert.ok(Date.now() - mgr._lastHeartbeat.get('zap1') < 1000);
+});
+
+testAsync('heartbeat: falha transitoria nao reinicia antes da janela de tolerancia', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.logToApp = () => {};
+  mgr.clients.set('zap1', { status: 'ready', client: { pupPage: {
+    isClosed: () => false,
+    evaluate: async () => { throw new Error('pagina ocupada'); }
+  } } });
+  mgr._lastHeartbeat.set('zap1', Date.now());
+  let reconnects = 0;
+  mgr._forceReconnect = async () => { reconnects++; };
+
+  await mgr._checkHeartbeat('zap1');
+
+  assert.strictEqual(reconnects, 0);
+});
+
+testAsync('heartbeat: falha persistente reconecta depois do timeout real', async () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.logToApp = () => {};
+  mgr.clients.set('zap1', { status: 'ready', client: { pupPage: {
+    isClosed: () => false,
+    evaluate: async () => { throw new Error('sem resposta'); }
+  } } });
+  mgr._lastHeartbeat.set('zap1', Date.now() - mgr._heartbeatTimeout - 1000);
+  const critical = [];
+  let reconnects = 0;
+  mgr.logCriticalEvent = (zapId, type, details) => critical.push({ zapId, type, details });
+  mgr._forceReconnect = async () => { reconnects++; };
+
+  await mgr._checkHeartbeat('zap1');
+
+  assert.strictEqual(reconnects, 1);
+  assert.strictEqual(critical.length, 1);
+  assert.strictEqual(critical[0].type, 'heartbeat_timeout');
+});
+
+testAsync('mensagem: reentrega simultanea gera um log, um historico e uma chamada de IA', async () => {
+  const mgr = new WhatsAppManager(null);
+  const logs = [];
+  const rendered = [];
+  let aiCalls = 0;
+  mgr.logToApp = (zapId, level, msg) => logs.push({ level, msg });
+  mgr.sendToRenderer = (...args) => rendered.push(args);
+  mgr.persistContacts = () => {};
+  mgr._setChatCursor = () => {};
+  mgr.onMessageCallback = async () => { aiCalls++; };
+  mgr.clients.set('zap-dedupe', {
+    status: 'ready',
+    client: {},
+    messages: new Map(),
+    chats: new Map(),
+    processedMsgKeys: new Set(),
+    newestMsgTs: 0,
+    chatCursors: new Map()
+  });
+  const msg = {
+    id: { fromMe: false, remote: 'remote-1', id: '1' },
+    from: '5511999999999@c.us',
+    to: '553299344496@c.us',
+    body: 'oi',
+    timestamp: Math.floor(Date.now() / 1000),
+    type: 'chat',
+    hasMedia: false,
+    _data: {},
+    getContact: async () => ({ name: 'Maria', pushname: '', id: { user: '5511999999999' } }),
+    getChat: async () => ({ id: { _serialized: '5511999999999@c.us' }, name: 'Maria', isGroup: false })
+  };
+
+  await Promise.all([mgr.handleMessage('zap-dedupe', msg), mgr.handleMessage('zap-dedupe', msg)]);
+
+  assert.strictEqual(aiCalls, 1);
+  assert.strictEqual(logs.filter((entry) => entry.level === 'incoming' && entry.msg.startsWith('Recebido')).length, 1);
+  assert.strictEqual(rendered.filter(([event]) => event === 'whatsapp-message').length, 1);
+  assert.strictEqual(mgr.conversations.get('zap-dedupe').get('5511999999999@c.us').messages.length, 1);
+});
+
+test('mensagem: reentrega de mensagem propria tambem e descartada', () => {
+  const mgr = new WhatsAppManager(null);
+  const data = { processedMsgKeys: new Set() };
+  const msg = { id: { fromMe: true, remote: 'remote-1', id: '2' } };
+  assert.strictEqual(mgr._claimMessageKey(data, msg), true);
+  assert.strictEqual(mgr._claimMessageKey(data, msg), false);
+  assert.strictEqual(data.processedMsgKeys.size, 1);
+});
+
+test('mensagem: recebidas e message_create usam deduplicacao independente', () => {
+  const mgr = new WhatsAppManager(null);
+  const data = { processedMsgKeys: new Set(), processedCreateKeys: new Set() };
+  const msg = { id: { fromMe: true, remote: 'remote-1', id: '3' } };
+  assert.strictEqual(mgr._claimMessageKey(data, msg, 'processedCreateKeys'), true);
+  assert.strictEqual(mgr._claimMessageKey(data, msg), true);
+  assert.strictEqual(mgr._claimMessageKey(data, msg, 'processedCreateKeys'), false);
+  assert.strictEqual(mgr._claimMessageKey(data, msg), false);
+});
+
+function makeIncomingMessage(overrides) {
+  return Object.assign({
+    id: { fromMe: false, remote: 'remote-lid', id: '4' },
+    from: '166687848546375@lid',
+    to: '5532999344496@c.us',
+    body: 'Oii',
+    timestamp: Math.floor(Date.now() / 1000),
+    type: 'chat',
+    hasMedia: false,
+    _data: {},
+    getContact: async () => ({ name: 'Mae', pushname: '', id: { user: '166687848546375' } }),
+    getChat: async () => ({ id: { _serialized: '166687848546375@lid' }, name: 'Mae', isGroup: false })
+  }, overrides || {});
+}
+
+function makeIncomingManager(callback) {
+  const mgr = new WhatsAppManager(null);
+  const logs = [];
+  const rendered = [];
+  mgr.logToApp = (zapId, level, msg) => logs.push({ level, msg });
+  mgr.sendToRenderer = (...args) => rendered.push(args);
+  mgr.persistContacts = () => {};
+  mgr._setChatCursor = () => {};
+  mgr.onMessageCallback = callback;
+  mgr.clients.set('zap-lid', {
+    status: 'ready',
+    client: {},
+    messages: new Map(),
+    chats: new Map(),
+    processedMsgKeys: new Set(),
+    processedCreateKeys: new Set(),
+    newestMsgTs: 0,
+    chatCursors: new Map(),
+    selfNumber: '553299344496',
+    selfNumberAlt: '5532999344496'
+  });
+  return { mgr, logs, rendered };
+}
+
+testAsync('mensagem: filtro rejeitado nao gera log de recebida', async () => {
+  const { mgr, logs } = makeIncomingManager(async () => ({ ok: false, accepted: false, reason: 'blocked_contact' }));
+  const result = await mgr.handleMessage('zap-lid', makeIncomingMessage());
+  assert.strictEqual(result.accepted, false);
+  assert.strictEqual(logs.filter((entry) => entry.level === 'incoming' && entry.msg.startsWith('Recebido')).length, 0);
+});
+
+testAsync('mensagem: falha no callback libera a chave e nova tentativa nao duplica historico', async () => {
+  let calls = 0;
+  const { mgr, logs, rendered } = makeIncomingManager(async () => {
+    calls++;
+    if (calls === 1) throw new Error('falha temporaria');
+    return { ok: true, accepted: true };
+  });
+  const msg = makeIncomingMessage();
+  const first = await mgr.handleMessage('zap-lid', msg);
+  const second = await mgr.handleMessage('zap-lid', msg);
+  assert.strictEqual(first.retry, true);
+  assert.strictEqual(second.accepted, true);
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(logs.filter((entry) => entry.level === 'incoming' && entry.msg.startsWith('Recebido')).length, 1);
+  assert.strictEqual(rendered.filter(([event]) => event === 'whatsapp-message').length, 1);
+  assert.strictEqual(mgr.conversations.get('zap-lid').get('166687848546375@lid').messages.length, 1);
+});
+
+testAsync('mensagem: LID usa o numero real do cache e atualiza o contato', async () => {
+  let received = null;
+  const { mgr } = makeIncomingManager(async (messageData) => {
+    received = messageData;
+    return { ok: true, accepted: true };
+  });
+  mgr.conversations.set('zap-lid', new Map([['166687848546375@lid', {
+    contact: { id: '166687848546375@lid', name: 'Mae', number: '553299203662' },
+    messages: [],
+    lastMessage: null
+  }]]));
+  await mgr.handleMessage('zap-lid', makeIncomingMessage());
+  assert.strictEqual(received.contact.number, '553299203662');
+  assert.strictEqual(received.contact.id, '553299203662@s.whatsapp.net');
+  assert.strictEqual(received.chat.id, '166687848546375@lid');
+  assert.strictEqual(mgr.conversations.get('zap-lid').get('166687848546375@lid').contact.id, '553299203662@s.whatsapp.net');
+});
+
+testAsync('mensagem: autochat continua sendo enviado para a IA', async () => {
+  let received = null;
+  const { mgr, logs } = makeIncomingManager(async (messageData) => {
+    received = messageData;
+    return { ok: true, accepted: true };
+  });
+  const msg = makeIncomingMessage({
+    id: { fromMe: true, remote: '553299344496@c.us', id: '5' },
+    from: '553299344496@c.us',
+    to: '553299344496@c.us',
+    fromMe: true,
+    getChat: async () => ({ id: { _serialized: '553299344496@c.us' }, name: 'Eu', isGroup: false })
+  });
+  await mgr.handleMessage('zap-lid', msg);
+  assert.ok(received);
+  assert.strictEqual(received.selfChat, true);
+  assert.strictEqual(logs.filter((entry) => entry.level === 'outgoing' && entry.msg.startsWith('Mensagem para si mesmo')).length, 1);
+});
+
 const MEDIA = { data: 'aGVsbG8=', mimeType: 'image/png', name: 'menu.png' };
 
 testAsync('REGRESSAO: sendMedia com retorno undefined chama sendMessage UMA vez', async () => {
@@ -359,6 +618,34 @@ testAsync('dono: markOwnerReply guarda o horario e so vale DEPOIS da mensagem', 
   assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 1000), false, 'resposta no mesmo segundo nao conta');
   mgr.markOwnerReply('zap1', '5511999999999@c.us', 500); // mais antigo: nao regride
   assert.strictEqual(await mgr.hasOwnerReplied('zap1', '5511999999999@c.us', 0), true);
+});
+
+testAsync('dono: getChat falho nao perde historico e reentrega nao duplica', async () => {
+  const mgr = new WhatsAppManager(null);
+  const lid = '142958774997157@lid';
+  mgr.conversations.set('zap1', new Map([[lid, {
+    contact: { id: '553299344496@s.whatsapp.net', name: 'Maria', number: '553299344496' },
+    messages: [],
+    lastMessage: null
+  }]]));
+  mgr.persistContacts = () => {};
+  mgr.sendToRenderer = () => {};
+  const msg = {
+    id: 'owner-1',
+    body: 'oi',
+    hasMedia: false,
+    timestamp: 123,
+    getChat: async () => { throw new Error('r'); }
+  };
+
+  await mgr._recordOwnerMessage('zap1', msg, lid);
+  await mgr._recordOwnerMessage('zap1', msg, lid);
+
+  const conv = mgr.conversations.get('zap1').get(lid);
+  assert.strictEqual(conv.messages.length, 1);
+  assert.strictEqual(conv.messages[0].origin, 'owner');
+  assert.strictEqual(conv.messages[0].chat.id, lid);
+  assert.strictEqual(conv.messages[0].contact.number, '553299344496');
 });
 
 testAsync('dono: hasOwnerReplied confere ao vivo (fromMe nao-web)', async () => {
@@ -402,6 +689,44 @@ testAsync('dono: replyMessage sem mensagem em cache cai no envio normal', async 
 
 // ================= HORARIO DE ATENDIMENTO =================
 const { isWithinWorkHours } = require(path.join(root, 'src', 'js', 'work-hours'));
+const { isContactBlocked } = require(path.join(root, 'src', 'core', 'messaging', 'pipeline'));
+
+test('bloqueio: lista vazia ou sem candidatos nunca bloqueia', () => {
+  assert.strictEqual(isContactBlocked(['5511999999999@c.us'], []), false);
+  assert.strictEqual(isContactBlocked([], ['5511999999999@s.whatsapp.net']), false);
+  assert.strictEqual(isContactBlocked(['', null, undefined], ['5511999999999@s.whatsapp.net']), false);
+});
+
+test('bloqueio: bate JID igual e formatos diferentes do mesmo numero', () => {
+  const blocked = ['553299344496@s.whatsapp.net'];
+  assert.strictEqual(isContactBlocked(['553299344496@c.us'], blocked), true, 'c.us vs s.whatsapp.net');
+  assert.strictEqual(isContactBlocked(['553299344496@s.whatsapp.net'], blocked), true);
+  assert.strictEqual(isContactBlocked(['553299344496'], blocked), true, 'so numero');
+});
+
+test('bloqueio: mensagem via @lid bate pelo numero do contato resolvido', () => {
+  const blocked = ['553299344496@s.whatsapp.net'];
+  // WhatsApp entrega por @lid (hash), mas o contact.number resolvido e o real.
+  assert.strictEqual(isContactBlocked(['111222333444555@lid', '553299344496@s.whatsapp.net'], blocked), true);
+  assert.strictEqual(isContactBlocked(['111222333444555@lid'], blocked), false, 'lid sozinho nao bate');
+});
+
+test('bloqueio: entrada salva como @lid bate quando a mensagem chega por @lid', () => {
+  const blocked = ['111222333444555@s.whatsapp.net'];
+  assert.strictEqual(isContactBlocked(['111222333444555@lid'], blocked), true);
+});
+
+test('bloqueio: sufixo de aparelho (:12) e DDI 55 nao quebram a comparacao', () => {
+  const blocked = ['553299344496:12@c.us'];
+  assert.strictEqual(isContactBlocked(['553299344496@c.us'], blocked), true);
+  assert.strictEqual(isContactBlocked(['3299344496'], ['553299344496@s.whatsapp.net']), true, 'sem DDI');
+  assert.strictEqual(isContactBlocked(['553299344496'], ['3299344496']), true, 'com DDI');
+  assert.strictEqual(isContactBlocked(['553299344497@c.us'], ['553299344496@s.whatsapp.net']), false);
+});
+
+test('bloqueio: numero de outro zap nao bloqueia', () => {
+  assert.strictEqual(isContactBlocked(['553299999999@c.us'], ['553288888888@s.whatsapp.net']), false);
+});
 
 test('horario: desativado nao bloqueia nunca', () => {
   assert.strictEqual(isWithinWorkHours(null), true);
@@ -421,6 +746,14 @@ test('horario: janela que vira o dia (22:00 -> 06:00)', () => {
   assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 23, 0)), true);
   assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 5, 0)), true);
   assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 5, 12, 0)), false);
+});
+
+test('horario: dias da janela noturna incluem a madrugada do dia seguinte', () => {
+  const wh = { enabled: true, start: '22:00', end: '06:00', days: [5] };
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 9, 23, 0)), true, 'sexta a noite');
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 10, 5, 0)), true, 'sabado de madrugada');
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 10, 23, 0)), false, 'sabado a noite');
+  assert.strictEqual(isWithinWorkHours(wh, new Date(2026, 0, 9, 12, 0)), false, 'sexta de dia');
 });
 
 test('horario: dias da semana (vazio = todos)', () => {
@@ -863,6 +1196,82 @@ test('FORMATO: exemplos do prompt nao ensinam a IA a usar "!"', () => {
   const secao = ai.buildNaturalTalkSection();
   assert.strictEqual(/Sim!|Beleza!|Entendi!|Tranquilo!|Bem-vindo!|Obrigado!|estamos abertos!/.test(secao), false,
     'exemplo com "!" ensina a IA a usar "!"');
+});
+
+test('monitor: verificacao saudavel e silenciosa e transicoes aparecem uma vez', () => {
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  const lines = [];
+  console.log = (...args) => lines.push(['log', ...args].join(' '));
+  console.warn = (...args) => lines.push(['warn', ...args].join(' '));
+  console.error = (...args) => lines.push(['error', ...args].join(' '));
+  try {
+    const health = { totalSessions: 1, healthySessions: 1, totalCriticalEvents: 99, sessions: [] };
+    const monitor = new BotMonitor({ getSystemHealth: () => health });
+    monitor.checkHealth();
+    monitor.checkHealth();
+    assert.strictEqual(lines.length, 0, 'verificacao saudavel nao pode poluir o log');
+
+    health.totalSessions = 2;
+    health.healthySessions = 1;
+    monitor.checkHealth();
+    monitor.checkHealth();
+    assert.strictEqual(lines.length, 1, 'estado degradado repetido');
+    assert.ok(lines[0].startsWith('warn [MONITOR] Sistema degradado'));
+
+    health.healthySessions = 2;
+    monitor.checkHealth();
+    assert.strictEqual(lines.length, 2, 'recuperacao deve ser registrada uma vez');
+    assert.ok(lines[1].startsWith('log [MONITOR] Sistema recuperado'));
+  } finally {
+    console.log = original.log;
+    console.warn = original.warn;
+    console.error = original.error;
+  }
+});
+
+test('criticos: eventos informativos nao entram no contador nem no console', () => {
+  const mgr = new WhatsAppManager(null);
+  mgr.sendToRenderer = () => {};
+  const originalError = console.error;
+  const lines = [];
+  console.error = (...args) => lines.push(args.map(String).join(' '));
+  try {
+    ['session_ready', 'auto_reconnect_triggered', 'auto_reconnect_success', 'session_disconnected',
+      'send_failed_retry', 'checkpoint_saved', 'session_recovery_started', 'session_recovery_success',
+      'session_reconnect_success'].forEach((type) => mgr.logCriticalEvent('z1', type, type));
+    assert.strictEqual(mgr.getCriticalEvents().length, 0);
+    assert.strictEqual(lines.length, 0);
+
+    mgr.logCriticalEvent('z1', 'heartbeat_timeout', 'WhatsApp sem resposta');
+    assert.strictEqual(mgr.getCriticalEvents().length, 1);
+    assert.strictEqual(lines.length, 1);
+    assert.ok(lines[0].includes('[CRITICAL][heartbeat_timeout]'));
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('terminal: horario nao vira fonte do log critico', () => {
+  const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  const classifyMatch = src.match(/function classifyTerminalLevel\(msg\) \{[\s\S]*?\n\}/);
+  const parseMatch = src.match(/function parseConsoleLine\(line\) \{[\s\S]*?\n\}/);
+  assert.ok(classifyMatch && parseMatch, 'parser do terminal nao encontrado');
+  const classify = vm.runInNewContext(`(${classifyMatch[0]})`);
+  const parse = vm.runInNewContext(`(${parseMatch[0]})`, { classifyTerminalLevel: classify });
+  const parsed = parse('2026-11-24T12:03:13.000Z [12:03:13][CRITICAL][heartbeat_timeout] Zap Z1: WhatsApp sem resposta');
+  assert.strictEqual(parsed.source, 'CRITICAL');
+  assert.strictEqual(parsed.level, 'error');
+  assert.ok(parsed.msg.includes('[heartbeat_timeout] Zap Z1'));
+});
+
+test('terminal: alta demanda do provedor e pausa de fallback nao contam como erro', () => {
+  const src = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  const match = src.match(/function classifyTerminalLevel\(msg\) \{[\s\S]*?\n\}/);
+  assert.ok(match, 'classificador de terminal nao encontrado');
+  const classify = vm.runInNewContext(`(${match[0]})`);
+  assert.strictEqual(classify('Falha em Google AI Studio: This model is currently experiencing high demand.'), 'warn');
+  assert.strictEqual(classify('Pulando Google AI Studio|gemini (falhou recentemente)'), 'info');
+  assert.strictEqual(classify('Falha ao autenticar no WhatsApp'), 'error');
 });
 
 async function runPending() {

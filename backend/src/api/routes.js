@@ -1,47 +1,9 @@
 // Rotas da API v1. Cada rota delega para o mesmo handler que o IPC do Setup
 // usa (runtime.invoke), mantendo uma unica implementacao da regra de negocio.
 const path = require('path');
-const os = require('os');
 const fs = require('fs');
 const billingCore = require('../../../src/core/billing');
-
-// RAM/swap reais do servidor. Em Linux usa MemAvailable (o MemFree puro
-// ignora cache e mostra a maquina "cheia" sem motivo). Fallback para os.*
-// em Windows/macOS, onde o teste roda.
-function readMemory() {
-  try {
-    const txt = fs.readFileSync('/proc/meminfo', 'utf8');
-    const read = (key) => {
-      const m = txt.match(new RegExp(`^${key}:\\s+(\\d+) kB`, 'm'));
-      return m ? Number(m[1]) * 1024 : null;
-    };
-    const total = read('MemTotal');
-    const available = read('MemAvailable');
-    const swapTotal = read('SwapTotal') || 0;
-    const swapFree = read('SwapFree');
-    if (total && available != null) {
-      return { total, available, swapTotal, swapUsed: swapFree == null ? 0 : Math.max(0, swapTotal - swapFree) };
-    }
-  } catch (_) { /* nao e Linux */ }
-  const total = os.totalmem();
-  const available = os.freemem();
-  return { total, available, swapTotal: 0, swapUsed: 0 };
-}
-
-// Bloco de recursos exposto em /health e /server/status. O app mobile futuro
-// consome o mesmo endpoint para avisar quando a VPS estiver no limite.
-function resourcesSnapshot() {
-  const mem = readMemory();
-  const mb = (bytes) => Math.round(Number(bytes) / 1048576);
-  const usedPct = mem.total ? Math.round(((mem.total - mem.available) / mem.total) * 100) : 0;
-  return {
-    ram: { totalMB: mb(mem.total), availableMB: mb(mem.available), usedPct },
-    swap: { totalMB: mb(mem.swapTotal), usedMB: mb(mem.swapUsed) },
-    processMB: mb(process.memoryUsage().rss),
-    loadavg: os.loadavg().map((n) => Math.round(n * 100) / 100),
-    cpus: (os.cpus() || []).length
-  };
-}
+const { resourcesSnapshot } = require('../../../src/core/resources');
 
 function asArray(value, fallback = []) {
   return Array.isArray(value) ? value : fallback;
@@ -51,12 +13,27 @@ function normalizeContactId(value) {
   return String(value == null ? '' : value).trim();
 }
 
+function contactNumber(value) {
+  return normalizeContactId(value).split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
 function sameContact(a, b) {
   const x = normalizeContactId(a);
   const y = normalizeContactId(b);
   if (!x || !y) return false;
   if (x === y) return true;
-  return x.split('@')[0] === y.split('@')[0];
+  const nx = contactNumber(x);
+  const ny = contactNumber(y);
+  if (!nx || !ny) return false;
+  if (nx === ny) return true;
+  if (/^55\d{10,13}$/.test(nx) && nx.slice(2) === ny) return true;
+  return /^55\d{10,13}$/.test(ny) && ny.slice(2) === nx;
+}
+
+function contactAliases(record) {
+  const contact = (record && record.contact) || {};
+  return [...new Set([record && record.chatId, record && record.id, contact.id, contact.number, record && record.number]
+    .map(normalizeContactId).filter(Boolean))];
 }
 
 function isBlocked(zap, contactId) {
@@ -124,6 +101,19 @@ function createRoutes({ runtime, config }) {
     return { zap, records };
   }
 
+  async function resolveContactAliases(zapId, values) {
+    const aliases = [...new Set(values.map(normalizeContactId).filter(Boolean))];
+    try {
+      const { records } = await contactsOf(zapId);
+      const record = records.find((item) => {
+        const ids = contactAliases(item);
+        return aliases.some((alias) => ids.some((id) => sameContact(alias, id)));
+      });
+      if (record) return contactAliases(record);
+    } catch (_) {}
+    return aliases;
+  }
+
   return [
     // ------------------------------------------------------------ raiz/health
     {
@@ -184,12 +174,29 @@ function createRoutes({ runtime, config }) {
         let extra = {};
         try { extra = (await invoke('server-status')) || {}; } catch (_) {}
         const state = runtime.buildStatusState ? runtime.buildStatusState() : {};
-        return { ...extra, ...state, ok: true, resources: resourcesSnapshot() };
+        let transcription = null;
+        try { transcription = await invoke('stt-status'); } catch (_) {}
+        return { ...extra, ...state, ok: true, resources: resourcesSnapshot(), transcription };
+      }
+    },
+    {
+      // Diagnostico isolado do servico de transcricao local (fila, motor,
+      // cache, recursos e metricas). Autenticado como o restante do painel.
+      method: 'GET', path: '/transcription/status',
+      handler: async () => {
+        let transcription = null;
+        try { transcription = await invoke('stt-status'); } catch (_) {}
+        return { ok: true, transcription };
       }
     },
     {
       method: 'POST', path: '/server/power',
       handler: (ctx) => invoke('server-power', !!(ctx.body && ctx.body.running))
+    },
+    {
+      // Reinicia a VPS inteira (o bot volta sozinho pelo systemd).
+      method: 'POST', path: '/server/restart',
+      handler: () => invoke('server-restart')
     },
     {
       method: 'POST', path: '/server/sync-now',
@@ -375,13 +382,17 @@ function createRoutes({ runtime, config }) {
     {
       method: 'POST', path: '/zaps/:id/contacts/block',
       handler: async (ctx) => {
-        const contactId = normalizeContactId(ctx.body && (ctx.body.contactId || ctx.body.id || ctx.body.chatId));
+        const body = ctx.body || {};
+        const contactId = normalizeContactId(body.contactId || body.id || body.chatId);
         if (!contactId) throw Object.assign(new Error('informe contactId'), { status: 400 });
+        const aliases = await resolveContactAliases(ctx.params.id, [contactId, ...asArray(body.aliases)]);
         const list = await loadZaps();
         const zap = list.find((z) => String(z.id) === String(ctx.params.id));
         if (!zap) throw Object.assign(new Error('zap nao encontrado'), { status: 404 });
         if (!Array.isArray(zap.blockedContacts)) zap.blockedContacts = [];
-        if (!zap.blockedContacts.some((b) => sameContact(b, contactId))) zap.blockedContacts.push(contactId);
+        for (const alias of aliases) {
+          if (!zap.blockedContacts.some((b) => sameContact(b, alias))) zap.blockedContacts.push(alias);
+        }
         await saveZaps(list);
         return { ok: true, blocked: zap.blockedContacts.length };
       }
@@ -389,12 +400,12 @@ function createRoutes({ runtime, config }) {
     {
       method: 'DELETE', path: '/zaps/:id/contacts/block/:contactId',
       handler: async (ctx) => {
-        const contactId = ctx.params.contactId;
+        const aliases = await resolveContactAliases(ctx.params.id, [ctx.params.contactId]);
         const list = await loadZaps();
         const zap = list.find((z) => String(z.id) === String(ctx.params.id));
         if (!zap) throw Object.assign(new Error('zap nao encontrado'), { status: 404 });
         const before = asArray(zap.blockedContacts);
-        zap.blockedContacts = before.filter((b) => !sameContact(b, contactId));
+        zap.blockedContacts = before.filter((b) => !aliases.some((alias) => sameContact(b, alias)));
         await saveZaps(list);
         return { ok: true, removed: before.length - zap.blockedContacts.length, blocked: zap.blockedContacts.length };
       }
@@ -402,11 +413,12 @@ function createRoutes({ runtime, config }) {
     {
       method: 'POST', path: '/zaps/:id/contacts/:contactId/authorize',
       handler: async (ctx) => {
+        const aliases = await resolveContactAliases(ctx.params.id, [ctx.params.contactId]);
         const list = await loadZaps();
         const zap = list.find((z) => String(z.id) === String(ctx.params.id));
         if (!zap) throw Object.assign(new Error('zap nao encontrado'), { status: 404 });
         const before = asArray(zap.blockedContacts);
-        zap.blockedContacts = before.filter((b) => !sameContact(b, ctx.params.contactId));
+        zap.blockedContacts = before.filter((b) => !aliases.some((alias) => sameContact(b, alias)));
         await saveZaps(list);
         return { ok: true, removed: before.length - zap.blockedContacts.length };
       }
@@ -421,11 +433,11 @@ function createRoutes({ runtime, config }) {
         if (!Array.isArray(target.blockedContacts)) target.blockedContacts = [];
         let added = 0;
         for (const c of records) {
-          const id = c.chatId || c.id;
-          if (!id) continue;
-          if (!target.blockedContacts.some((b) => sameContact(b, id))) {
-            target.blockedContacts.push(id);
-            added++;
+          for (const id of contactAliases(c)) {
+            if (!target.blockedContacts.some((b) => sameContact(b, id))) {
+              target.blockedContacts.push(id);
+              added++;
+            }
           }
         }
         await saveZaps(list);
@@ -552,7 +564,9 @@ function createRoutes({ runtime, config }) {
       method: 'GET', path: '/logs',
       handler: async (ctx) => {
         const lines = asArray(await invoke('server-terminal-logs'));
-        const limit = Number(ctx.query.limit) || 500;
+        // O log so some quando o usuario limpa: entrega o historico completo
+        // (mesmo teto de 20k linhas que o app local mantem em memoria).
+        const limit = Math.max(1, Math.min(20000, Number(ctx.query.limit) || 20000));
         return { ok: true, lines: lines.slice(-limit) };
       }
     },

@@ -718,7 +718,7 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
     return !verifyMessage(t, { allowKnownMarkers: true }).ok;
   }
 
-  async generateResponse(messageData, zapConfig, allProviders) {
+  async generateResponse(messageData, zapConfig, allProviders, useFallback = true) {
     const { zapId, body, from, chat } = messageData;
 
     if (!zapConfig || !zapConfig.provider || !zapConfig.model) {
@@ -763,7 +763,7 @@ NOME DO CLIENTE: ${contactName}
     });
 
     // Add all other models from all providers as fallback
-    if (allProviders && Array.isArray(allProviders)) {
+    if (useFallback && allProviders && Array.isArray(allProviders)) {
       for (const provider of allProviders) {
         if (!provider.models) continue;
         // Chave efetiva do provedor (apiKeys[] > apiKey legado) - sem isso,
@@ -797,12 +797,12 @@ NOME DO CLIENTE: ${contactName}
     let lastError = null;
     for (const entry of fallbackQueue) {
       if (!this.isModelAvailable(entry.key)) {
-        console.log(`[FALLBACK] Pulando ${entry.key} (falhou recentemente)`);
+        if (useFallback) console.log(`[FALLBACK] Pulando ${entry.key} (falhou recentemente)`);
         continue;
       }
 
       try {
-        console.log(`[FALLBACK] Tentando ${entry.provider.name} / ${entry.model.id}...`);
+        if (useFallback) console.log(`[FALLBACK] Tentando ${entry.provider.name} / ${entry.model.id}...`);
         const response = await this.callAI(entry.provider, entry.model, messages);
         let text = typeof response === 'string' ? response.trim() : '';
         let verdict = text
@@ -833,24 +833,30 @@ NOME DO CLIENTE: ${contactName}
           this.markModelSuccess(entry.key);
           this.addToHistory(zapId, chat.id, 'user', body);
           this.addToHistory(zapId, chat.id, 'assistant', text);
-          console.log(`[FALLBACK] Sucesso com ${entry.provider.name} / ${entry.model.id}`);
+          if (useFallback) console.log(`[FALLBACK] Sucesso com ${entry.provider.name} / ${entry.model.id}`);
           return text;
         }
         if (text.length > 0) {
           lastError = `Resposta reprovada pelo verificador (${verdict.reason})`;
           this.markModelFailed(entry.key);
-          console.log(`[GUARD] ${entry.key} descartado (${verdict.reason}) - NAO enviado ao cliente: "${text.substring(0, 80)}"`);
-          continue;
+          if (useFallback) {
+            console.log(`[GUARD] ${entry.key} descartado (${verdict.reason}) - NAO enviado ao cliente: "${text.substring(0, 80)}"`);
+            continue;
+          }
+          throw new Error(lastError);
         }
         lastError = 'Resposta vazia';
       } catch (error) {
         lastError = error;
         this.markModelFailed(entry.key);
+        if (!useFallback) throw error;
         console.log(`[FALLBACK] Falha em ${entry.provider.name} / ${entry.model.id}: ${error.message}`);
       }
     }
 
-    console.error(`[FALLBACK] Todos os modelos falharam. Ultimo erro:`, lastError?.message);
+    if (!useFallback) return null;
+    const reason = lastError instanceof Error ? lastError.message : lastError;
+    console.error(`[FALLBACK] Todos os modelos falharam. Ultimo erro: ${reason || 'Motivo nao informado'}`);
     return null;
   }
 

@@ -94,6 +94,7 @@ const localDataApi = {
   // Painel de gerenciamento do servidor (status, power e terminal)
   serverOverview: () => ipcRenderer.invoke('server-overview'),
   serverPower: (running) => ipcRenderer.invoke('server-power', running),
+  serverRestart: () => ipcRenderer.invoke('server-restart'),
   zapBlockAllExisting: (zapRef) => ipcRenderer.invoke('zap-block-all-existing', zapRef),
   onServerPowerUpdated: (callback) => ipcRenderer.on('server-power-updated', (e, data) => callback(data)),
   serverTerminalLogs: () => ipcRenderer.invoke('server-terminal-logs'),

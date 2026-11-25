@@ -61,6 +61,13 @@
       #remoteGate .gate-status.error { color: #b3261e; }
       #remoteGate .gate-status.success { color: #1a7f37; }
       #remoteGate .gate-hint { margin-top: 18px; font-size: 11px; color: #8a8a8a; line-height: 1.5; }
+      #remoteGate .gate-server {
+        display: flex; align-items: center; gap: 8px;
+        margin: 0 0 6px; padding: 9px 12px;
+        border: 1px solid #e9e9ea; border-radius: 10px;
+        background: #fafafa; color: #111111;
+        font-size: 12px; font-weight: 600;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -80,7 +87,8 @@
         </div>
         <h1>Conectar ao servidor</h1>
         <p class="lead">O bot roda na VPS. Entre com o endereco do servidor e a senha administrativa para gerenciar seus Zaps.</p>
-        <label for="gateUrl">Endereco do servidor</label>
+        <div class="gate-server" id="gateServerLine" style="display:none"></div>
+        <label for="gateUrl" id="gateUrlLabel">Endereco do servidor</label>
         <input id="gateUrl" name="url" type="text" spellcheck="false" placeholder="http://203.0.113.10:3000" />
         <label for="gatePassword">Senha administrativa</label>
         <input id="gatePassword" name="password" type="password" placeholder="Sua senha" />
@@ -98,6 +106,23 @@
     const status = gate.querySelector('#gateStatus');
 
     urlInput.value = api.remoteAuth.getServerUrl() || '';
+
+    // Servidor ja vem configurado no instalador: esconde o campo de endereco
+    // e pede somente a senha. A URL continua no input (hidden) para o envio.
+    const fixedUrl = String(api.remoteAuth.getServerUrl() || '').trim();
+    if (fixedUrl) {
+      const urlLabel = gate.querySelector('#gateUrlLabel');
+      const serverLine = gate.querySelector('#gateServerLine');
+      const lead = gate.querySelector('p.lead');
+      if (urlLabel) urlLabel.style.display = 'none';
+      urlInput.style.display = 'none';
+      if (lead) lead.textContent = 'O bot roda na VPS. Entre com a senha administrativa para gerenciar seus Zaps.';
+      if (serverLine) {
+        serverLine.textContent = `Servidor: ${fixedUrl.replace(/^https?:\/\//, '')}`;
+        serverLine.style.display = 'flex';
+      }
+    }
+
     if (reason) {
       status.textContent = reason;
       status.className = 'gate-status error';

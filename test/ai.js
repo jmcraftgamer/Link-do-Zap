@@ -253,6 +253,34 @@ testAsync('junk: todos os modelos lixo -> devolve null (main envia erro padrao)'
   assert.strictEqual(r, null);
 });
 
+testAsync('fallback: modo do pipeline tenta somente o modelo solicitado', async () => {
+  const ai = new AIResponder();
+  mockFetch((req) => (isGoogle(req) ? googleOk('') : orOk('fallback')));
+  await assert.rejects(
+    () => ai.generateResponse(msg(), cfg(GOOGLE, GOOGLE.models[0]), providers, false),
+    /Gemini sem texto visivel/
+  );
+  assert.strictEqual(fetchCalls.length, 1, 'generateResponse criou outro fallback dentro do pipeline');
+});
+
+testAsync('fallback: erro final de resposta vazia mostra o motivo', async () => {
+  const ai = new AIResponder();
+  mockFetch(() => googleOk(''));
+  const original = { log: console.log, error: console.error };
+  const errors = [];
+  console.log = () => {};
+  console.error = (...args) => errors.push(args.map(String).join(' '));
+  try {
+    const r = await ai.generateResponse(msg(), cfg(GOOGLE, GOOGLE.models[0]), providers);
+    assert.strictEqual(r, null);
+    assert.strictEqual(errors.length, 1);
+    assert.ok(errors[0].includes('Ultimo erro: Resposta vazia'), errors[0]);
+  } finally {
+    console.log = original.log;
+    console.error = original.error;
+  }
+});
+
 testAsync('guard: resposta reprovada pede de novo ao mesmo modelo e envia a corrigida', async () => {
   const ai = new AIResponder();
   let g = 0;

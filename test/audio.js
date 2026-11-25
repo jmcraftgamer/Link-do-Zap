@@ -7,6 +7,12 @@ const { decryptWhatsAppMedia } = require(path.join(__dirname, '..', 'src', 'js',
 const WhatsAppManager = require(path.join(__dirname, '..', 'src', 'js', 'whatsapp-manager'));
 const AIResponder = require(path.join(__dirname, '..', 'src', 'js', 'ai-responder'));
 const { sanitizeMessage, sanitizeMessages } = require(path.join(__dirname, '..', 'src', 'core', 'audio-history'));
+const { classifyAudioError } = require(path.join(__dirname, '..', 'src', 'core', 'audio', 'errors'));
+const { validateAudio, sniffAudioMime } = require(path.join(__dirname, '..', 'src', 'core', 'audio', 'validator'));
+const { normalizeTranscript, isUsableTranscript } = require(path.join(__dirname, '..', 'src', 'core', 'audio', 'transcript'));
+const { AudioTaskStore } = require(path.join(__dirname, '..', 'src', 'core', 'audio', 'task-store'));
+const { AudioScheduler } = require(path.join(__dirname, '..', 'src', 'core', 'audio', 'scheduler'));
+const { AudioPipeline } = require(path.join(__dirname, '..', 'src', 'core', 'audio', 'pipeline'));
 
 let passed = 0;
 const failures = [];
@@ -358,6 +364,327 @@ async function testTimeoutDeTranscricao() {
   }
 }
 
+// ---------------------------------------------------------------
+// Fila persistente de audio: classificacao, validacao, store, pipeline
+// ---------------------------------------------------------------
+
+function makeTempStore(name) {
+  const dir = require('fs').mkdtempSync(path.join(require('os').tmpdir(), `zap-audio-${name}-`));
+  const file = path.join(dir, 'audio-tasks.json');
+  let clock = 1700000000000;
+  const store = new AudioTaskStore({
+    filePath: file,
+    now: () => clock,
+    logger: { error() {}, info() {}, warn() {} }
+  });
+  return { file, store, advance: (ms) => { clock += ms; }, now: () => clock };
+}
+
+function oggBuffer() {
+  return Buffer.concat([Buffer.from('OggS'), Buffer.alloc(220, 1)]);
+}
+
+test('audio erro: classifica auth, expirada, transitoria e permanente', () => {
+  assert.strictEqual(classifyAudioError(new Error('HTTP 401 unauthorized')).kind, 'auth');
+  assert.strictEqual(classifyAudioError(new Error('HTTP 401 unauthorized')).retryable, false);
+  const expired = classifyAudioError(new Error('midia expirada, cliente pedindo reupload'));
+  assert.strictEqual(expired.kind, 'expired');
+  assert.strictEqual(expired.refresh, true);
+  assert.strictEqual(classifyAudioError(new Error('HTTP 503')).kind, 'transient');
+  assert.strictEqual(classifyAudioError(new Error('socket hang up')).retryable, true);
+  assert.strictEqual(classifyAudioError(new Error('mensagem nao encontrada')).kind, 'permanent');
+  const timeout = classifyAudioError(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+  assert.strictEqual(timeout.kind, 'timeout');
+  assert.strictEqual(timeout.retryable, true);
+});
+
+test('audio validador: aceita ogg real e recusa html/json/curto/grande', () => {
+  const ok = validateAudio(oggBuffer(), { mimetype: 'audio/ogg; codecs=opus' });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.mimetype, 'audio/ogg');
+  assert.strictEqual(sniffAudioMime(oggBuffer()), 'audio/ogg');
+  const html = validateAudio(Buffer.from('<html>' + 'x'.repeat(200) + '</html>'), { mimetype: 'audio/ogg' });
+  assert.strictEqual(html.ok, false);
+  const json = validateAudio(Buffer.from('{"erro":"sem media"}'.padEnd(200, ' ')), { mimetype: 'audio/ogg' });
+  assert.strictEqual(json.ok, false);
+  assert.strictEqual(validateAudio(Buffer.alloc(4), { mimetype: 'audio/ogg' }).ok, false);
+  const tooBig = validateAudio(oggBuffer(), { mimetype: 'audio/ogg', maxBytes: 100 });
+  assert.strictEqual(tooBig.ok, false);
+  assert.strictEqual(tooBig.kind, 'limit');
+});
+
+test('audio transcricao: limpa prefixos e descarta silencio/musica', () => {
+  assert.strictEqual(normalizeTranscript('  Transcricao: ola   mundo '), 'ola mundo');
+  assert.strictEqual(isUsableTranscript('[Musica]'), false);
+  assert.strictEqual(isUsableTranscript('(silencio)'), false);
+  assert.strictEqual(isUsableTranscript('...'), false);
+  assert.strictEqual(isUsableTranscript('quero marcar um horario'), true);
+});
+
+test('audio store: begin idempotente e persistencia apos reiniciar', () => {
+  const { file, store } = makeTempStore('store');
+  const first = store.begin({ zapId: 'z1', msgId: 'm1', chatId: 'c1', type: 'ptt' });
+  assert.strictEqual(first.duplicate, false);
+  const again = store.begin({ zapId: 'z1', msgId: 'm1' });
+  assert.strictEqual(again.duplicate, true);
+  assert.strictEqual(again.task.key, first.task.key);
+  store.transition(first.task.key, 'TRANSCRIBED', { text: 'oi' });
+  const reloaded = new AudioTaskStore({ filePath: file });
+  const t = reloaded.get(first.task.key);
+  assert.ok(t);
+  assert.strictEqual(t.state, 'TRANSCRIBED');
+  assert.strictEqual(t.text, 'oi');
+});
+
+test('audio store: markStale protege tarefa em voo e manda IA para DLQ', () => {
+  const { store, advance } = makeTempStore('stale');
+  const a = store.begin({ zapId: 'z1', msgId: 'm1' });
+  const b = store.begin({ zapId: 'z1', msgId: 'm2' });
+  store.transition(a.task.key, 'AI_PROCESSING');
+  store.transition(b.task.key, 'DOWNLOADING');
+  advance(5 * 60 * 1000);
+  const changed = store.markStale(2 * 60 * 1000, new Set([b.task.key]));
+  assert.strictEqual(changed.length, 1);
+  assert.strictEqual(store.get(a.task.key).state, 'DEAD_LETTER');
+  assert.strictEqual(store.get(b.task.key).state, 'DOWNLOADING');
+});
+
+async function testSchedulerLimits() {
+  const scheduler = new AudioScheduler({ maxConcurrent: 2, maxPerKey: 1, maxPending: 10 });
+  let activeAll = 0;
+  let peakAll = 0;
+  let activeA = 0;
+  let peakA = 0;
+  const job = (key) => scheduler.run(key, async () => {
+    activeAll++;
+    peakAll = Math.max(peakAll, activeAll);
+    if (key === 'a') { activeA++; peakA = Math.max(peakA, activeA); }
+    await new Promise((r) => setTimeout(r, 20));
+    if (key === 'a') activeA--;
+    activeAll--;
+  });
+  await Promise.all([job('a'), job('a'), job('b'), job('c')]);
+  assert.strictEqual(peakA, 1, 'o mesmo zap nao pode rodar dois audios ao mesmo tempo');
+  assert.ok(peakAll <= 2, `limite global estourado (pico ${peakAll})`);
+
+  const tiny = new AudioScheduler({ maxConcurrent: 1, maxPerKey: 1, maxPending: 1 });
+  const running = tiny.run('a', () => new Promise((r) => setTimeout(r, 20)));
+  await assert.rejects(() => tiny.run('b', async () => {}), /backpressure/);
+  await running;
+}
+
+async function testPipelineRetry() {
+  const { store } = makeTempStore('retry');
+  const delays = [];
+  const pipeline = new AudioPipeline({
+    store,
+    sleep: async (ms) => { delays.push(ms); },
+    random: () => 0,
+    config: { baseDelayMs: 100, maxDelayMs: 400, jitterRatio: 0.25, downloadAttempts: 3, transcribeAttempts: 1 }
+  });
+  const { task } = pipeline.begin({ zapId: 'z1', msgId: 'm1', chatId: 'c1', type: 'ptt', mimetype: 'audio/ogg' });
+  let calls = 0;
+  const res = await pipeline.run(task.key, {
+    download: async () => {
+      calls++;
+      if (calls < 3) throw new Error('HTTP 503');
+      return { buffer: oggBuffer(), mimetype: 'audio/ogg', method: 'cdn+decrypt' };
+    },
+    transcribe: async () => 'ola mundo'
+  });
+  assert.strictEqual(res.ok, true);
+  assert.strictEqual(res.text, 'ola mundo');
+  assert.strictEqual(calls, 3, 'deveria tentar 3 vezes');
+  assert.deepStrictEqual(delays, [100, 200], 'backoff exponencial sem jitter');
+  assert.strictEqual(store.get(task.key).state, 'TRANSCRIBED');
+}
+
+async function testPipelineDeadLetter() {
+  const { store } = makeTempStore('dlq');
+  const pipeline = new AudioPipeline({ store, sleep: async () => {}, random: () => 0 });
+  const { task } = pipeline.begin({ zapId: 'z1', msgId: 'm1' });
+  let calls = 0;
+  const res = await pipeline.run(task.key, {
+    download: async () => { calls++; throw new Error('HTTP 401 unauthorized'); },
+    transcribe: async () => 'x'
+  });
+  assert.strictEqual(res.ok, false);
+  assert.strictEqual(res.deadLetter, true);
+  assert.strictEqual(res.kind, 'auth');
+  assert.strictEqual(calls, 1, 'falha de credencial nao deve ser repetida');
+  assert.strictEqual(store.get(task.key).state, 'DEAD_LETTER');
+  const reopened = pipeline.retryDeadLetter(task.key);
+  assert.ok(reopened);
+  assert.strictEqual(reopened.state, 'QUEUED');
+}
+
+async function testPipelineBackpressureRetryLater() {
+  const { store } = makeTempStore('bp');
+  const scheduler = {
+    run: async () => {
+      const err = new Error('fila de audio cheia (backpressure)');
+      err.code = 'QUEUE_FULL';
+      throw err;
+    }
+  };
+  const pipeline = new AudioPipeline({ store, scheduler, sleep: async () => {} });
+  const { task } = pipeline.begin({ zapId: 'z1', msgId: 'm1' });
+  const res = await pipeline.run(task.key, {
+    download: async () => ({ buffer: oggBuffer(), mimetype: 'audio/ogg' }),
+    transcribe: async () => 'x'
+  });
+  assert.strictEqual(res.retryLater, true);
+  assert.strictEqual(store.get(task.key).state, 'RETRYING');
+}
+
+test('audio pipeline: recuperacao nao retoma audio que ja chegou na IA', () => {
+  const { store, now } = makeTempStore('recover');
+  const pipeline = new AudioPipeline({ store, now });
+  const done = store.begin({ zapId: 'z1', msgId: 'm1' });
+  store.transition(done.task.key, 'COMPLETED');
+  const pending = store.begin({ zapId: 'z1', msgId: 'm2' });
+  store.transition(pending.task.key, 'DOWNLOADING');
+  const ai = store.begin({ zapId: 'z1', msgId: 'm3' });
+  store.transition(ai.task.key, 'AI_PROCESSING');
+  const keys = pipeline.recoverable().map((t) => t.key);
+  assert.ok(keys.includes(pending.task.key), 'download interrompido deve ser retomado');
+  assert.ok(!keys.includes(done.task.key), 'audio concluido nao pode ser repetido');
+  assert.ok(!keys.includes(ai.task.key), 'audio em resposta nao pode gerar segunda resposta');
+});
+
+async function testMensagemComAudioUsaMesmaIA() {
+  const { createMessagePipeline } = require(path.join(__dirname, '..', 'src', 'core', 'messaging', 'pipeline'));
+  const sent = [];
+  let seenBody = null;
+  let receivedTaskKey = null;
+  const manager = {
+    clients: new Map(),
+    async sendMessage(zapId, chatId, text) { sent.push(text); return { success: true }; },
+    async hasOwnerReplied() { return false; }
+  };
+  const responder = {
+    getModelsToTry() { return [{ provider: { id: 'p', name: 'P', apiKey: 'k' }, model: { id: 'm' } }]; },
+    async generateResponse(msg) { seenBody = msg.body; return 'Claro, qual o servico?'; },
+    isJunkResponse() { return false; }
+  };
+  const pipeline = createMessagePipeline({
+    getWhatsapp: () => manager,
+    getAiResponder: () => responder,
+    getConversationStore: () => null,
+    loadZaps: () => [{ id: 'Z1', enabled: true, autoReply: true, instantReply: true, model: 'm' }],
+    loadProviders: () => [],
+    loadTrainings: () => ({ Z1: [] }),
+    checkBillingActive: () => ({ active: true, reason: 'own_use' }),
+    isServerPaused: () => false,
+    isServerMode: () => true,
+    log: () => {},
+    typing: { send: async () => {}, clear: async () => {}, waitRealistic: async () => {} },
+    resolveProviderKey: (p) => p,
+    runAudioTask: async (md) => {
+      receivedTaskKey = md.audioTaskKey;
+      return { ok: true, text: 'quero um orcamento', method: 'cdn+decrypt', size: 999 };
+    }
+  });
+  const result = await pipeline.processMessage({
+    zapId: 'Z1',
+    id: 'false_1',
+    body: '[AUDIO]',
+    from: '5511@c.us',
+    to: '5512@c.us',
+    fromMe: false,
+    timestamp: Math.floor(Date.now() / 1000),
+    audio: null,
+    audioFailed: false,
+    audioPending: true,
+    audioTaskKey: 'Z1:abc',
+    contact: { id: '5511@s.whatsapp.net', name: 'Ana', number: '5511' },
+    chat: { id: '5511@c.us', name: 'Ana', isGroup: false }
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(receivedTaskKey, 'Z1:abc', 'a tarefa persistente precisa ser usada');
+  assert.strictEqual(seenBody, 'quero um orcamento', 'a transcricao precisa chegar na IA como texto');
+  assert.strictEqual(sent[0], 'Claro, qual o servico?');
+}
+
+async function testFilaDeAudioAdiaSemResponder() {
+  const { createMessagePipeline } = require(path.join(__dirname, '..', 'src', 'core', 'messaging', 'pipeline'));
+  const sent = [];
+  const manager = {
+    clients: new Map(),
+    async sendMessage(zapId, chatId, text) { sent.push(text); return { success: true }; },
+    async hasOwnerReplied() { return false; }
+  };
+  const responder = {
+    getModelsToTry() { return [{ provider: { id: 'p', name: 'P', apiKey: 'k' }, model: { id: 'm' } }]; },
+    async generateResponse() { throw new Error('IA nao deveria ser chamada'); },
+    isJunkResponse() { return false; }
+  };
+  const pipeline = createMessagePipeline({
+    getWhatsapp: () => manager,
+    getAiResponder: () => responder,
+    getConversationStore: () => null,
+    loadZaps: () => [{ id: 'Z1', enabled: true, autoReply: true, instantReply: true, model: 'm' }],
+    loadProviders: () => [],
+    loadTrainings: () => ({ Z1: [] }),
+    checkBillingActive: () => ({ active: true, reason: 'own_use' }),
+    isServerPaused: () => false,
+    isServerMode: () => true,
+    log: () => {},
+    typing: { send: async () => {}, clear: async () => {}, waitRealistic: async () => {} },
+    resolveProviderKey: (p) => p,
+    runAudioTask: async () => ({ ok: false, retryLater: true, kind: 'transient', error: 'HTTP 503' })
+  });
+  const result = await pipeline.processMessage({
+    zapId: 'Z1', id: 'false_2', body: '[AUDIO]', from: '5511@c.us', to: '5512@c.us',
+    fromMe: false, timestamp: Math.floor(Date.now() / 1000), audio: null, audioFailed: false,
+    audioPending: true, audioTaskKey: 'Z1:def',
+    contact: { id: '5511@s.whatsapp.net', name: 'Ana', number: '5511' },
+    chat: { id: '5511@c.us', name: 'Ana', isGroup: false }
+  });
+  assert.strictEqual(result.reason, 'audio_retry');
+  assert.strictEqual(sent.length, 0, 'audio adiado nao pode receber resposta precipitada');
+}
+
+async function testFilaDeAudioFalhaDefinitivaPedeTexto() {
+  const { createMessagePipeline } = require(path.join(__dirname, '..', 'src', 'core', 'messaging', 'pipeline'));
+  const sent = [];
+  const manager = {
+    clients: new Map(),
+    async sendMessage(zapId, chatId, text) { sent.push(text); return { success: true }; },
+    async hasOwnerReplied() { return false; }
+  };
+  const responder = {
+    getModelsToTry() { return [{ provider: { id: 'p', name: 'P', apiKey: 'k' }, model: { id: 'm' } }]; },
+    async generateResponse() { throw new Error('IA nao deveria ser chamada'); },
+    isJunkResponse() { return false; }
+  };
+  const pipeline = createMessagePipeline({
+    getWhatsapp: () => manager,
+    getAiResponder: () => responder,
+    getConversationStore: () => null,
+    loadZaps: () => [{ id: 'Z1', enabled: true, autoReply: true, instantReply: true, model: 'm' }],
+    loadProviders: () => [],
+    loadTrainings: () => ({ Z1: [] }),
+    checkBillingActive: () => ({ active: true, reason: 'own_use' }),
+    isServerPaused: () => false,
+    isServerMode: () => true,
+    log: () => {},
+    typing: { send: async () => {}, clear: async () => {}, waitRealistic: async () => {} },
+    resolveProviderKey: (p) => p,
+    runAudioTask: async () => ({ ok: false, deadLetter: true, kind: 'corrupt', error: 'audio invalido' })
+  });
+  const result = await pipeline.processMessage({
+    zapId: 'Z1', id: 'false_3', body: '[AUDIO]', from: '5511@c.us', to: '5512@c.us',
+    fromMe: false, timestamp: Math.floor(Date.now() / 1000), audio: null, audioFailed: false,
+    audioPending: true, audioTaskKey: 'Z1:ghi',
+    contact: { id: '5511@s.whatsapp.net', name: 'Ana', number: '5511' },
+    chat: { id: '5511@c.us', name: 'Ana', isGroup: false }
+  });
+  assert.strictEqual(result.reason, 'audio_dead_letter');
+  assert.strictEqual(sent.length, 1);
+  assert.ok(/texto/i.test(sent[0]), 'cliente deve ser convidado a mandar texto');
+}
+
 async function rodar(name, fn) {
   try {
     await fn();
@@ -374,6 +701,13 @@ async function runAsyncTests() {
   await rodar('transcricao: Gemini recebe base64 puro e signal de timeout', testGeminiUsaBase64SemBuffer);
   await rodar('transcricao: fila limita as transcricoes simultaneas', testFilaDeTranscricao);
   await rodar('transcricao: timeout aborta provedor travado', testTimeoutDeTranscricao);
+  await rodar('audio scheduler: limite por zap, global e backpressure', testSchedulerLimits);
+  await rodar('audio pipeline: retry com backoff ate transcrever', testPipelineRetry);
+  await rodar('audio pipeline: credencial invalida vai para DLQ e pode reprocessar', testPipelineDeadLetter);
+  await rodar('audio pipeline: fila cheia mantem a tarefa para novo ciclo', testPipelineBackpressureRetryLater);
+  await rodar('audio + IA: transcricao entra no mesmo pipeline de texto', testMensagemComAudioUsaMesmaIA);
+  await rodar('audio + IA: tarefa adiada nao responde antes da hora', testFilaDeAudioAdiaSemResponder);
+  await rodar('audio + IA: falha definitiva pede para enviar texto', testFilaDeAudioFalhaDefinitivaPedeTexto);
   try {
     await testRegressaoMimetypePtt();
   } catch (e) {

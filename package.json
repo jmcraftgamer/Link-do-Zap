@@ -13,7 +13,7 @@
     "icon": "electron scripts/make-icon.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis",
-    "test": "node test/connect-queue.js && node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js && node test/audio.js && node test/config-safety.js && node test/backend.js && node test/remote-client.js",
+    "test": "node test/connect-queue.js && node test/run.js && node test/ai.js && node test/flow.js && node test/linux.js && node test/auto-msg.js && node test/agent.js && node test/audio.js && node test/stt.js && node test/config-safety.js && node test/backend.js && node test/remote-client.js",
     "test:ai": "node test/ai.js",
     "test:agent": "node test/agent.js",
     "test:ai-live": "node test/ai-live.js",
@@ -73,6 +73,7 @@
       ]
     },
     "nsis": {
+      "artifactName": "Link-no-WhatsApp-Setup-${version}.${ext}",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,

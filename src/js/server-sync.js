@@ -230,6 +230,84 @@ class ServerSync {
     }
   }
 
+  // Envia um comando shell para a VPS executar: cria server-cmds/<id>.json
+  // direto sobre origin/<branch>. O backend na VPS pega, executa, apaga o
+  // arquivo e publica a saida no server-terminal.jsonl.
+  pushExecCommand(command) {
+    if (!this.enabled) return Promise.resolve({ ok: false, disabled: true, error: 'sincronizacao desativada' });
+    const doIt = () => this._pushExecCommand(command);
+    const p = this._chain.then(doIt);
+    this._chain = p.catch(() => {});
+    return p;
+  }
+
+  async _pushExecCommand(command) {
+    const id = `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zap-cmd-'));
+    const indexFile = path.join(tmpDir, 'index');
+    const env = { GIT_INDEX_FILE: indexFile };
+    try {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const fetch = await run('git', ['fetch', '--quiet', 'origin', this.branch], { cwd: this.dataDir, timeout: 30000 });
+        if (fetch.code !== 0) {
+          return { ok: false, error: (fetch.stderr || 'sem conexao com o repositorio de dados').trim() };
+        }
+        const remoteRef = `origin/${this.branch}`;
+        const head = await run('git', ['rev-parse', remoteRef], { cwd: this.dataDir, timeout: 15000 });
+        const headSha = (head.stdout || '').trim();
+        if (head.code !== 0 || !headSha) {
+          return { ok: false, error: (head.stderr || 'nao foi possivel ler o branch remoto').trim() };
+        }
+
+        let r = await run('git', ['read-tree', remoteRef], { cwd: this.dataDir, timeout: 30000, env });
+        if (r.code !== 0) return { ok: false, error: (r.stderr || 'read-tree falhou').trim() };
+
+        const cmdTmp = path.join(tmpDir, id + '.json');
+        fs.writeFileSync(cmdTmp, JSON.stringify({ id, command: String(command), ts: Date.now() }));
+        const blob = await run('git', ['hash-object', '-w', cmdTmp], { cwd: this.dataDir, timeout: 15000 });
+        const blobSha = (blob.stdout || '').trim();
+        if (blob.code !== 0 || !blobSha) {
+          return { ok: false, error: (blob.stderr || 'hash-object falhou').trim() };
+        }
+        r = await run('git', ['update-index', '--add', '--cacheinfo', `100644,${blobSha},server-cmds/${id}.json`], {
+          cwd: this.dataDir, timeout: 15000, env
+        });
+        if (r.code !== 0) return { ok: false, error: (r.stderr || 'update-index falhou').trim() };
+
+        const tree = await run('git', ['write-tree'], { cwd: this.dataDir, timeout: 30000, env });
+        const treeSha = (tree.stdout || '').trim();
+        if (tree.code !== 0 || !treeSha) {
+          return { ok: false, error: (tree.stderr || 'write-tree falhou').trim() };
+        }
+
+        const commit = await run('git', [
+          '-c', 'user.name=Link no WhatsApp',
+          '-c', 'user.email=link@localhost',
+          'commit-tree', treeSha, '-p', headSha, '-m', `app: exec na VPS ${id}`
+        ], { cwd: this.dataDir, timeout: 30000 });
+        const commitSha = (commit.stdout || '').trim();
+        if (commit.code !== 0 || !commitSha) {
+          return { ok: false, error: (commit.stderr || 'commit-tree falhou').trim() };
+        }
+
+        const push = await run('git', ['push', 'origin', `${commitSha}:${this.branch}`], {
+          cwd: this.dataDir, timeout: 90000
+        });
+        if (push.code === 0) {
+          await run('git', ['fetch', '--quiet', 'origin', this.branch], { cwd: this.dataDir, timeout: 30000 });
+          return { ok: true, id, attempts: attempt };
+        }
+        const err = (push.stderr || '').trim() || 'push rejeitado';
+        if (/authentication|could not read username|permission|denied/i.test(err)) {
+          return { ok: false, error: err };
+        }
+      }
+      return { ok: false, error: 'push do comando falhou apos varias tentativas' };
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+
   _emitStatus() {
     try { if (this._onStatus) this._onStatus(this.getStatus()); } catch (_) {}
   }

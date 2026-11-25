@@ -5,12 +5,30 @@ const { decryptWhatsAppMedia } = require('./media-crypto');
 const { ConnectQueue } = require('../core/connect-queue');
 const { sanitizeMessage, sanitizeMessages } = require('../core/audio-history');
 
+const NON_CRITICAL_EVENTS = new Set([
+  'session_ready',
+  'auto_reconnect_triggered',
+  'auto_reconnect_success',
+  'session_disconnected',
+  'send_failed_retry',
+  'checkpoint_saved',
+  'session_recovery_started',
+  'session_recovery_success',
+  'session_reconnect_success'
+]);
+
 class WhatsAppManager {
   constructor(mainWindow) {
     this.mainWindow = mainWindow;
     this.clients = new Map();
     this.conversations = new Map();
     this.onMessageCallback = null;
+    // Recuperacao de audio (fila persistente + retry). Injetado pelo main.js.
+    this.audioPipeline = null;
+    // Objetos Message originais enquanto a tarefa de audio esta em andamento.
+    // Nao vai para o disco: a recuperacao pos-reinicio reconstroi um objeto
+    // minimo a partir da chave salva na tarefa.
+    this._audioMsgRefs = new Map();
     // Zaps em reconexao forcada (pagina morta durante envio)
     this._reconnecting = new Set();
     // Fila de conexao: sem limite, 30 Zaps com sessao salva abrem 30 Chromium
@@ -80,21 +98,56 @@ class WhatsAppManager {
     if (this._heartbeatIntervals.has(zapId)) {
       this.stopHeartbeat(zapId);
     }
-    
+
     this._lastHeartbeat.set(zapId, Date.now());
-    
+
     const interval = setInterval(() => {
-      const lastBeat = this._lastHeartbeat.get(zapId);
-      const now = Date.now();
-      
-      if (lastBeat && (now - lastBeat) > this._heartbeatTimeout) {
-        this.logCriticalEvent(zapId, 'heartbeat_timeout', `Heartbeat timeout: no activity for ${this._heartbeatTimeout/1000} seconds`);
-        this._forceReconnect(zapId);
-      }
+      this._checkHeartbeat(zapId).catch((e) => {
+        this.logToApp(zapId, 'warning', `Falha na sondagem do WhatsApp: ${e && e.message ? e.message : e}`);
+      });
     }, this._heartbeatCheckInterval);
-    
+
     this._heartbeatIntervals.set(zapId, interval);
     this.logToApp(zapId, 'info', 'Heartbeat monitoring started');
+  }
+
+  async _checkHeartbeat(zapId) {
+    const data = this.clients.get(String(zapId));
+    if (!data || data.status !== 'ready' || !data.client) return;
+
+    const page = data.client.pupPage;
+    let healthy = false;
+    if (page && !page.isClosed()) {
+      try {
+        const state = await this._withTimeout(page.evaluate(() => {
+          try {
+            const model = window.require && window.require('WAWebSocketModel');
+            return {
+              socket: model && model.Socket && model.Socket.state,
+              hasSynced: !!(model && model.Socket && model.Socket.hasSynced)
+            };
+          } catch (_) {
+            return { socket: null, hasSynced: false };
+          }
+        }), 8000, 'heartbeat');
+        healthy = !!(state && state.socket === 'CONNECTED' && state.hasSynced);
+      } catch (_) {
+        this.logToApp(zapId, 'warning', 'Sondagem do WhatsApp sem resposta; aguardando a janela de reconexao.');
+      }
+    }
+
+    if (healthy) {
+      this.updateHeartbeat(zapId);
+      return;
+    }
+
+    const lastBeat = this._lastHeartbeat.get(zapId);
+    if (lastBeat && (Date.now() - lastBeat) > this._heartbeatTimeout) {
+      this.logCriticalEvent(zapId, 'heartbeat_timeout', `WhatsApp sem resposta por ${this._heartbeatTimeout / 1000} segundos`);
+      this._forceReconnect(zapId).catch((e) => {
+        this.logToApp(zapId, 'error', `Falha ao reconectar apos heartbeat: ${e && e.message ? e.message : e}`);
+      });
+    }
   }
 
   stopHeartbeat(zapId) {
@@ -113,6 +166,7 @@ class WhatsAppManager {
 
   // Critical event tracking for diagnostics
   logCriticalEvent(zapId, eventType, details) {
+    if (NON_CRITICAL_EVENTS.has(eventType)) return;
     const event = {
       timestamp: Date.now(),
       zapId,
@@ -241,6 +295,131 @@ class WhatsAppManager {
     this.onMessageCallback = callback;
   }
 
+  setAudioPipeline(pipeline) {
+    this.audioPipeline = pipeline || null;
+  }
+
+  async _prepareWhatsAppPage(client, zapId) {
+    const browser = client && client.pupBrowser;
+    const current = client && client.pupPage;
+    if (!browser || typeof browser.pages !== 'function') return;
+    const pages = await browser.pages();
+    if (pages.length <= 1) return;
+
+    const states = [];
+    for (const candidate of pages) {
+      if (candidate.isClosed()) continue;
+      const state = await candidate.evaluate(() => {
+        let socket = null;
+        let hasSynced = false;
+        try {
+          const model = window.require && window.require('WAWebSocketModel');
+          socket = model && model.Socket && model.Socket.state;
+          hasSynced = !!(model && model.Socket && model.Socket.hasSynced);
+        } catch (_) { /* modulo ainda carregando */ }
+        return { socket, hasSynced };
+      }).catch(() => null);
+      if (state) states.push({ page: candidate, ...state });
+    }
+
+    const usable = states.length ? states : (current ? [{ page: current, socket: null, hasSynced: false }] : []);
+    const selected = usable.find((s) => s.socket === 'CONNECTED' && s.hasSynced)
+      || usable.find((s) => s.socket === 'CONNECTED')
+      || usable.find((s) => s.page === current)
+      || usable[0];
+    if (!selected) return;
+
+    if (selected.page !== current) {
+      client.pupPage = selected.page;
+      this.logToApp(zapId, 'info', 'Pagina sincronizada do WhatsApp restaurada; usando esta pagina para continuar a sessao.');
+    }
+
+    let closed = 0;
+    for (const candidate of pages) {
+      if (candidate === selected.page || candidate.isClosed()) continue;
+      try { await candidate.close(); closed++; } catch (_) { /* aba restaurada ja fechou */ }
+    }
+    if (closed) {
+      this.logToApp(zapId, 'info', `${closed} aba(s) antiga(s) do WhatsApp fechada(s) para evitar conflito e vazamento de memoria.`);
+    }
+  }
+
+  async _finalizeSyncedWhatsApp(client, zapId) {
+    const data = this.clients.get(zapId);
+    if (data && data.status === 'ready') return;
+    const page = client && client.pupPage;
+    if (!page || page.isClosed()) return;
+    try {
+      const result = await page.evaluate(async () => {
+        let socket = null;
+        let hasSynced = false;
+        try {
+          const model = window.require && window.require('WAWebSocketModel');
+          socket = model && model.Socket && model.Socket.state;
+          hasSynced = !!(model && model.Socket && model.Socket.hasSynced);
+        } catch (_) { /* modulo ainda carregando */ }
+        if (socket !== 'CONNECTED' || !hasSynced || typeof window.onAppStateHasSyncedEvent !== 'function') {
+          return { called: false, socket, hasSynced };
+        }
+        await window.onAppStateHasSyncedEvent();
+        return { called: true, socket, hasSynced, wwebjs: typeof window.WWebJS };
+      });
+      if (result.called) {
+        this.logToApp(zapId, 'info', 'Sessao ja estava sincronizada; evento oficial de pronto reexecutado para concluir a conexao.');
+      }
+    } catch (e) {
+      this.logToApp(zapId, 'warning', `Nao foi possivel concluir sessao ja sincronizada: ${e.message}`);
+    }
+  }
+
+  async _resolveWhatsAppWindowConflict(client, zapId) {
+    await this._prepareWhatsAppPage(client, zapId);
+    const page = client && client.pupPage;
+    if (!page) return;
+    const deadline = Date.now() + 60000;
+    while (!page.isClosed() && Date.now() < deadline) {
+      const snapshot = await page.evaluate(() => {
+        let socket = null;
+        try {
+          const model = window.require && window.require('WAWebSocketModel');
+          socket = model && model.Socket && model.Socket.state;
+        } catch (_) { /* modulo ainda carregando */ }
+        const body = (document.body && document.body.innerText || '').slice(0, 500);
+        return {
+          socket,
+          conflict: /aberto em outra janela|open in another window/i.test(body)
+        };
+      }).catch(() => null);
+      if (!snapshot) {
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
+      if (snapshot.conflict) {
+        this.logToApp(zapId, 'warning', 'WhatsApp estava aberto em outra janela. Assumindo a sessao neste servidor...');
+        const navigation = page.waitForNavigation({ waitUntil: 'load', timeout: 30000 }).catch(() => null);
+        const clicked = await page.evaluate(() => {
+          const nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+          const target = nodes.find((el) => /usar nesta janela|use here|use this window/i.test(
+            `${el.innerText || ''} ${el.getAttribute('aria-label') || ''}`
+          ));
+          if (!target) return false;
+          target.click();
+          return true;
+        }).catch(() => false);
+        if (clicked) {
+          await navigation;
+          await page.waitForFunction(
+            () => window.Debug && window.Debug.VERSION !== undefined,
+            { timeout: 60000 }
+          ).catch(() => {});
+        }
+        return;
+      }
+      if (snapshot.socket && !['UNLAUNCHED', 'OPENING', 'PAIRING', 'CONFLICT'].includes(snapshot.socket)) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
   async connectZap(zapId, phoneNumber, method = 'pairing') {
     // Save checkpoint before connection attempt
     if (this.clients.has(zapId)) {
@@ -358,7 +537,7 @@ class WhatsAppManager {
         showNotification: true,
         intervalMs: 180000
       } : undefined,
-      authTimeoutMs: 180000,
+      authTimeoutMs: 600000,
       puppeteer: {
         headless: true,
         args: [
@@ -368,6 +547,7 @@ class WhatsAppManager {
           '--disable-accelerated-2d-canvas',
           '--no-first-run',
           '--disable-gpu',
+          '--renderer-process-limit=2',
           '--disable-features=IsolateOrigins,site-per-process,Translate,BackForwardCache,MediaRouter,OptimizationHints',
           '--disable-extensions',
           '--disable-default-apps',
@@ -380,8 +560,12 @@ class WhatsAppManager {
           '--disable-backgrounding-occluded-windows',
           '--mute-audio'
         ],
-        timeout: 120000,
-        protocolTimeout: 180000
+        // Timeouts altos de proposito: em VPS com pouca RAM/CPU (2 GB, 1 vCPU)
+        // a carga da pagina do WhatsApp Web pode passar de 3 minutos; com os
+        // valores curtos antigos a inicializacao morria no meio e o bot nunca
+        // chegava a "ready".
+        timeout: 600000,
+        protocolTimeout: 600000
       },
       // 'local' em vez de 'none': congela a versao do WA Web apos a primeira
       // carga, evitando que atualizacoes do WhatsApp quebrem os scripts injetados
@@ -408,6 +592,16 @@ class WhatsAppManager {
     // controle total. isPairing foi calculado acima (metodo + telefone).
 
     const client = new Client(clientOptions);
+    // O WhatsApp recarrega a pagina ao assumir uma janela antiga. Resolver o
+    // conflito antes do inject() evita que a espera do socket morra com
+    // "Execution context was destroyed" e fique presa em UNLAUNCHED.
+    const originalInject = client.inject.bind(client);
+    client.inject = async () => {
+      await this._resolveWhatsAppWindowConflict(client, zapId);
+      const result = await originalInject();
+      await this._finalizeSyncedWhatsApp(client, zapId);
+      return result;
+    };
 
     this.clients.set(zapId, {
       client,
@@ -436,6 +630,8 @@ class WhatsAppManager {
       chatCursors: new Map(),
       // IDs ja processados nesta sessao (evita responder duas vezes o backlog)
       processedMsgKeys: new Set(),
+      // Reentregas do evento de mensagens enviadas (autochat/IA/dono).
+      processedCreateKeys: new Set(),
       // true enquanto o catch-up do backlog esta rodando
       backlogRunning: false,
       // Watchdog de pareamento (polling do socket) - detecta quando o
@@ -699,6 +895,7 @@ class WhatsAppManager {
         if (!msg.fromMe) return; // mensagens recebidas vêm pelo evento 'message'
         const data = this.clients.get(zapId);
         if (!data || data.client !== client) return;
+        if (!this._claimMessageKey(data, msg, 'processedCreateKeys')) return;
 
         // Chat da mensagem: para mensagens enviadas por mim, o chat e msg.to
         const chatJid = msg.to || msg.from || '';
@@ -741,16 +938,7 @@ class WhatsAppManager {
             this.markOwnerReply(zapId, chatJid, msg.timestamp);
             this.logToApp(zapId, 'info', `Dono respondeu manualmente em ${chatJid} - IA nao vai responder por cima.`);
             try {
-              const chatObj = await msg.getChat();
-              const cid = chatObj && chatObj.id && (chatObj.id._serialized || chatObj.id);
-              let cname = '';
-              try { cname = chatObj.formattedTitle || chatObj.name || ''; } catch (_) {}
-              this._recordOutgoing(zapId, cid || chatJid, msg.body || (msg.hasMedia ? '[mídia]' : ''), 'owner', msg, {
-                chatId: cid || undefined,
-                name: cname,
-                hasMedia: !!msg.hasMedia,
-                timestamp: msg.timestamp
-              });
+              await this._recordOwnerMessage(zapId, msg, chatJid);
             } catch (e) {
               console.warn('[CONV] falha ao registrar mensagem manual do dono:', e.message);
             }
@@ -776,10 +964,8 @@ class WhatsAppManager {
           for (let i = 0; i < keys.length - 100; i++) data.messages.delete(keys[i]);
         }
 
-        this.logToApp(zapId, 'incoming',
-          `Autochat [${chatNum}]: mensagem sua para o proprio numero (${msg.type}): "${bodyTxt.substring(0, 120)}"`);
-
-        await this.handleMessage(zapId, msg);
+        const result = await this.handleMessage(zapId, msg);
+        if (result && result.retry) this._releaseMessageKey(data, msg, 'processedCreateKeys');
       } catch (e) {
         console.error('[AUTOCHAT] Erro ao processar message_create:', e);
         this.logToApp(zapId, 'error', `Autochat: erro ao processar mensagem: ${e.message}`);
@@ -859,6 +1045,10 @@ class WhatsAppManager {
     } catch (error) {
       console.error(`Erro ao inicializar Zap ${zapId}:`, error);
       this.logToApp(zapId, 'error', `Erro ao iniciar WhatsApp: ${error.message}`);
+      // Tentativa que falhou nao pode deixar o Chromium vivo: cada vazamento
+      // comia ~500 MB e, com pouca RAM, os retries seguintes estouravam o
+      // protocolTimeout em cadeia. destroy() fecha o browser SEM apagar sessao.
+      try { await client.destroy(); } catch (_) { /* browser nem chegou a subir */ }
       this.clients.delete(zapId);
       return { status: 'error', error: error.message };
     }
@@ -866,7 +1056,10 @@ class WhatsAppManager {
 
   async handleMessage(zapId, msg, opts) {
     const fromBacklog = !!(opts && opts.fromBacklog);
+    const messageClient = this.clients.get(String(zapId));
     try {
+      if (!this._claimMessageKey(messageClient, msg)) return;
+
       // Update heartbeat for activity monitoring
       this.updateHeartbeat(zapId);
       
@@ -889,20 +1082,21 @@ class WhatsAppManager {
         return;
       }
 
+      let contactObj = null;
       try {
-        const contact = await msg.getContact();
-        contactName = contact.name || contact.pushname || contact.id.user;
-        contactNumber = contact.id.user;
+        contactObj = await msg.getContact();
+        contactName = contactObj.name || contactObj.pushname || contactObj.id.user;
       } catch (e) {
         console.log('Aviso: nao foi possivel obter contato, usando dados basicos');
       }
 
+      let chatObj = null;
       try {
-        const chat = await msg.getChat();
-        chatId = chat.id._serialized;
-        chatName = chat.name || chat.id.user || chatName;
+        chatObj = await msg.getChat();
+        chatId = chatObj.id._serialized;
+        chatName = chatObj.name || chatObj.id.user || chatName;
         // reliable group detection from chat object
-        if (typeof chat.isGroup === 'boolean') isGroup = chat.isGroup;
+        if (typeof chatObj.isGroup === 'boolean') isGroup = chatObj.isGroup;
         // also check serialized suffix as fallback
         if (chatId.includes('@g.us')) isGroup = true;
 
@@ -919,7 +1113,7 @@ class WhatsAppManager {
         // Armazena o objeto Chat para reutilizar (sendStateTyping, clearState)
         const clientData = this.clients.get(zapId);
         if (clientData && clientData.chats) {
-          clientData.chats.set(chatId, chat);
+          clientData.chats.set(chatId, chatObj);
           // Teto: em numero com milhares de conversas o mapa crescia sem fim.
           // Cada Chat guarda o objeto inteiro do wwebjs.
           if (clientData.chats.size > 200) {
@@ -930,6 +1124,11 @@ class WhatsAppManager {
       } catch (e) {
         console.log('Aviso: nao foi possivel obter chat, usando dados basicos');
       }
+
+      contactNumber = await this._resolveContactNumber(zapId, chatId, contactObj, chatObj);
+      const contactId = String(chatId).endsWith('@lid') && contactNumber === this._normNum(chatId)
+        ? chatId
+        : `${contactNumber}@s.whatsapp.net`;
 
       // Prefere um nome humano (agenda/pushname) ao numero quando disponivel
       if (this._isNumericName(contactName) && !this._isNumericName(chatName)) {
@@ -946,6 +1145,7 @@ class WhatsAppManager {
       // =============================================
       let audioInfo = null;
       let audioFailed = false;
+      let audioPending = false;
       // msg.mimetype nao existe na classe Message - mimetype real esta em msg._data.mimetype
       const rawMime = (msg._data && msg._data.mimetype) || '';
       const isAudioType = msg.type === 'ptt' || msg.type === 'audio' ||
@@ -954,10 +1154,13 @@ class WhatsAppManager {
       if (isAudioType) {
         if (!msg.hasMedia) {
           audioFailed = true;
-          this.logToApp(zapId, 'warning', `Audio de ${contactName} sem midia acessivel (hasMedia=false).`);
+        } else if (this.audioPipeline) {
+          // Download adiado para a fila de audio: o pipeline baixa com retry,
+          // valida os bytes, persiste o estado e so entao entrega a IA.
+          audioPending = true;
         } else {
-          this.logToApp(zapId, 'info', `Audio detectado de ${contactName} (${rawMime || 'ptt'}). Baixando...`);
-          audioInfo = await this._downloadAudio(zapId, msg, rawMime);
+          // Compatibilidade: sem pipeline injetado, mantem o fluxo antigo.
+          audioInfo = await this._downloadAudio(zapId, msg, rawMime, { silent: true });
           if (!audioInfo) audioFailed = true;
         }
       }
@@ -971,9 +1174,6 @@ class WhatsAppManager {
       if (isAudioType && (!body || body.trim() === '')) {
         body = '[AUDIO]';
       }
-
-      this.logToApp(zapId, msg.fromMe ? 'outgoing' : 'incoming',
-        `${msg.fromMe ? 'Mensagem para si mesmo' : 'Recebido'} de ${contactName} (${msg.type}): "${body.substring(0, 120)}"`);
 
       const messageData = {
         zapId,
@@ -989,8 +1189,11 @@ class WhatsAppManager {
         mimetype: rawMime || '',
         audio: audioInfo,
         audioFailed: audioFailed,
+        audioPending: audioPending,
+        audioTaskKey: '',
+        audioWasAudio: isAudioType,
         contact: {
-          id: `${contactNumber}@s.whatsapp.net`,
+          id: contactId,
           name: contactName,
           number: contactNumber
         },
@@ -1024,39 +1227,46 @@ class WhatsAppManager {
         if (this._isNumericName(conversation.contact.name) && !this._isNumericName(contactName)) {
           conversation.contact.name = contactName;
         }
-        if (!conversation.contact.number && messageData.contact.number) {
-          conversation.contact.number = messageData.contact.number;
+        const previousId = String(conversation.contact.id || '');
+        if (previousId !== messageData.contact.id &&
+            (previousId === chatId || previousId.endsWith('@lid') || this._normNum(previousId) === this._normNum(chatId))) {
+          conversation.contact.id = messageData.contact.id;
         }
+        if (messageData.contact.number) conversation.contact.number = messageData.contact.number;
       }
       // Historico guarda a versao sem base64. O `messageData` original segue
       // completo para o pipeline da IA transcrever; so o que fica na RAM e limpo.
       const historyEntry = sanitizeMessage(messageData);
-      conversation.messages.push(historyEntry);
-      conversation.lastMessage = historyEntry;
-      // Mantem o historico da UI enxuto
-      if (conversation.messages.length > 200) {
-        conversation.messages = conversation.messages.slice(-200);
+      const existingEntry = historyEntry.id && conversation.messages.find((item) => item.id === historyEntry.id);
+      if (!existingEntry) {
+        conversation.messages.push(historyEntry);
+        // Mantem o historico da UI enxuto
+        if (conversation.messages.length > 200) {
+          conversation.messages = conversation.messages.slice(-200);
+        }
       }
+      conversation.lastMessage = historyEntry;
 
       // Persist contacts to disk so they survive restarts
       this.persistContacts();
 
       // Envia para a tela do app (sempre). Sem o base64: o renderer nao usa
       // `.audio` e o payload cai de megabytes para kilobytes.
-      this.sendToRenderer('whatsapp-message', historyEntry);
+      if (!existingEntry) this.sendToRenderer('whatsapp-message', historyEntry);
 
       // =============================================
       // DECISAO: Chamar a IA ou nao?
       // =============================================
       if (!this.onMessageCallback) {
         this.logToApp(zapId, 'warning', 'IA ignorada: callback de auto-reply nao configurado.');
-        return; // Sem callback configurado
+        return { accepted: false };
       }
 
       const clientData = this.clients.get(zapId);
       if (!clientData) {
+        this._releaseMessageKey(messageClient, msg);
         this.logToApp(zapId, 'warning', 'IA ignorada: cliente do Zap nao encontrado (sessao encerrada?).');
-        return;
+        return { retry: true };
       }
 
       // REGRA 1: Bot precisa estar pronto para ENVIAR. Aceita 'authenticated'
@@ -1064,16 +1274,18 @@ class WhatsAppManager {
       // gerava a resposta, o sendMessage falhava e o cliente ficava sem
       // resposta (e o historico ganhava uma mensagem fantasma).
       if (clientData.status !== 'ready' && clientData.status !== 'authenticated') {
+        this._releaseMessageKey(messageClient, msg);
         this.logToApp(zapId, 'warning', `IA ignorada: status atual e "${clientData.status}" (aguardando ready).`);
-        return;
+        return { retry: true };
       }
       if (clientData.status !== 'ready') {
         this.logToApp(zapId, 'info', `Mensagem de ${contactName} aguardando a conexao ficar pronta...`);
         const ready = await this._waitForReady(zapId, 180000);
         if (!ready) {
+          this._releaseMessageKey(messageClient, msg);
           this.logToApp(zapId, 'warning',
             `Conexao nao ficou pronta a tempo - a mensagem de ${contactName} sera recuperada pelo backlog.`);
-          return;
+          return { retry: true };
         }
       }
 
@@ -1087,7 +1299,7 @@ class WhatsAppManager {
           // (conversas já populadas acima, aqui só decidimos não chamar IA)
           if (body.trim() === '' && !audioInfo) {
             this.logToApp(zapId, 'info', `IA ignorada: mensagem vazia/template (${msg.type}) de ${contactName}.`);
-            return;
+            return { accepted: false };
           }
         }
       }
@@ -1103,27 +1315,67 @@ class WhatsAppManager {
         if (newest && msgTs < newest - 180) {
           this.logToApp(zapId, 'warning',
             `IA ignorada: mensagem antiga (msg ${msgTs} < mais nova vista ${newest} -180s).`);
-          return;
+          return { accepted: false };
         }
       }
       if (msgTs && msgTs > (Number(clientData.newestMsgTs) || 0)) {
         clientData.newestMsgTs = msgTs;
       }
-      // Cursor por chat: marca ate onde este chat ja foi tratado (usado pelo
-      // backlog para nao responder duas vezes a mesma mensagem).
-      this._setChatCursor(zapId, chatId, msgTs);
-
-      // Passou em todos os filtros - chamar a IA!
-      this.logToApp(zapId, 'info', `Filtros aprovados. Enviando mensagem de ${contactName} para a IA...`);
+      let result;
+      let audioTaskKey = '';
+      if (audioPending && this.audioPipeline) {
+        // Tarefa persistente: a mesma mensagem entregue 2x pelo WhatsApp nao
+        // pode gerar 2 transcricoes nem 2 respostas.
+        const begun = this.audioPipeline.begin({
+          zapId,
+          msgId: this._ensureMsgKey(msg),
+          msgKey: this._ensureMsgKey(msg),
+          chatId,
+          chatName,
+          contactId,
+          contactName,
+          contactNumber,
+          type: msg.type || '',
+          mimetype: rawMime || '',
+          ts: Number(msg.timestamp) || 0
+        });
+        if (begun.duplicate) {
+          this._releaseMessageKey(messageClient, msg);
+          this.logToApp(zapId, 'info', `Audio duplicado ignorado (${contactName}).`);
+          return { accepted: false, reason: 'audio_duplicate' };
+        }
+        audioTaskKey = begun.task.key;
+        messageData.audioTaskKey = audioTaskKey;
+        messageData.audioTask = begun.task;
+        this._audioMsgRefs.set(audioTaskKey, msg);
+      }
       try {
-        await this.onMessageCallback(messageData);
+        result = await this.onMessageCallback(messageData);
       } catch (e) {
+        this._releaseMessageKey(messageClient, msg);
         console.error(`[WHATSAPP] Erro no callback de auto-reply:`, e);
         this.logToApp(zapId, 'error', `Erro no processamento da IA: ${e.message}`);
+        return { retry: true };
+      } finally {
+        if (audioTaskKey) this._audioMsgRefs.delete(audioTaskKey);
       }
+
+      this._setChatCursor(zapId, chatId, msgTs);
+      const accepted = !result || result.accepted !== false;
+      if (accepted) {
+        this.logToApp(zapId, msg.fromMe ? 'outgoing' : 'incoming',
+          `${msg.fromMe ? 'Mensagem para si mesmo' : 'Recebido'} de ${contactName} (${msg.type}): "${body.substring(0, 120)}"`);
+        if (isAudioType) {
+          if (audioFailed) this.logToApp(zapId, 'warning', `Audio de ${contactName} sem midia acessivel ou download falhou.`);
+          else if (audioInfo) this.logToApp(zapId, 'info', `Audio detectado de ${contactName} (${rawMime || 'ptt'}).`);
+        }
+      }
+      return { accepted, reason: result && result.reason };
     } catch (error) {
+      this._releaseMessageKey(messageClient, msg);
       console.error(`Erro ao processar mensagem no Zap ${zapId}:`, error);
       this.logToApp(zapId, 'error', `Erro ao processar mensagem recebida: ${error.message}`);
+      return { retry: true };
     }
   }
 
@@ -1138,6 +1390,57 @@ class WhatsAppManager {
   _normNum(jidOrNum) {
     if (!jidOrNum) return '';
     return String(jidOrNum).split('@')[0].replace(/:/g, '').replace(/\D/g, '');
+  }
+
+  async _resolveContactNumber(zapId, chatId, contact, chat) {
+    const raw = String(chatId || '').split('@')[0].replace(/:\d+$/, '');
+    const isLid = String(chatId || '').endsWith('@lid');
+    const convs = this.conversations.get(String(zapId));
+    const cached = convs && convs.get(chatId);
+    const candidates = [
+      contact && contact.number,
+      contact && contact.phoneNumber,
+      chat && chat.number,
+      chat && chat.phoneNumber,
+      cached && cached.contact && cached.contact.number
+    ];
+    for (const value of candidates) {
+      try {
+        const serialized = value && typeof value === 'object' ? (value._serialized || String(value)) : String(value || '');
+        if (!serialized || serialized.endsWith('@lid')) continue;
+        const number = this._normNum(serialized);
+        if (number.length >= 6 && (!isLid || number !== raw)) return number;
+      } catch (_) { /* getter do wwebjs pode falhar */ }
+    }
+    if (!isLid) return this._normNum(raw);
+
+    const data = this.clients.get(String(zapId));
+    const page = data && data.client && data.client.pupPage;
+    if (page && !page.isClosed()) {
+      try {
+        const number = await this._withTimeout(page.evaluate(async (lid) => {
+          try {
+            const WFB = window.require('WAWebWidFactory');
+            const wid = WFB.createWid(lid);
+            const contactModel = window.require('WAWebCollections').Contact.get(wid);
+            let pn = contactModel && contactModel.phoneNumber;
+            if (!pn && window.WWebJS && typeof window.WWebJS.enforceLidAndPnRetrieval === 'function') {
+              const resolved = await window.WWebJS.enforceLidAndPnRetrieval(lid);
+              pn = resolved && resolved.phone;
+            }
+            if (!pn) pn = window.require('WAWebApiContact').getPhoneNumber(wid);
+            const serialized = pn && typeof pn === 'object' ? (pn._serialized || String(pn)) : String(pn || '');
+            if (!serialized || serialized.endsWith('@lid')) return '';
+            return serialized.split('@')[0].replace(/:\d+$/, '');
+          } catch (_) {
+            return '';
+          }
+        }, chatId), 5000, 'resolve-lid');
+        const normalized = this._normNum(number);
+        if (normalized.length >= 6 && normalized !== raw) return normalized;
+      } catch (_) { /* sem mapeamento disponivel */ }
+    }
+    return this._normNum(raw);
   }
 
   // true quando o "nome" e so o numero (sem um nome humano de verdade)
@@ -1187,6 +1490,21 @@ class WhatsAppManager {
       }
       return '';
     } catch (_) { return ''; }
+  }
+
+  _claimMessageKey(data, msg, setName = 'processedMsgKeys') {
+    const key = this._ensureMsgKey(msg);
+    if (!key || !data) return true;
+    if (!data[setName]) data[setName] = new Set();
+    if (data[setName].has(key)) return false;
+    data[setName].add(key);
+    this._trimSet(data[setName], 2000);
+    return true;
+  }
+
+  _releaseMessageKey(data, msg, setName = 'processedMsgKeys') {
+    const key = this._ensureMsgKey(msg);
+    if (key && data && data[setName]) data[setName].delete(key);
   }
 
   async _patchMediaMsgAttrs(client) {
@@ -1618,9 +1936,10 @@ class WhatsAppManager {
               data: decrypted.toString('base64'),
               mimetype: sniffed || mimetype,
               size: decrypted.length,
+              method: 'cdn+decrypt',
             };
           } catch (e) {
-            this.logToApp(zapId, 'warning', `Fallback de descriptografia manual falhou: ${e.message}`);
+            if (!silent) this.logToApp(zapId, 'warning', `Fallback de descriptografia manual falhou: ${e.message}`);
             diag = {
               ...meta,
               ok: false,
@@ -1631,7 +1950,7 @@ class WhatsAppManager {
           }
         } else {
           const errTxt = fetched.errors.join(' | ').slice(0, 800);
-          this.logToApp(zapId, 'warning', `CDN da midia falhou: ${errTxt}`);
+          if (!silent) this.logToApp(zapId, 'warning', `CDN da midia falhou: ${errTxt}`);
           diag = {
             ...meta,
             ok: false,
@@ -1787,6 +2106,7 @@ class WhatsAppManager {
           data: direct.data,
           mimetype: direct.mimetype || mimetype,
           size: direct.size || 0,
+          method: direct.via ? `page/${direct.via}` : 'page/downloadManager',
         };
       }
       if (direct) {
@@ -1809,12 +2129,81 @@ class WhatsAppManager {
     if (!silent) {
       this.logToApp(zapId, 'warning', `Diagnostico download: passo=${dStep} erro=${dErr}${dStage}${dDet}`);
     }
+    if (opts && opts.throwOnError) {
+      // A fila de audio precisa do motivo real para decidir entre repetir
+      // (rede/URL vencida) e desistir (arquivo invalido/permanente).
+      const err = new Error(`download de midia falhou: passo=${dStep} erro=${dErr}${dStage}${dDet}`);
+      err.step = dStep;
+      err.code = dStep;
+      throw err;
+    }
     return null;
   }
 
+  // Resolve o objeto Message de uma tarefa de audio. Em uso normal o objeto
+  // recem-recebido esta no cache em memoria; apos um reinicio reconstruimos a
+  // partir da chave persistida (ou buscamos no cliente). O download so precisa
+  // dos campos primitivos (id/from/to/fromMe/mimetype), entao o sintetico
+  // funciona mesmo sem a mensagem original na memoria.
+  async resolveAudioMessage(task) {
+    const key = String((task && (task.msgKey || task.msgId)) || '');
+    const cached = task && task.key ? this._audioMsgRefs.get(String(task.key)) : null;
+    if (cached) return cached;
+    const zapId = String((task && task.zapId) || '');
+    const clientData = this.clients.get(zapId);
+    const client = clientData && clientData.client;
+    if (client && key && typeof client.getMessageById === 'function') {
+      try {
+        const found = await new Promise((resolve) => {
+          let done = false;
+          const timer = setTimeout(() => {
+            if (!done) { done = true; resolve(null); }
+          }, 5000);
+          if (typeof timer.unref === 'function') timer.unref();
+          Promise.resolve()
+            .then(() => client.getMessageById(key))
+            .then(
+              (value) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve(value || null);
+              },
+              () => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve(null);
+              }
+            );
+        });
+        if (found && found.id) return found;
+      } catch (_) { /* segue para o objeto sintetico */ }
+    }
+    return this._syntheticAudioMessage(task, key);
+  }
+
+  _syntheticAudioMessage(task, key) {
+    const match = /^(true|false)_(.+?)_([^_]+)$/.exec(key || '');
+    const fromMe = match ? match[1] === 'true' : false;
+    const chatId = String((task && task.chatId) || '');
+    const remote = match ? match[2] : chatId;
+    const idPart = match ? match[3] : (key || `recovered-${Date.now()}`);
+    return {
+      id: { _serialized: key || idPart, id: idPart, remote, fromMe },
+      from: fromMe ? chatId : remote,
+      to: fromMe ? remote : chatId,
+      fromMe,
+      type: String((task && task.type) || 'ptt'),
+      timestamp: Number(task && task.ts) || 0,
+      hasMedia: true,
+      _data: { mimetype: String((task && task.mimetype) || '') },
+    };
+  }
+
   // Compatibilidade: audio continua sendo o caso padrao (transcricao pela IA).
-  _downloadAudio(zapId, msg, rawMime) {
-    return this._downloadMedia(zapId, msg, rawMime, 'audio', { label: 'Audio' });
+  _downloadAudio(zapId, msg, rawMime, opts) {
+    return this._downloadMedia(zapId, msg, rawMime, 'audio', { ...(opts || {}), label: 'Audio' });
   }
 
   // Tipo de midia a partir do `type` do WhatsApp e/ou do mimetype.
@@ -2491,14 +2880,13 @@ class WhatsAppManager {
             if (ts > cursor && (!target || ts > (Number(target.timestamp) || 0))) target = m;
           }
           if (!target) continue;
-          const key = this._ensureMsgKey(target);
-          if (key && data.processedMsgKeys && data.processedMsgKeys.has(key)) continue;
-          if (key) { data.processedMsgKeys.add(key); this._trimSet(data.processedMsgKeys, 2000); }
-          // Marca antes de processar: se o envio falhar, nao repete em loop.
+          const result = await this.handleMessage(zapId, target, { fromBacklog: true });
+          if (result && result.retry) continue;
           this._setChatCursor(zapId, id, Number(target.timestamp) || 0);
           processed++;
-          this.logToApp(zapId, 'info', `Backlog: recuperando mensagem de ${chat.name || id}`);
-          await this.handleMessage(zapId, target, { fromBacklog: true });
+          if (!result || result.accepted !== false) {
+            this.logToApp(zapId, 'info', `Backlog: recuperando mensagem de ${chat.name || id}`);
+          }
         } catch (e) {
           console.warn(`[BACKLOG] falha no chat ${id}: ${e.message}`);
         }
@@ -2909,6 +3297,13 @@ class WhatsAppManager {
               if (chat.number && (!conv.contact.number || this._isNumericName(conv.contact.number))) {
                 conv.contact.number = String(chat.number);
               }
+              const resolved = String(chat.number || '');
+              if (/^\d{6,}$/.test(resolved)) {
+                conv.contact.number = resolved;
+                if (!conv.contact.id || conv.contact.id.startsWith(`${chatId.split('@')[0]}@`)) {
+                  conv.contact.id = `${resolved}@s.whatsapp.net`;
+                }
+              }
             }
           }
         } catch (chatErr) {
@@ -3049,6 +3444,8 @@ class WhatsAppManager {
         },
         chat: { id: chatId, name: conv.contact.name, isGroup: false }
       };
+      const existing = id && conv.messages.find((item) => item.id === id);
+      if (existing) return existing;
       conv.messages.push(msg);
       if (conv.messages.length > 200) conv.messages = conv.messages.slice(-200);
       conv.lastMessage = msg;
@@ -3062,6 +3459,25 @@ class WhatsAppManager {
       console.warn('[CONV] Falha ao registrar mensagem enviada:', err.message);
       return null;
     }
+  }
+
+  async _recordOwnerMessage(zapId, msg, chatJid) {
+    let chatObj = null;
+    try { chatObj = await msg.getChat(); } catch (_) { /* usa a conversa ja carregada */ }
+    const zapConversations = this.conversations.get(String(zapId));
+    const cachedConv = zapConversations && zapConversations.get(chatJid);
+    const cid = chatObj && chatObj.id
+      ? (chatObj.id._serialized || String(chatObj.id))
+      : chatJid;
+    let cname = (cachedConv && cachedConv.contact && cachedConv.contact.name) || '';
+    try { cname = (chatObj && (chatObj.formattedTitle || chatObj.name)) || cname; } catch (_) {}
+    const cachedNumber = cachedConv && cachedConv.contact && cachedConv.contact.number;
+    this._recordOutgoing(zapId, cachedNumber || cid, msg.body || (msg.hasMedia ? '[mídia]' : ''), 'owner', msg, {
+      chatId: cid,
+      name: cname,
+      hasMedia: !!msg.hasMedia,
+      timestamp: msg.timestamp
+    });
   }
 
   // Busca o historico real do chat no WhatsApp (recebidas, suas e da IA) e

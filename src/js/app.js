@@ -210,7 +210,6 @@ let searchDdIndex = -1;
 let lastRenderedConversations = null;
 let lastRenderedConversationsZapId = null;
 const addZapBtn = document.getElementById('addZapBtn');
-const listZapsBtn = document.getElementById('listZapsBtn');
 const addZapModal = document.getElementById('addZapModal');
 const closeModalBtn = document.getElementById('closeModal');
 const cancelAdd = document.getElementById('cancelAdd');
@@ -471,6 +470,7 @@ function init() {
   }
 
   setupEventListeners();
+  setupCustomSelects();
   initProviders();
   initProviderConfig();
 
@@ -756,9 +756,6 @@ function setupEventListeners() {
   });
 
   addZapBtn.addEventListener('click', openModal);
-  listZapsBtn.addEventListener('click', () => {
-    searchInput.focus();
-  });
   closeModalBtn.addEventListener('click', closeModalHandler);
   cancelAdd.addEventListener('click', closeModalHandler);
   confirmAdd.addEventListener('click', addNewZap);
@@ -866,6 +863,12 @@ function navigateTo(page) {
 
   if (page === 'mensagem-automatica') {
     onAutoMsgPageOpen();
+  }
+
+  // Abrir o painel do servidor marca os erros como vistos (badge sem pulso)
+  if (page === 'gerenciar-servidor') {
+    serverErrorBadgeSeen = countServerTerminalErrors();
+    updateServerErrorBadge();
   }
 
   // Close zap panel when leaving "adicionar-whatsapp" page
@@ -1134,6 +1137,142 @@ function resetSearchForPage(page) {
 }
 
 // ============================================
+// Custom Select (dropdown estilizado)
+// ============================================
+const CSELECT_CHEVRON = '<svg class="cselect-chevron" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+const CSELECT_MAX_H = 232;
+
+function closeCselect(wrap) {
+  wrap.classList.remove('open');
+  const list = wrap.querySelector('.cselect-list');
+  list.querySelectorAll('.cselect-option').forEach(o => o.classList.remove('highlighted'));
+}
+
+function closeAllCselects() {
+  document.querySelectorAll('.cselect.open').forEach(closeCselect);
+}
+
+function positionCselectList(wrap) {
+  const field = wrap.querySelector('.cselect-field');
+  const list = wrap.querySelector('.cselect-list');
+  list.style.display = 'block';
+  const rect = field.getBoundingClientRect();
+  list.style.left = rect.left + 'px';
+  list.style.width = Math.max(rect.width, 240) + 'px';
+  const h = Math.min(list.offsetHeight, CSELECT_MAX_H);
+  if (rect.bottom + h + 8 > window.innerHeight && rect.top - h - 8 > 0) {
+    list.style.top = (rect.top - h - 4) + 'px';
+  } else {
+    list.style.top = (rect.bottom + 4) + 'px';
+  }
+}
+
+function syncCselect(select) {
+  const wrap = select && select.closest ? select.closest('.cselect') : null;
+  if (!wrap) return;
+  const list = wrap.querySelector('.cselect-list');
+  const valueEl = wrap.querySelector('.cselect-value');
+  list.innerHTML = '';
+  Array.from(select.options).forEach(opt => {
+    const el = document.createElement('div');
+    el.className = 'cselect-option' + (opt.selected ? ' selected' : '');
+    el.dataset.value = opt.value;
+    el.textContent = opt.textContent;
+    list.appendChild(el);
+  });
+  const selOpt = select.options[select.selectedIndex];
+  valueEl.textContent = selOpt ? selOpt.textContent : (select.options.length ? select.options[0].textContent : '');
+}
+
+function setupCustomSelects() {
+  document.querySelectorAll('select.cselect-source').forEach(select => {
+    if (select.dataset.cselectReady) return;
+    select.dataset.cselectReady = '1';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'cselect';
+    select.parentNode.insertBefore(wrap, select);
+    wrap.appendChild(select);
+    select.classList.add('cselect-hidden');
+    select.setAttribute('aria-hidden', 'true');
+
+    const field = document.createElement('div');
+    field.className = 'cselect-field';
+    field.tabIndex = 0;
+    field.innerHTML = '<span class="cselect-value"></span>' + CSELECT_CHEVRON;
+    const list = document.createElement('div');
+    list.className = 'cselect-list';
+    wrap.appendChild(field);
+    wrap.appendChild(list);
+
+    const pick = (opt) => {
+      select.value = opt.dataset.value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      closeCselect(wrap);
+    };
+
+    const open = () => {
+      closeAllCselects();
+      syncCselect(select);
+      wrap.classList.add('open');
+      positionCselectList(wrap);
+      const sel = list.querySelector('.cselect-option.selected');
+      if (sel) sel.classList.add('highlighted');
+    };
+
+    field.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (wrap.classList.contains('open')) closeCselect(wrap);
+      else open();
+    });
+
+    field.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!wrap.classList.contains('open')) open();
+      } else if (e.key === 'Escape') {
+        closeCselect(wrap);
+      }
+      if (!wrap.classList.contains('open')) return;
+      const opts = Array.from(list.querySelectorAll('.cselect-option'));
+      if (!opts.length) return;
+      const hlIdx = opts.findIndex(o => o.classList.contains('highlighted'));
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        const dir = e.key === 'ArrowDown' ? 1 : -1;
+        const next = hlIdx < 0 ? (dir > 0 ? 0 : opts.length - 1) : Math.min(Math.max(hlIdx + dir, 0), opts.length - 1);
+        opts.forEach(o => o.classList.remove('highlighted'));
+        opts[next].classList.add('highlighted');
+        opts[next].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        const target = opts[hlIdx] || list.querySelector('.cselect-option.selected') || opts[0];
+        if (target) pick(target);
+      }
+    });
+
+    list.addEventListener('click', (e) => {
+      const opt = e.target && e.target.closest ? e.target.closest('.cselect-option') : null;
+      if (opt) pick(opt);
+    });
+
+    syncCselect(select);
+  });
+}
+
+// Fecha qualquer dropdown aberto ao clicar fora ou ao fechar o modal
+document.addEventListener('click', (e) => {
+  if (e.target && typeof e.target.closest === 'function' && e.target.closest('.cselect')) return;
+  closeAllCselects();
+});
+
+// Escape fecha primeiro o dropdown aberto (e nao o modal por baixo)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && document.querySelector('.cselect.open')) {
+    closeAllCselects();
+    e.stopPropagation();
+  }
+}, true);
+
+// ============================================
 // Modal - Add Zap
 // ============================================
 function updateProvidersCheckboxes() {
@@ -1211,11 +1350,14 @@ function updateModelSelect() {
     opt.textContent = `${model.name} (${model.provider})${model.free ? ' - Gratuito' : ''}`;
     modelSelect.appendChild(opt);
   });
+
+  syncCselect(modelSelect);
 }
 
 function openModal() {
   updateProvidersCheckboxes();
   clearForm();
+  closeAllCselects();
   addZapModal.classList.add('active');
 
   const zapPersonality = document.getElementById('zapPersonality');
@@ -2252,6 +2394,50 @@ function renderPanelModelConfig(zap) {
 // ============================================
 // Panel Contacts
 // ============================================
+// Bloqueios podem estar salvos como JID (@c.us/@s.whatsapp.net/@lid) ou so
+// numero (agente). Compara pelos digitos para os dois formatos baterem.
+function contactKeyMatch(a, b) {
+  const variants = (v) => {
+    const n = String(v == null ? '' : v).split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (!n) return [];
+    const out = [n];
+    if (/^55\d{10,13}$/.test(n)) out.push(n.slice(2));
+    else if (/^\d{10,11}$/.test(n)) out.push('55' + n);
+    return out;
+  };
+  const va = variants(a);
+  const vb = variants(b);
+  return va.some(x => vb.includes(x));
+}
+
+function contactAliases(conv) {
+  const contact = (conv && conv.contact) || {};
+  return [...new Set([conv && conv.chatId, contact.id, contact.number]
+    .map((v) => String(v == null ? '' : v).trim()).filter(Boolean))];
+}
+
+function contactIsBlocked(zap, conv) {
+  const aliases = contactAliases(conv);
+  return ((zap && zap.blockedContacts) || [])
+    .some((blocked) => aliases.some((alias) => contactKeyMatch(blocked, alias)));
+}
+
+function setContactAliasesBlocked(zap, aliases, blocked) {
+  if (!Array.isArray(zap.blockedContacts)) zap.blockedContacts = [];
+  const ids = aliases.map((v) => String(v == null ? '' : v).trim()).filter(Boolean);
+  if (blocked) {
+    for (const id of ids) {
+      if (!zap.blockedContacts.some((saved) => contactKeyMatch(saved, id))) zap.blockedContacts.push(id);
+    }
+  } else {
+    zap.blockedContacts = zap.blockedContacts.filter((saved) => !ids.some((id) => contactKeyMatch(saved, id)));
+  }
+}
+
+function setContactBlocked(zap, conv, blocked) {
+  setContactAliasesBlocked(zap, contactAliases(conv), blocked);
+}
+
 async function loadPanelContacts(zapId) {
   const container = document.getElementById('panelContactsList');
   container.innerHTML = '<div class="spinner" style="margin:16px auto;"></div>';
@@ -2264,7 +2450,6 @@ async function loadPanelContacts(zapId) {
   try {
     const conversations = await window.electronAPI.whatsappConversations(zapId.toString());
     const zap = zapsData.find(z => String(z.id) === String(zapId));
-    const blocked = (zap && zap.blockedContacts) || [];
 
     if (!conversations || conversations.length === 0) {
       container.innerHTML = '<p style="font-size:12px;color:#999;">Nenhum contato encontrado. Conecte o Zap e receba mensagens.</p>';
@@ -2276,11 +2461,11 @@ async function loadPanelContacts(zapId) {
       if (conv.contact && conv.contact.id && conv.contact.id.includes('@g.us')) return;
       if (conv.contact && conv.contact.id && conv.contact.id.includes('@newsletter')) return;
 
-      const isBlocked = blocked.includes(conv.contact.id);
+      const isBlocked = contactIsBlocked(zap, conv);
       const item = document.createElement('div');
       item.className = 'panel-contact-item';
       item.innerHTML = `
-        <input type="checkbox" data-contact="${conv.contact.id}" ${!isBlocked ? 'checked' : ''}>
+        <input type="checkbox" data-contact="${escapeHtml(conv.contact.id)}" ${!isBlocked ? 'checked' : ''}>
         <div class="panel-contact-avatar">
           <svg viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2">
             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
@@ -2300,11 +2485,7 @@ async function loadPanelContacts(zapId) {
         const z = zapsData.find(x => String(x.id) === String(zapId));
         if (!z) return;
         if (!z.blockedContacts) z.blockedContacts = [];
-        if (cb.checked) {
-          z.blockedContacts = z.blockedContacts.filter(id => id !== conv.contact.id);
-        } else {
-          if (!z.blockedContacts.includes(conv.contact.id)) z.blockedContacts.push(conv.contact.id);
-        }
+        setContactBlocked(z, conv, !cb.checked);
         item.querySelector('.panel-contact-auth').textContent = cb.checked ? 'Autorizado' : 'Bloqueado';
         saveZaps();
       });
@@ -2338,7 +2519,12 @@ function renderContactsPage() {
           <div class="contact-zap-name">${escapeHtml(zap.name)}</div>
           <div class="contact-zap-phone">${escapeHtml(zap.phone || '')}</div>
         </div>
-        <button class="contact-zap-lock-btn" data-zap="${zap.id}" title="Desativar todos os contatos">🔒</button>
+        <button class="contact-zap-lock-btn" data-zap="${zap.id}" title="Desativar todos os contatos">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+        </button>
         <span class="contact-zap-chevron">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 18 15 12 9 6"/>
@@ -2360,12 +2546,9 @@ function renderContactsPage() {
       if (!z.blockedContacts) z.blockedContacts = [];
       try {
         const conversations = await window.electronAPI.whatsappConversations(String(zap.id));
-        const blocked = z.blockedContacts || [];
         const contacts = (conversations || []).filter(c => c && c.contact && c.contact.id && !c.contact.id.includes('@g.us'));
-        contacts.forEach(c => {
-          if (!blocked.includes(c.contact.id)) blocked.push(c.contact.id);
-        });
-        z.blockedContacts = blocked;
+        contacts.forEach(c => setContactBlocked(z, c, true));
+        z.blockedContacts = [...new Set(z.blockedContacts)];
         saveZaps();
         alert('Todos os contatos do Zap "' + zap.name + '" foram desativados!');
         loadContactsForZap(z, item.querySelector('.contact-zap-contacts'));
@@ -2425,7 +2608,6 @@ async function loadContactsForZap(zap, container) {
 
   try {
     const conversations = await window.electronAPI.whatsappConversations(String(zap.id));
-    const blocked = (zap.blockedContacts || []);
     const contacts = (conversations || []).filter(c =>
       c && c.contact && c.contact.id &&
       !c.contact.id.includes('@g.us') &&
@@ -2439,7 +2621,7 @@ async function loadContactsForZap(zap, container) {
 
     container.innerHTML = '';
     contacts.forEach(conv => {
-      const isBlocked = blocked.includes(conv.contact.id);
+      const isBlocked = contactIsBlocked(zap, conv);
       const row = document.createElement('div');
       row.className = 'contact-row';
       row.innerHTML = `
@@ -2467,11 +2649,7 @@ async function loadContactsForZap(zap, container) {
         const z = zapsData.find(x => String(x.id) === String(zap.id));
         if (!z) return;
         if (!z.blockedContacts) z.blockedContacts = [];
-        if (cb.checked) {
-          z.blockedContacts = z.blockedContacts.filter(id => id !== conv.contact.id);
-        } else if (!z.blockedContacts.includes(conv.contact.id)) {
-          z.blockedContacts.push(conv.contact.id);
-        }
+        setContactBlocked(z, conv, !cb.checked);
         saveZaps();
       });
     });
@@ -2516,11 +2694,14 @@ async function openZapContactsModal(zapId, zapName) {
       const checkboxes = listContainer.querySelectorAll('.contact-auth-checkbox');
       let added = 0;
       checkboxes.forEach(cb => {
-        const cid = cb.dataset.contact;
-        if (cid && !zap.blockedContacts.includes(cid)) {
-          zap.blockedContacts.push(cid);
+        const aliases = [cb.dataset.contact, cb.dataset.chat, cb.dataset.number];
+        const before = zap.blockedContacts.length;
+        setContactAliasesBlocked(zap, aliases, true);
+        if (zap.blockedContacts.length > before) {
           cb.checked = false;
           added++;
+        } else {
+          cb.checked = false;
         }
       });
       saveZaps();
@@ -2539,7 +2720,6 @@ async function openZapContactsModal(zapId, zapName) {
   try {
     const conversations = await window.electronAPI.whatsappConversations(zapId.toString());
     const zap = zapsData.find(z => String(z.id) === String(zapId));
-    const blocked = zap.blockedContacts || [];
 
     if (!conversations || conversations.length === 0) {
       listContainer.innerHTML = '<p style="text-align:center; padding: 20px; color:#666;">Nenhum contato encontrado para este Zap.</p>';
@@ -2551,7 +2731,7 @@ async function openZapContactsModal(zapId, zapName) {
       // Ignore groups visually here
       if (conv.contact && conv.contact.id && conv.contact.id.includes('@g.us')) return;
 
-      const isBlocked = blocked.includes(conv.contact.id);
+      const isBlocked = contactIsBlocked(zap, conv);
       
       const item = document.createElement('div');
       item.className = 'provider-item'; // reuse styles from providers
@@ -2568,7 +2748,7 @@ async function openZapContactsModal(zapId, zapName) {
         </div>
         <div class="provider-item-actions">
           <label class="auto-reply-toggle">
-            <input type="checkbox" class="contact-auth-checkbox" data-zap="${zapId}" data-contact="${conv.contact.id}" ${!isBlocked ? 'checked' : ''}>
+            <input type="checkbox" class="contact-auth-checkbox" data-zap="${zapId}" data-contact="${escapeHtml(conv.contact.id)}" data-chat="${escapeHtml(conv.chatId || '')}" data-number="${escapeHtml(conv.contact.number || '')}" ${!isBlocked ? 'checked' : ''}>
             <span class="auto-reply-label">Autorizado</span>
           </label>
         </div>
@@ -2578,30 +2758,16 @@ async function openZapContactsModal(zapId, zapName) {
 
     listContainer.querySelectorAll('.contact-auth-checkbox').forEach(cb => {
       cb.addEventListener('change', (e) => {
-        toggleContactAuth(e.target.dataset.zap, e.target.dataset.contact, e.target.checked);
+        const currentZap = zapsData.find(z => String(z.id) === String(e.target.dataset.zap));
+        const conv = conversations.find(c => c.contact && String(c.contact.id) === String(e.target.dataset.contact));
+        if (!currentZap || !conv) return;
+        setContactBlocked(currentZap, conv, !e.target.checked);
+        saveZaps();
       });
     });
 
   } catch (err) {
     listContainer.innerHTML = `<p class="error-text">Erro ao buscar contatos: ${err.message}</p>`;
-  }
-}
-
-function toggleContactAuth(zapId, contactId, isAuthorized) {
-  const zap = zapsData.find(z => String(z.id) === String(zapId));
-  if (zap) {
-    if (!zap.blockedContacts) zap.blockedContacts = [];
-    
-    if (isAuthorized) {
-      // Remove from blocked list
-      zap.blockedContacts = zap.blockedContacts.filter(id => id !== contactId);
-    } else {
-      // Add to blocked list
-      if (!zap.blockedContacts.includes(contactId)) {
-        zap.blockedContacts.push(contactId);
-      }
-    }
-    saveZaps();
   }
 }
 
@@ -2614,6 +2780,8 @@ function clearForm() {
   document.getElementById('zapModelGroup').style.display = 'none';
   document.getElementById('zapModel').innerHTML = '<option value="auto">Automtico (Melhor para Pior)</option>';
   document.querySelectorAll('.provider-checkbox:checked').forEach(cb => { cb.checked = false; });
+  syncCselect(document.getElementById('zapPersonality'));
+  syncCselect(document.getElementById('zapModel'));
 }
 
 // ============================================
@@ -6157,6 +6325,9 @@ let agentMentions = {};
 let agentDictating = false;
 let agentRecorder = null;
 let agentRecChunks = [];
+let agentImages = [];
+let agentImageSeq = 0;
+let agentInChatMode = false;
 
 function initDashboardChat() {
   const input = document.getElementById('dashChatInput');
@@ -6175,7 +6346,7 @@ function initDashboardChat() {
   });
 
   input.addEventListener('input', () => {
-    autosizeDashInput(input);
+    updateDashHint();
     handleDashMention(input);
   });
 
@@ -6187,9 +6358,38 @@ function initDashboardChat() {
   if (filesBtn) filesBtn.addEventListener('click', attachDashFile);
 }
 
-function autosizeDashInput(input) {
-  input.style.height = 'auto';
-  input.style.height = Math.min(132, input.scrollHeight) + 'px';
+function updateDashHint() {
+  const hint = document.getElementById('dashCardHint');
+  const input = document.getElementById('dashChatInput');
+  if (!hint) return;
+  const hasText = !!(input && input.value.trim());
+  const hasImg = agentImages.length > 0;
+  hint.classList.toggle('hidden', hasText || hasImg);
+}
+
+// Cardbox desce do centro para o rodape com animacao FLIP (mesmo cardbox)
+function enterDashChatMode() {
+  if (agentInChatMode) return;
+  const page = document.getElementById('page-dashboard');
+  const box = document.getElementById('dashCardbox');
+  if (!page || !box) return;
+  const first = box.getBoundingClientRect();
+  page.classList.add('dash-mode-chat', 'dash-enter-instant');
+  box.classList.add('dash-cardbox-anim');
+  const last = box.getBoundingClientRect();
+  const dx = first.left - last.left;
+  const dy = first.top - last.top;
+  if (dx || dy) {
+    box.style.transform = `translate(${dx}px, ${dy}px)`;
+    void box.offsetWidth;
+    box.style.transform = 'translate(0, 0)';
+  }
+  agentInChatMode = true;
+  setTimeout(() => {
+    box.classList.remove('dash-cardbox-anim');
+    box.style.transform = '';
+    page.classList.remove('dash-enter-instant');
+  }, 420);
 }
 
 function setDashBusy(busy) {
@@ -6200,12 +6400,22 @@ function setDashBusy(busy) {
   if (input) input.disabled = busy;
 }
 
-function appendDashBubble(role, text) {
+function appendDashBubble(role, text, images) {
   const box = document.getElementById('dashChatMessages');
   if (!box) return null;
   const div = document.createElement('div');
   div.className = 'dash-msg ' + (role === 'user' ? 'dash-msg-user' : 'dash-msg-agent');
   div.textContent = String(text || '');
+  if (Array.isArray(images) && images.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'dash-msg-attach';
+    images.forEach(im => {
+      const img = document.createElement('img');
+      img.src = im.dataUrl;
+      wrap.appendChild(img);
+    });
+    div.appendChild(wrap);
+  }
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
   return div;
@@ -6237,15 +6447,22 @@ async function sendAgentMessage() {
   const input = document.getElementById('dashChatInput');
   if (!input || agentBusy) return;
   const text = input.value.trim();
-  if (!text) return;
+  const images = agentImages.slice();
+  if (!text && !images.length) return;
 
   const mentions = collectDashMentions(text);
   input.value = '';
-  autosizeDashInput(input);
+  updateDashHint();
   hideDashMentionDropdown();
   agentMentions = {};
+  agentImages = [];
+  const attachRow = document.getElementById('dashCardAttach');
+  if (attachRow) attachRow.innerHTML = '';
+  syncDashAttachUI();
 
-  appendDashBubble('user', text);
+  enterDashChatMode();
+
+  appendDashBubble('user', text, images);
   setDashBusy(true);
   const typing = showDashTyping();
 
@@ -6253,10 +6470,14 @@ async function sendAgentMessage() {
     const res = await window.electronAPI.agentChat({
       message: text,
       history: agentHistory.slice(-16),
-      mentions
+      mentions,
+      images: images.map(im => ({ dataUrl: im.dataUrl, mime: im.mime, name: im.name }))
     });
     if (typing && typing.parentNode) typing.parentNode.removeChild(typing);
-    agentHistory.push({ role: 'user', content: text });
+    agentHistory.push({
+      role: 'user',
+      content: text || (images.length ? `[${images.length} imagem(ns) enviada(s)]` : '')
+    });
     const steps = (res && res.steps) || [];
     steps.forEach(appendDashToolLine);
     const reply = (res && res.reply) || 'Sem resposta.';
@@ -6334,7 +6555,7 @@ async function loadDashContacts() {
 function ensureDashMentionDropdown() {
   let dd = document.getElementById('dashMentionDd');
   if (dd) return dd;
-  const host = document.querySelector('.dash-chat');
+  const host = document.getElementById('dashCardbox');
   if (!host) return null;
   dd = document.createElement('div');
   dd.id = 'dashMentionDd';
@@ -6462,7 +6683,7 @@ function toggleDashDictation() {
         const input = document.getElementById('dashChatInput');
         if (text && String(text).trim() && input) {
           input.value = (input.value ? input.value.replace(/\s+$/, '') + ' ' : '') + String(text).trim();
-          autosizeDashInput(input);
+          updateDashHint();
           input.focus();
         } else {
           alert('Nao consegui transcrever o audio. Tente falar mais perto do microfone.');
@@ -6483,38 +6704,93 @@ function toggleDashDictation() {
   });
 }
 
-// --------------------------- Arquivos ---------------------------
+// --------------------------- Imagens ---------------------------
 function attachDashFile() {
   const picker = document.createElement('input');
   picker.type = 'file';
+  picker.accept = 'image/*';
+  picker.multiple = true;
   picker.onchange = async () => {
-    const f = picker.files && picker.files[0];
-    if (!f) return;
-    const input = document.getElementById('dashChatInput');
-    if (!input) return;
-    const isText = (f.type && f.type.startsWith('text/')) ||
-      /\.(txt|md|csv|json|log|xml|html|css|js|ts|jsx|tsx|py|java|c|cpp|cs|php|yml|yaml|ini|cfg|sql)$/i.test(f.name);
-    let note;
-    if (isText && f.size <= 200 * 1024) {
-      try {
-        const content = await f.text();
-        input.value = (input.value ? input.value.trim() + '\n\n' : '') +
-          `[Arquivo: ${f.name}]\n` + content.slice(0, 15000);
-        note = f.name + ' (conteudo anexado)';
-      } catch (_) {
-        input.value = (input.value ? input.value.trim() + '\n\n' : '') + `[Arquivo anexado: ${f.name}]`;
-        note = f.name;
+    const files = Array.from(picker.files || []);
+    if (!files.length) return;
+    for (const f of files) {
+      if (!f.type || !f.type.startsWith('image/')) {
+        alert('"' + f.name + '" nao e uma imagem.');
+        continue;
       }
-    } else {
-      input.value = (input.value ? input.value.trim() + '\n\n' : '') +
-        `[Arquivo anexado: ${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB) - conteudo nao lido]`;
-      note = f.name;
+      try {
+        const dataUrl = await downscaleDashImage(f);
+        const id = ++agentImageSeq;
+        agentImages.push({ id, dataUrl, mime: f.type, name: f.name });
+        addDashAttachChip(id, dataUrl, f.name);
+      } catch (_) {
+        alert('Nao consegui ler a imagem: ' + f.name);
+      }
     }
-    autosizeDashInput(input);
-    appendDashToolLine({ ok: true, tool: 'anexo', info: note });
-    input.focus();
+    syncDashAttachUI();
+    const input = document.getElementById('dashChatInput');
+    if (input) input.focus();
   };
   picker.click();
+}
+
+function downscaleDashImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 1280;
+      let w = img.width;
+      let h = img.height;
+      const scale = Math.min(1, MAX / Math.max(w, h));
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      try { resolve(canvas.toDataURL('image/jpeg', 0.85)); }
+      catch (e) { reject(e); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode')); };
+    img.src = url;
+  });
+}
+
+function addDashAttachChip(id, dataUrl, name) {
+  const row = document.getElementById('dashCardAttach');
+  if (!row) return;
+  const chip = document.createElement('div');
+  chip.className = 'dash-attach-chip';
+  chip.dataset.id = String(id);
+  const img = document.createElement('img');
+  img.src = dataUrl;
+  img.alt = name;
+  const rm = document.createElement('button');
+  rm.type = 'button';
+  rm.className = 'dash-attach-remove';
+  rm.title = 'Remover imagem';
+  rm.textContent = '×';
+  rm.addEventListener('click', () => {
+    const i = agentImages.findIndex(x => String(x.id) === String(id));
+    if (i !== -1) agentImages.splice(i, 1);
+    chip.remove();
+    syncDashAttachUI();
+  });
+  chip.appendChild(img);
+  chip.appendChild(rm);
+  row.appendChild(chip);
+}
+
+function syncDashAttachUI() {
+  const row = document.getElementById('dashCardAttach');
+  const box = document.getElementById('dashCardbox');
+  if (!row || !box) return;
+  const has = agentImages.length > 0;
+  row.style.display = has ? 'flex' : 'none';
+  box.classList.toggle('has-attach', has);
+  updateDashHint();
 }
 
 // ============================================
@@ -6530,6 +6806,11 @@ let serverUptimeBase = 0;
 let serverUptimeAt = 0;
 let serverUptimeRunning = false;
 let serverUptimeTimer = null;
+const SERVER_TERM_RENDER_MAX = 1500;
+let serverErrorBadgeSeen = 0;
+let serverErrorWindowStart = 0; // boot da VPS: erros antes disso nao contam no badge
+let serverUptimeIsSystem = false; // uptime mostrado e o da maquina (VPS), nao do processo
+let serverUnreachable = false;
 
 function serverClock(ts) {
   try {
@@ -6553,10 +6834,10 @@ function renderServerUptime() {
   if (!value) return;
   if (!serverUptimeRunning) {
     if (label) label.textContent = 'Servidor';
-    value.textContent = 'parado';
+    value.textContent = serverUnreachable ? 'sem contato' : 'parado';
     return;
   }
-  if (label) label.textContent = 'Ativo há';
+  if (label) label.textContent = serverUptimeIsSystem ? 'VPS ligada há' : 'Ativo há';
   const elapsed = serverUptimeBase + Math.max(0, (Date.now() - serverUptimeAt) / 1000);
   value.textContent = serverFormatChrono(elapsed);
 }
@@ -6653,6 +6934,7 @@ function addServerTerminalEntry(entry) {
 
   serverTerminalHistory.push(entry);
   if (serverTerminalHistory.length > 20000) serverTerminalHistory.shift();
+  if (entry.level === 'error') updateServerErrorBadge();
 
   const term = document.getElementById('serverTerminal');
   if (!term) return;
@@ -6678,11 +6960,25 @@ function formatServerTerminalText() {
   }).join('\n');
 }
 
+// Botoes do terminal agora sao so icone: o retorno visual fica no titulo
+// (tooltip) e numa borda verde curta, sem trocar o desenho do botao.
+function flashTermAction(btn, title, ms = 1500) {
+  if (!btn) return;
+  if (!btn.dataset.originalTitle) btn.dataset.originalTitle = btn.title || '';
+  btn.classList.add('is-done');
+  btn.title = title;
+  clearTimeout(btn._flashTimer);
+  btn._flashTimer = setTimeout(() => {
+    btn.classList.remove('is-done');
+    btn.title = btn.dataset.originalTitle || '';
+  }, ms);
+}
+
 async function copyServerTerminal() {
   const text = formatServerTerminalText();
   const btn = document.getElementById('serverTerminalCopy');
   if (!text.trim()) {
-    if (btn) { btn.textContent = 'Vazio'; setTimeout(() => { btn.textContent = 'Copiar'; }, 1200); }
+    flashTermAction(btn, 'Nada para copiar');
     return;
   }
   let ok = false;
@@ -6701,19 +6997,665 @@ async function copyServerTerminal() {
       ta.remove();
     } catch (_) { ok = false; }
   }
-  if (btn) {
-    btn.textContent = ok ? 'Copiado!' : 'Falhou';
-    setTimeout(() => { btn.textContent = 'Copiar'; }, 1400);
-  }
+  flashTermAction(btn, ok ? 'Copiado!' : 'Falhou');
 }
 
 async function clearServerTerminal() {
   serverTerminalHistory = [];
   serverTerminalIds = new Set();
   clearServerTerminalDom();
+  updateServerErrorBadge();
   if (window.electronAPI && window.electronAPI.serverTerminalClear) {
     try { await window.electronAPI.serverTerminalClear(); } catch (_) {}
   }
+}
+
+// ============================================
+// Analises do servidor: disco e RAM em tempo real
+// ============================================
+const RAM_WINDOW_MS = 5 * 60 * 1000; // janela do grafico: 5 minutos
+const RAM_SAMPLES_MAX = 120;
+let ramSamples = [];
+
+function analyticsNum(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatGbFromMb(mb, digits = 1) {
+  const gb = analyticsNum(mb) / 1024;
+  const d = gb >= 100 ? 0 : digits;
+  return `${gb.toFixed(d).replace('.', ',')} GB`;
+}
+
+function renderStorageAnalytics(disk) {
+  const card = document.getElementById('storageCard');
+  const fill = document.getElementById('storageFill');
+  const track = document.getElementById('storageTrack');
+  const pctEl = document.getElementById('storageUsedPct');
+  const sub = document.getElementById('storageSubtitle');
+  const usedEl = document.getElementById('storageUsedLabel');
+  const freeEl = document.getElementById('storageFreeLabel');
+  const totalEl = document.getElementById('storageTotalLabel');
+  if (!card || !fill) return;
+
+  if (!disk) {
+    if (sub) sub.textContent = 'Disco indisponivel neste servidor.';
+    if (pctEl) pctEl.textContent = '--';
+    if (usedEl) usedEl.textContent = '--';
+    if (freeEl) freeEl.textContent = '--';
+    if (totalEl) totalEl.textContent = '--';
+    card.classList.remove('is-warn', 'is-critical');
+    fill.style.width = '0%';
+    return;
+  }
+
+  const pct = Math.max(0, Math.min(100, Math.round(analyticsNum(disk.usedPct))));
+  fill.style.width = `${pct}%`;
+  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (track) track.setAttribute('aria-valuenow', String(pct));
+  if (usedEl) usedEl.textContent = formatGbFromMb(disk.usedMB);
+  if (freeEl) freeEl.textContent = formatGbFromMb(disk.freeMB);
+  if (totalEl) totalEl.textContent = formatGbFromMb(disk.totalMB);
+  if (sub) {
+    sub.textContent = `Disco ${disk.path || '/'} · ${formatGbFromMb(disk.freeMB)} livres para sessoes, audios e backups`;
+  }
+  card.classList.toggle('is-warn', pct >= 75 && pct < 90);
+  card.classList.toggle('is-critical', pct >= 90);
+}
+
+function pushRamSample(ram) {
+  const totalMB = analyticsNum(ram && ram.totalMB);
+  if (!totalMB) return;
+  const usedMB = Math.max(0, analyticsNum(ram.usedMB));
+  const t = Date.now();
+  const last = ramSamples[ramSamples.length - 1];
+  if (last && t - last.t < 1500) {
+    last.usedMB = usedMB;
+    last.totalMB = totalMB;
+  } else {
+    ramSamples.push({ t, usedMB, totalMB });
+  }
+  while (ramSamples.length > RAM_SAMPLES_MAX) ramSamples.shift();
+  while (ramSamples.length > 2 && t - ramSamples[0].t > RAM_WINDOW_MS + 20000) ramSamples.shift();
+}
+
+function smoothSvgPath(points) {
+  if (!points.length) return '';
+  if (points.length === 1) return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  let d = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[i - 1] || points[i];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[i + 2] || p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C ${c1x.toFixed(2)} ${c1y.toFixed(2)}, ${c2x.toFixed(2)} ${c2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
+  }
+  return d;
+}
+
+function renderRamLabels(ram, resources) {
+  const usedEl = document.getElementById('ramUsedGb');
+  const totalEl = document.getElementById('ramTotalGb');
+  const sub = document.getElementById('ramSubtitle');
+  const procEl = document.getElementById('ramProcessLabel');
+  const peakEl = document.getElementById('ramPeakLabel');
+  const avgEl = document.getElementById('ramAvgLabel');
+  const swapEl = document.getElementById('ramSwapLabel');
+  const swapItem = document.getElementById('ramSwapItem');
+  const card = document.getElementById('ramCard');
+  const badge = document.getElementById('ramLiveBadge');
+
+  const totalMB = analyticsNum(ram.totalMB);
+  const usedMB = analyticsNum(ram.usedMB);
+  const pct = totalMB ? Math.round((usedMB / totalMB) * 100) : 0;
+
+  if (usedEl) usedEl.textContent = formatGbFromMb(usedMB);
+  if (totalEl) totalEl.textContent = `de ${formatGbFromMb(totalMB)}`;
+
+  let peak = 0;
+  let sum = 0;
+  for (const s of ramSamples) {
+    peak = Math.max(peak, s.usedMB);
+    sum += s.usedMB;
+  }
+  const avg = ramSamples.length ? sum / ramSamples.length : usedMB;
+
+  if (peakEl) peakEl.textContent = formatGbFromMb(peak || usedMB);
+  if (avgEl) avgEl.textContent = formatGbFromMb(avg);
+  if (procEl) procEl.textContent = formatGbFromMb(resources && resources.processMB);
+
+  if (swapEl && swapItem) {
+    const swapTotal = analyticsNum(resources && resources.swap && resources.swap.totalMB);
+    const swapUsed = analyticsNum(resources && resources.swap && resources.swap.usedMB);
+    if (swapTotal > 0) {
+      swapItem.style.display = '';
+      swapEl.textContent = `${formatGbFromMb(swapUsed)} / ${formatGbFromMb(swapTotal)}`;
+    } else {
+      swapItem.style.display = 'none';
+    }
+  }
+
+  if (sub) {
+    const cores = analyticsNum(resources && resources.cpus) || 0;
+    const load = resources && Array.isArray(resources.loadavg) ? analyticsNum(resources.loadavg[0]) : 0;
+    const parts = [`${pct}% em uso`];
+    if (cores) parts.push(`${cores} nucleo${cores === 1 ? '' : 's'}`);
+    if (load) parts.push(`carga ${load.toFixed(2).replace('.', ',')}`);
+    sub.textContent = parts.join(' · ');
+  }
+
+  if (card) {
+    card.classList.toggle('is-high', pct >= 78 && pct < 90);
+    card.classList.toggle('is-critical', pct >= 90);
+  }
+  if (badge) {
+    const last = ramSamples[ramSamples.length - 1];
+    const stale = !last || Date.now() - last.t > 20000;
+    badge.classList.toggle('is-offline', stale);
+    const label = document.getElementById('ramLiveLabel');
+    if (label) label.textContent = stale ? 'SEM SINAL' : 'AO VIVO';
+  }
+}
+
+function renderRamChart() {
+  const wrap = document.getElementById('ramChartWrap');
+  const svg = document.getElementById('ramChart');
+  const grid = document.getElementById('ramGrid');
+  if (!wrap || !svg || !grid || !ramSamples.length) return;
+
+  const w = Math.max(280, Math.round(wrap.clientWidth || 600));
+  const h = Math.max(120, Math.round(wrap.clientHeight || 168));
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+
+  const padL = 38;
+  const padR = 10;
+  const padT = 8;
+  const padB = 16;
+  const innerW = Math.max(40, w - padL - padR);
+  const innerH = Math.max(40, h - padT - padB);
+
+  const last = ramSamples[ramSamples.length - 1];
+  const totalMB = Math.max(256, analyticsNum(last.totalMB) || 1024);
+  const yFor = (mb) => padT + innerH - (Math.max(0, Math.min(totalMB, mb)) / totalMB) * innerH;
+
+  grid.innerHTML = '';
+  const ns = 'http://www.w3.org/2000/svg';
+  const gbStep = totalMB / 1024;
+
+  for (let i = 0; i <= 4; i++) {
+    const frac = i / 4;
+    const yy = padT + innerH * (1 - frac);
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', String(padL));
+    line.setAttribute('x2', String(w - padR));
+    line.setAttribute('y1', yy.toFixed(1));
+    line.setAttribute('y2', yy.toFixed(1));
+    if (i === 0) line.setAttribute('class', 'ram-grid-base');
+    grid.appendChild(line);
+
+    const label = document.createElementNS(ns, 'text');
+    label.setAttribute('x', String(padL - 8));
+    label.setAttribute('y', String(yy + 3.2));
+    label.setAttribute('text-anchor', 'end');
+    const gb = (gbStep * frac);
+    label.textContent = frac === 0 ? '0' : gb.toFixed(gb >= 10 ? 0 : 1).replace('.', ',');
+    grid.appendChild(label);
+  }
+
+  // Linha de atencao em 85% da RAM.
+  const limitY = yFor(totalMB * 0.85);
+  const limit = document.createElementNS(ns, 'line');
+  limit.setAttribute('x1', String(padL));
+  limit.setAttribute('x2', String(w - padR));
+  limit.setAttribute('y1', limitY.toFixed(1));
+  limit.setAttribute('y2', limitY.toFixed(1));
+  limit.setAttribute('class', 'ram-grid-limit');
+  grid.appendChild(limit);
+
+  const now = Date.now();
+  const points = ramSamples.map((s) => ({
+    x: padL + Math.max(0, Math.min(1, 1 - (now - s.t) / RAM_WINDOW_MS)) * innerW,
+    y: yFor(s.usedMB)
+  }));
+
+  const linePath = smoothSvgPath(points);
+  const lineEl = document.getElementById('ramLine');
+  const areaEl = document.getElementById('ramArea');
+  if (lineEl) lineEl.setAttribute('d', linePath);
+  if (areaEl) {
+    const baseY = padT + innerH;
+    const first = points[0];
+    const lastPt = points[points.length - 1];
+    areaEl.setAttribute('d', `${linePath} L ${lastPt.x.toFixed(2)} ${baseY.toFixed(2)} L ${first.x.toFixed(2)} ${baseY.toFixed(2)} Z`);
+  }
+
+  const pointer = document.getElementById('ramPointer');
+  if (pointer) {
+    const px = points[points.length - 1].x;
+    const py = points[points.length - 1].y;
+    pointer.style.opacity = '1';
+    for (const id of ['ramPointerDot', 'ramPointerHalo']) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      el.setAttribute('cx', px.toFixed(2));
+      el.setAttribute('cy', py.toFixed(2));
+    }
+  }
+
+  const empty = document.getElementById('ramChartEmpty');
+  if (empty) empty.classList.toggle('is-hidden', ramSamples.length >= 2);
+}
+
+function renderServerAnalytics(resources) {
+  if (!resources || typeof resources !== 'object') return;
+  renderStorageAnalytics(resources.disk || null);
+  if (resources.ram && analyticsNum(resources.ram.totalMB)) {
+    pushRamSample(resources.ram);
+    renderRamLabels(resources.ram, resources);
+    renderRamChart();
+  }
+}
+
+function serverZapStatusLabel(status) {
+  const map = {
+    ready: 'Funcionando',
+    connecting: 'Conectando',
+    waiting_qr: 'Aguardando QR',
+    waiting_pairing: 'Aguardando pareamento',
+    pairing_accepted: 'Sincronizando',
+    authenticated: 'Autenticado',
+    auth_failure: 'Erro de autenticacao',
+    pairing_error: 'Erro de pareamento',
+    disconnected: 'Desconectado'
+  };
+  return map[status] || String(status || 'Desconhecido');
+}
+
+function renderServerErrors(errors) {
+  const box = document.getElementById('serverRecentErrors');
+  const countEl = document.getElementById('serverErrorsCount');
+  if (!box) return;
+  const list = Array.isArray(errors) ? errors : [];
+  if (countEl) countEl.textContent = String(list.length);
+  if (!list.length) {
+    box.innerHTML = '<p class="health-empty">Nenhum erro registrado. Tudo certo por aqui.</p>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const e of list) {
+    const row = document.createElement('div');
+    row.className = 'health-error-row';
+    const time = document.createElement('span');
+    time.className = 'health-error-time';
+    time.textContent = serverClock(e.ts);
+    const src = document.createElement('span');
+    src.className = 'health-error-source';
+    src.textContent = e.source || 'SERVIDOR';
+    const msg = document.createElement('span');
+    msg.className = 'health-error-msg';
+    msg.textContent = String(e.msg || '');
+    row.appendChild(time);
+    row.appendChild(src);
+    row.appendChild(msg);
+    box.appendChild(row);
+  }
+}
+
+function renderServerZapsList(o) {
+  const listEl = document.getElementById('serverZapsList');
+  const countEl = document.getElementById('serverZapsConnected');
+  if (!listEl) return;
+  const zaps = Array.isArray(o.zaps) ? o.zaps : [];
+  const total = zaps.length;
+  const connected = zaps.filter((z) => z.status === 'ready').length;
+  if (countEl) countEl.textContent = `${connected}/${total}`;
+  if (!total) {
+    listEl.innerHTML = '<p class="health-empty">Nenhum Zap configurado.</p>';
+    return;
+  }
+  listEl.innerHTML = '';
+  for (const z of zaps) {
+    const row = document.createElement('div');
+    row.className = 'health-zap-row';
+    const dot = document.createElement('span');
+    dot.className = `zap-status-dot ${z.status === 'ready' ? 'ok' : (['auth_failure', 'pairing_error'].includes(z.status) ? 'bad' : 'warn')}`;
+    const name = document.createElement('span');
+    name.className = 'health-zap-name';
+    name.textContent = z.name || String(z.id);
+    const st = document.createElement('span');
+    st.className = 'health-zap-status';
+    st.textContent = serverZapStatusLabel(z.status);
+    row.appendChild(dot);
+    row.appendChild(name);
+    row.appendChild(st);
+    listEl.appendChild(row);
+  }
+}
+
+// Erros que aconteceram DEPOIS do ultimo boot da VPS. O log inteiro persiste
+// no disco, mas a contagem do badge comeca do zero a cada reinicio do servidor.
+function serverErrorsSinceBoot() {
+  const since = serverErrorWindowStart > 0 ? serverErrorWindowStart : 0;
+  return serverTerminalHistory.filter((e) => {
+    if (e.level !== 'error') return false;
+    if (!since) return true;
+    try {
+      const t = new Date(e.ts).getTime();
+      return Number.isNaN(t) || t >= since;
+    } catch (_) { return true; }
+  });
+}
+
+function countServerTerminalErrors() {
+  return serverErrorsSinceBoot().length;
+}
+
+// Sinbolo de erro no canto superior direito: numero REAL de erros desde o
+// ultimo reinicio do servidor. Zero erros = indicador invisivel.
+function updateServerErrorBadge() {
+  const btn = document.getElementById('serverErrorBadge');
+  const countEl = document.getElementById('serverErrorCount');
+  if (!btn || !countEl) return;
+  const total = countServerTerminalErrors();
+  if (total <= 0) {
+    btn.style.display = 'none';
+    serverErrorBadgeSeen = 0;
+    return;
+  }
+  btn.style.display = '';
+  countEl.textContent = String(total);
+  btn.classList.toggle('has-new', total > serverErrorBadgeSeen);
+  // O balao do status mostra a mesma contagem: mantem os dois sincronizados.
+  if (currentServerOverview) updateServerStatusTooltip(currentServerOverview);
+  if (document.getElementById('serverErrorsOverlay') && document.getElementById('serverErrorsOverlay').classList.contains('is-open')) {
+    renderServerErrorsModal();
+  }
+}
+
+function scrollToLastServerError() {
+  const term = document.getElementById('serverTerminal');
+  if (!term) return;
+  const lines = term.querySelectorAll('.server-term-line.level-error');
+  const last = lines[lines.length - 1];
+  if (last) {
+    last.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    last.classList.remove('is-flash');
+    void last.offsetWidth;
+    last.classList.add('is-flash');
+    setTimeout(() => last.classList.remove('is-flash'), 2400);
+  }
+}
+
+function serverErrorStamp(entry) {
+  let stamp = entry.time || serverClock(entry.ts);
+  try {
+    const d = new Date(entry.ts);
+    if (!Number.isNaN(d.getTime())) {
+      stamp = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()} ${stamp}`;
+    }
+  } catch (_) {}
+  return stamp;
+}
+
+function ensureServerErrorsModal() {
+  if (document.getElementById('serverErrorsOverlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'serverErrorsOverlay';
+  overlay.className = 'server-errors-overlay';
+  overlay.innerHTML = `
+    <div class="server-errors-box">
+      <div class="server-errors-head">
+        <div class="server-errors-title">
+          <h3>Erros do servidor</h3>
+          <p id="serverErrorsSub">desde o ultimo reinicio</p>
+        </div>
+        <span class="server-errors-total" id="serverErrorsTotal">0</span>
+      </div>
+      <div class="server-errors-list" id="serverErrorsList"></div>
+      <div class="server-errors-foot">
+        <button type="button" class="server-errors-btn primary" id="serverErrorsCopy">Copiar tudo</button>
+        <button type="button" class="server-errors-btn" id="serverErrorsGoLog">Ver no log</button>
+        <button type="button" class="server-errors-btn" id="serverErrorsClose">Fechar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) closeServerErrorsModal();
+  });
+  document.getElementById('serverErrorsClose').addEventListener('click', closeServerErrorsModal);
+  document.getElementById('serverErrorsCopy').addEventListener('click', copyServerErrors);
+  document.getElementById('serverErrorsGoLog').addEventListener('click', () => {
+    closeServerErrorsModal();
+    if (getActivePageId() !== 'gerenciar-servidor') navigateTo('gerenciar-servidor');
+    setTimeout(scrollToLastServerError, 350);
+  });
+}
+
+function renderServerErrorsModal() {
+  const overlay = document.getElementById('serverErrorsOverlay');
+  if (!overlay) return;
+  const list = document.getElementById('serverErrorsList');
+  const total = document.getElementById('serverErrorsTotal');
+  const sub = document.getElementById('serverErrorsSub');
+  const errors = serverErrorsSinceBoot();
+  if (total) total.textContent = String(errors.length);
+  if (sub) {
+    sub.textContent = serverErrorWindowStart > 0
+      ? `desde o ultimo reinicio (${serverClock(serverErrorWindowStart)} ${String(new Date(serverErrorWindowStart).getDate()).padStart(2, '0')}/${String(new Date(serverErrorWindowStart).getMonth() + 1).padStart(2, '0')})`
+      : 'erros do log do servidor';
+  }
+  if (!list) return;
+  list.innerHTML = '';
+  if (!errors.length) {
+    const empty = document.createElement('p');
+    empty.className = 'server-errors-empty';
+    empty.textContent = 'Nenhum erro desde o ultimo reinicio.';
+    list.appendChild(empty);
+    return;
+  }
+  // Mais recente primeiro: o que acabou de acontecer aparece no topo.
+  const frag = document.createDocumentFragment();
+  for (const e of errors.slice().reverse()) {
+    const row = document.createElement('div');
+    row.className = 'server-error-row';
+
+    const time = document.createElement('span');
+    time.className = 'server-error-time';
+    time.textContent = serverErrorStamp(e);
+
+    const tag = document.createElement('span');
+    tag.className = `server-error-tag tag-${String(e.level || 'error').replace(/[^a-z]/g, '')}`;
+    tag.textContent = e.source || 'SERVIDOR';
+
+    const msg = document.createElement('span');
+    msg.className = 'server-error-msg';
+    msg.textContent = e.msg == null ? '' : String(e.msg);
+
+    row.appendChild(time);
+    row.appendChild(tag);
+    row.appendChild(msg);
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+}
+
+function openServerErrorsModal() {
+  ensureServerErrorsModal();
+  serverErrorBadgeSeen = countServerTerminalErrors();
+  updateServerErrorBadge();
+  renderServerErrorsModal();
+  document.getElementById('serverErrorsOverlay').classList.add('is-open');
+}
+
+function closeServerErrorsModal() {
+  const overlay = document.getElementById('serverErrorsOverlay');
+  if (overlay) overlay.classList.remove('is-open');
+}
+
+async function copyServerErrors() {
+  const errors = serverErrorsSinceBoot();
+  const btn = document.getElementById('serverErrorsCopy');
+  const text = errors.map((e) => `[${serverErrorStamp(e)}] [${e.source || 'SERVIDOR'}] ${e.msg || ''}`).join('\n');
+  if (!text) {
+    flashTermAction(btn, 'Nada para copiar');
+    return;
+  }
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (_) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      ta.remove();
+    } catch (_) { ok = false; }
+  }
+  flashTermAction(btn, ok ? 'Copiado!' : 'Falhou');
+}
+
+function onServerErrorBadgeClick() {
+  openServerErrorsModal();
+}
+
+// Balao do indicador de status: dados REAIS do overview (nada simulado).
+// A cor da bolinha segue o level do servidor (verde/amarelo/vermelho) e o
+// balao explica o motivo exato.
+function serverTooltipStateLine(o) {
+  const errCount = countServerTerminalErrors();
+  const zaps = Array.isArray(o.zaps) ? o.zaps : [];
+  const broken = zaps.filter((z) => z.status === 'auth_failure' || z.status === 'pairing_error').length;
+  const connected = zaps.filter((z) => z.status === 'ready').length;
+  if (!o.running) {
+    return { text: o.paused ? 'Servidor desligado' : 'Servidor sem conexao', cls: 'bad' };
+  }
+  if (o.level === 'bad') {
+    if (broken > 0) return { text: `${broken} ${broken === 1 ? 'Zap comprometido' : 'Zaps comprometidos'} (sessao invalidada - pareie de novo)`, cls: 'bad' };
+    if (zaps.length > 0 && connected === 0) return { text: 'Nenhum Zap conectado - o servidor nao envia mensagens', cls: 'bad' };
+    return { text: o.label || 'Servidor com problema critico', cls: 'bad' };
+  }
+  if (o.level === 'warn') {
+    if (errCount > 0) return { text: `Funcionando com ${errCount} ${errCount === 1 ? 'erro' : 'erros'}`, cls: 'warn' };
+    if (connected < zaps.length) {
+      const off = zaps.length - connected;
+      return { text: `Funcionando com ${off} ${off === 1 ? 'Zap fora do ar' : 'Zaps fora do ar'}`, cls: 'warn' };
+    }
+    return { text: o.label || 'Funcionando com avisos', cls: 'warn' };
+  }
+  return { text: 'Funcionando sem erros', cls: 'ok' };
+}
+
+function serverTooltipRow(label, value, cls) {
+  const row = document.createElement('div');
+  row.className = 'server-tooltip-row';
+  const k = document.createElement('span');
+  k.className = 'server-tooltip-key';
+  k.textContent = label;
+  const v = document.createElement('span');
+  v.className = `server-tooltip-val ${cls || ''}`;
+  v.textContent = value;
+  row.appendChild(k);
+  row.appendChild(v);
+  return row;
+}
+
+function buildServerStatusTooltip(o) {
+  if (!o) {
+    const box = document.createElement('div');
+    box.className = 'server-tooltip-box';
+    box.appendChild(serverTooltipRow('Estado', 'Sem resposta do servidor', 'bad'));
+    const since = serverUnreachable ? new Date().toLocaleTimeString('pt-BR', { hour12: false }) : '';
+    if (since) box.appendChild(serverTooltipRow('Sem contato desde', since, ''));
+    return box;
+  }
+  const box = document.createElement('div');
+  box.className = 'server-tooltip-box';
+
+  const state = serverTooltipStateLine(o);
+  box.appendChild(serverTooltipRow('Estado', state.text, state.cls));
+  if (o.hint && o.hint !== state.text) box.appendChild(serverTooltipRow('Detalhe', o.hint, ''));
+
+  const zaps = Array.isArray(o.zaps) ? o.zaps : [];
+  const connected = zaps.filter((z) => z.status === 'ready').length;
+  box.appendChild(serverTooltipRow('Zaps', `${connected} de ${zaps.length} conectados`, connected === zaps.length && zaps.length > 0 ? 'ok' : (connected < zaps.length ? 'warn' : '')));
+
+  const offline = zaps.filter((z) => z.status !== 'ready');
+  if (offline.length) {
+    const names = offline.slice(0, 4).map((z) => `${z.name || z.id} (${serverZapStatusLabel(z.status)})`).join(', ');
+    const extra = offline.length > 4 ? ` +${offline.length - 4} outros` : '';
+    box.appendChild(serverTooltipRow('Fora do ar', names + extra, 'warn'));
+  }
+
+  const ram = (o.resources && o.resources.ram) || null;
+  if (ram) {
+    box.appendChild(serverTooltipRow('RAM', `${ram.usedPct}% em uso de ${ram.totalGB} GB`, ram.usedPct >= 85 ? 'bad' : (ram.usedPct >= 70 ? 'warn' : '')));
+  }
+  const disk = (o.resources && o.resources.disk) || null;
+  if (disk) {
+    box.appendChild(serverTooltipRow('Disco', `${disk.usedPct}% em uso de ${disk.totalGB} GB`, disk.usedPct >= 85 ? 'bad' : (disk.usedPct >= 70 ? 'warn' : '')));
+  }
+
+  const stt = o.transcription || null;
+  if (stt && stt.enabled !== false) {
+    const totals = stt.totals || {};
+    const queue = stt.queue || {};
+    const pending = Number(queue.waiting) || 0;
+    const running = Number(queue.active) || 0;
+    const done = Number(totals.completed) || 0;
+    const failed = Number(totals.failed) || 0;
+    const p50 = stt.timing && stt.timing.stt ? Number(stt.timing.stt.p50) || 0 : 0;
+    const health = stt.engine ? stt.engine.healthy : null;
+    const parts = [`${done} transcrito(s)`];
+    parts.push(pending || running ? `fila ${pending + running}` : 'fila vazia');
+    if (p50 > 0) parts.push(`p50 ${p50 >= 1000 ? (p50 / 1000).toFixed(1) + 's' : p50 + 'ms'}`);
+    if (failed > 0) parts.push(`${failed} falha(s)`);
+    const cls = health === false ? 'bad' : (failed > 0 ? 'warn' : (pending + running > 0 ? 'warn' : 'ok'));
+    const label = health === false ? 'Áudio (motor parado)' : 'Áudio';
+    box.appendChild(serverTooltipRow(label, parts.join(' · '), cls));
+  }
+
+  const sysUp = Number(o.systemUptime) || 0;
+  if (sysUp > 0) box.appendChild(serverTooltipRow('VPS ligada ha', serverFormatChrono(sysUp), ''));
+
+  const sinceBoot = serverErrorsSinceBoot();
+  const lastErr = sinceBoot.length ? sinceBoot[sinceBoot.length - 1] : null;
+  if (lastErr && lastErr.msg) {
+    const short = String(lastErr.msg).length > 90 ? String(lastErr.msg).slice(0, 90) + '...' : String(lastErr.msg);
+    box.appendChild(serverTooltipRow('Ultimo erro', `${serverErrorStamp(lastErr)} - ${short}`, 'warn'));
+  }
+
+  if (Number.isFinite(Number(o.remoteAgeSec)) && o.remoteAgeSec != null) {
+    const sec = Number(o.remoteAgeSec);
+    box.appendChild(serverTooltipRow('Atualizado', sec < 60 ? `ha ${Math.max(0, Math.floor(sec))}s` : `ha ${Math.floor(sec / 60)}min`, sec > 300 ? 'warn' : ''));
+  }
+  return box;
+}
+
+function ensureServerStatusTooltip() {
+  if (document.getElementById('serverStatusTooltip')) return;
+  const tip = document.createElement('div');
+  tip.id = 'serverStatusTooltip';
+  tip.className = 'server-status-tooltip';
+  tip.style.display = 'none';
+  document.body.appendChild(tip);
+}
+
+function updateServerStatusTooltip(o) {
+  ensureServerStatusTooltip();
+  const tip = document.getElementById('serverStatusTooltip');
+  tip.innerHTML = '';
+  tip.appendChild(buildServerStatusTooltip(o));
 }
 
 function updateServerOverviewDom(o) {
@@ -6728,32 +7670,26 @@ function updateServerOverviewDom(o) {
   const dot = document.getElementById('serverStatusDot');
   if (dot) {
     dot.className = `panel-status-dot server-status-dot ${cls}`;
-    dot.title = o.label || statusText;
+  }
+
+  const label = document.getElementById('serverStatusLabel');
+  if (label) {
+    label.textContent = o.label || statusText;
+    label.dataset.level = cls;
   }
 
   const pill = document.getElementById('serverStatusPill');
   if (pill) {
-    pill.title = o.hint || o.label || statusText;
     pill.dataset.status = statusText;
   }
-  // Visibilidade de erros recentes do servidor
-  const errBox = document.getElementById('serverRecentErrors');
-  if (errBox && Array.isArray(o.errors) && o.errors.length) {
-    errBox.innerHTML = '<strong>Ultimos erros:</strong> ' + o.errors.map(e => `<span style="color:#c00">• ${String(e || '').slice(0, 80)}</span>`).join(' ');
-    errBox.style.display = 'block';
-  } else if (errBox) {
-    errBox.style.display = 'none';
-    errBox.innerHTML = '';
-  }
 
-  const btn = document.getElementById('serverPowerBtn');
-  if (btn) {
-    btn.textContent = running ? 'Desligar servidor' : 'Ligar servidor';
-    btn.className = `server-power-btn ${running ? 'stop' : 'start'}`;
-    btn.title = running
-      ? 'Desliga o bot e para as respostas automaticas'
-      : 'Liga o bot e reconecta os Zaps';
+  renderServerErrors(o.errors);
+  renderServerZapsList(o);
+
+  const btn = document.getElementById('serverRestartBtn');
+  if (btn && !btn.classList.contains('is-busy')) {
     btn.disabled = false;
+    btn.title = 'Reinicia a VPS inteira. O bot volta sozinho em cerca de 1 minuto.';
   }
 
   const total = Math.max(0, Number(o.total) || 0);
@@ -6762,10 +7698,36 @@ function updateServerOverviewDom(o) {
   const zapsLabel = document.getElementById('serverInfoZapsLabel');
   if (zapsLabel) zapsLabel.textContent = total === 1 ? 'Zap' : 'Zaps';
 
-  serverUptimeBase = Math.max(0, Number(o.uptime) || 0);
-  serverUptimeAt = Date.now();
-  serverUptimeRunning = running;
+  // O boot da maquina e a referencia da contagem de erros do badge:
+  // reiniciou a VPS, a contagem comeca do zero (o log continua no disco).
+  if (o.systemBootAt) {
+    try {
+      const t = new Date(o.systemBootAt).getTime();
+      if (!Number.isNaN(t)) serverErrorWindowStart = t;
+    } catch (_) {}
+  }
+
+  // O balao usa a mesma janela de erros do badge: precisa vir DEPOIS.
+  updateServerStatusTooltip(o);
+
+  // Tempo mostrado: preferencia pelo tempo REAL da VPS ligada (os.uptime),
+  // que so zera quando a maquina reinicia. Fallback: uptime do processo.
+  const sysUp = Number(o.systemUptime) || 0;
+  if (sysUp > 0) {
+    serverUptimeBase = sysUp;
+    serverUptimeAt = Date.now();
+    serverUptimeRunning = true;
+    serverUptimeIsSystem = true;
+  } else {
+    serverUptimeBase = Math.max(0, Number(o.uptime) || 0);
+    serverUptimeAt = Date.now();
+    serverUptimeRunning = running;
+    serverUptimeIsSystem = false;
+  }
   renderServerUptime();
+  updateServerErrorBadge();
+
+  renderServerAnalytics(o.resources);
 }
 
 async function refreshServerOverview() {
@@ -6773,41 +7735,115 @@ async function refreshServerOverview() {
   try {
     const o = await window.electronAPI.serverOverview();
     if (!o) return;
+    if (serverUnreachable) {
+      serverUnreachable = false;
+      addServerTerminalEntry({
+        ts: new Date().toISOString(),
+        time: serverClock(),
+        level: 'success',
+        source: 'CONEXAO',
+        msg: 'Servidor respondendo novamente.'
+      });
+    }
     currentServerOverview = o;
     updateServerOverviewDom(o);
-  } catch (_) { /* silencioso - o polling tenta de novo */ }
+  } catch (_) {
+    // O servidor caiu (ou a internet). Congela o cronometro para nao contar
+    // tempo falso e registra UMA entrada de erro local enquanto durar a queda.
+    serverUptimeAt = Date.now();
+    if (!serverUnreachable) {
+      serverUnreachable = true;
+      addServerTerminalEntry({
+        ts: new Date().toISOString(),
+        time: serverClock(),
+        level: 'error',
+        source: 'CONEXAO',
+        msg: 'Sem resposta do servidor - verifique a internet e se a VPS esta ligada.'
+      });
+      updateServerStatusTooltip(null);
+      updateServerErrorBadge();
+    }
+  }
 }
 
-async function toggleServerPower() {
-  if (!window.electronAPI || !window.electronAPI.serverPower) return;
-  const running = currentServerOverview ? !!currentServerOverview.running : true;
-  const willRun = !running;
-  if (!willRun) {
-    const question = 'Desligar o servidor agora? O bot vai parar de responder mensagens ate voce ligar de novo.';
-    const ok = window.electronAPI.nativeConfirm
-      ? window.electronAPI.nativeConfirm(question)
-      : window.confirm(question);
-    if (!ok) return;
-  }
-  const btn = document.getElementById('serverPowerBtn');
+async function restartServer() {
+  if (!window.electronAPI || !window.electronAPI.serverRestart) return;
+  const question = 'Reiniciar o servidor agora?\n\nA VPS inteira sera reiniciada e o bot volta sozinho em cerca de 1 minuto. As conversas continuam salvas.';
+  const ok = window.electronAPI.nativeConfirm
+    ? window.electronAPI.nativeConfirm(question)
+    : window.confirm(question);
+  if (!ok) return;
+  const btn = document.getElementById('serverRestartBtn');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = willRun ? 'Ligando...' : 'Desligando...';
+    btn.classList.add('is-busy');
+    const label = btn.querySelector('span');
+    if (label) label.textContent = 'Reiniciando...';
   }
+  let started = false;
   try {
-    const r = await window.electronAPI.serverPower(willRun);
+    const r = await window.electronAPI.serverRestart();
     if (r && r.ok === false) {
-      alert(`Nao foi possivel ${willRun ? 'ligar' : 'desligar'} o servidor: ${r.error || 'erro desconhecido'}`);
+      alert(`Nao foi possivel reiniciar o servidor: ${r.error || 'erro desconhecido'}`);
+      return;
     }
+    started = true;
   } catch (e) {
-    alert(`Nao foi possivel ${willRun ? 'ligar' : 'desligar'} o servidor: ${e.message}`);
+    // A conexao pode cair no meio do reinicio: isso e esperado.
+    started = true;
   } finally {
-    if (btn) {
+    if (!started && btn) {
       btn.disabled = false;
-      btn.textContent = willRun ? 'Desligar servidor' : 'Ligar servidor';
+      btn.classList.remove('is-busy');
+      const label = btn.querySelector('span');
+      if (label) label.textContent = 'Reiniciar servidor';
     }
-    refreshServerOverview();
   }
+  if (started) showRestartOverlay();
+}
+
+function showRestartOverlay() {
+  let overlay = document.getElementById('serverRestartOverlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'serverRestartOverlay';
+    overlay.className = 'server-restart-overlay';
+    overlay.innerHTML = `
+      <div class="server-restart-box">
+        <div class="server-restart-spinner" aria-hidden="true"></div>
+        <h3>Reiniciando o servidor</h3>
+        <p id="serverRestartText">A VPS esta reiniciando. O painel volta sozinho assim que o servidor responder.</p>
+        <div class="server-restart-progress"><span id="serverRestartBar"></span></div>
+        <div class="server-restart-meta" id="serverRestartMeta">aguardando o servidor...</div>
+      </div>`;
+    document.body.appendChild(overlay);
+  }
+  overlay.classList.add('is-open');
+  const startedAt = Date.now();
+
+  async function poll() {
+    const meta = document.getElementById('serverRestartMeta');
+    const bar = document.getElementById('serverRestartBar');
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    if (meta) meta.textContent = `aguardando o servidor... ${elapsed}s`;
+    if (bar) bar.style.width = `${Math.min(96, 8 + elapsed * 2.2)}%`;
+    let alive = false;
+    try {
+      if (window.electronAPI && window.electronAPI.serverOverview) {
+        const o = await window.electronAPI.serverOverview();
+        alive = !!(o && typeof o === 'object');
+      }
+    } catch (_) { alive = false; }
+    if (alive) {
+      if (bar) bar.style.width = '100%';
+      const text = document.getElementById('serverRestartText');
+      if (text) text.textContent = 'Servidor no ar. Recarregando o painel...';
+      setTimeout(() => window.location.reload(), 900);
+      return;
+    }
+    setTimeout(poll, 4000);
+  }
+  setTimeout(poll, 6000);
 }
 
 async function sendServerCommand() {
@@ -6834,199 +7870,6 @@ async function sendServerCommand() {
   input.focus();
 }
 
-const SERVER_TERM_RENDER_MAX = 5000;
-let serverConnectMode = 'local';
-
-async function refreshServerConnectCard() {
-  if (!window.electronAPI || !window.electronAPI.serverConfigGet) return;
-  const title = document.getElementById('serverConnectTitle');
-  const hint = document.getElementById('serverConnectHint');
-  const pathEl = document.getElementById('serverConnectPath');
-  const pick = document.getElementById('serverConnectPick');
-  const clone = document.getElementById('serverConnectClone');
-  let cfg = null;
-  try { cfg = await window.electronAPI.serverConfigGet(); } catch (_) { cfg = null; }
-  if (!cfg) return;
-  serverConnectMode = cfg.mode || 'local';
-
-  if (cfg.mode === 'server') {
-    if (title) title.textContent = 'Servidor 24h conectado';
-    if (hint) hint.textContent = 'O bot roda no servidor, 24 horas. Este PC e apenas o painel: fechar o programa nao para o WhatsApp.';
-    if (pathEl) pathEl.textContent = `Repositorio de dados: ${cfg.repoDir || '?'}`;
-    if (pick) { pick.textContent = 'Trocar pasta do repositorio'; pick.style.display = ''; pick.disabled = false; }
-    if (clone) clone.style.display = 'none';
-  } else if (cfg.mode === 'server-missing') {
-    if (title) title.textContent = 'Servidor 24h sem conexao';
-    if (hint) hint.textContent = 'O servidor esta configurado, mas a pasta do repositorio de dados nao foi encontrada. O WhatsApp NAO sera iniciado neste PC.';
-    if (pathEl) pathEl.textContent = cfg.repoDir ? `Ultimo caminho: ${cfg.repoDir}` : '';
-    if (pick) { pick.textContent = 'Reconectar pasta do repositorio'; pick.style.display = ''; pick.disabled = false; }
-    if (clone) clone.style.display = '';
-  } else if (cfg.mode === 'remote') {
-    // Modo VPS: o bot roda no servidor remoto; este PC e somente o painel.
-    if (title) title.textContent = 'Servidor na VPS conectado';
-    if (hint) hint.textContent = 'O bot roda na VPS, 24 horas. Este PC e apenas o painel: fechar o programa nao para o WhatsApp.';
-    if (pathEl) pathEl.textContent = cfg.url ? `Servidor: ${cfg.url}` : '';
-    if (pick) { pick.textContent = 'Voltar ao modo local'; pick.style.display = ''; pick.disabled = false; }
-    if (clone) clone.style.display = 'none';
-  } else {
-    if (title) title.textContent = 'Este PC esta hospedando o bot';
-    if (hint) hint.textContent = 'Neste modo o bot so funciona enquanto este programa estiver aberto. Para funcionar 24h sem o PC ligado, conecte o servidor abaixo.';
-    if (pathEl) pathEl.textContent = '';
-    if (pick) { pick.textContent = 'Usar pasta do repositorio'; pick.style.display = ''; pick.disabled = false; }
-    if (clone) clone.style.display = '';
-  }
-}
-
-async function restartForServerConfig() {
-  try {
-    if (window.electronAPI.serverRelaunch) {
-      await window.electronAPI.serverRelaunch();
-    } else {
-      alert('Feche e abra o programa para aplicar.');
-    }
-  } catch (_) {
-    alert('Feche e abra o programa para aplicar.');
-  }
-}
-
-async function pickServerRepoFolder() {
-  if (!window.electronAPI || !window.electronAPI.serverConfigPick) return;
-  if (serverConnectMode === 'remote') {
-    if (!confirm('Voltar a rodar o bot neste PC? O programa vai reiniciar no modo local.')) return;
-    const r = await window.electronAPI.remoteConfigDisable();
-    if (r && r.ok) {
-      alert('Modo local restaurado. O programa vai reiniciar.');
-      await restartForServerConfig();
-      return;
-    }
-    alert((r && r.error) || 'Nao foi possivel voltar ao modo local.');
-    return;
-  }
-  const btn = document.getElementById('serverConnectPick');
-  if (btn) { btn.disabled = true; btn.textContent = 'Abrindo...'; }
-  try {
-    const r = await window.electronAPI.serverConfigPick();
-    if (r && r.ok) {
-      alert('Servidor configurado! O programa vai reiniciar para entrar no modo painel.');
-      await restartForServerConfig();
-      return;
-    }
-    if (r && !r.canceled) alert(r.error || 'Nao foi possivel usar essa pasta.');
-  } catch (e) {
-    alert('Erro ao escolher a pasta: ' + e.message);
-  } finally {
-    if (btn) btn.disabled = false;
-    refreshServerConnectCard();
-  }
-}
-
-async function cloneServerRepo() {
-  if (!window.electronAPI || !window.electronAPI.serverConfigClone) return;
-  const url = document.getElementById('serverRepoUrl');
-  const token = document.getElementById('serverRepoToken');
-  const btn = document.getElementById('serverCloneGo');
-  if (!url || !url.value.trim()) { alert('Informe a URL do repositorio de dados.'); return; }
-  if (btn) { btn.disabled = true; btn.textContent = 'Clonando...'; }
-  try {
-    const r = await window.electronAPI.serverConfigClone(url.value.trim(), token ? token.value.trim() : '');
-    if (r && r.ok) {
-      alert('Repositorio clonado e servidor conectado! O programa vai reiniciar.');
-      await restartForServerConfig();
-      return;
-    }
-    alert((r && r.error) || 'Nao foi possivel clonar o repositorio.');
-  } catch (e) {
-    alert('Erro ao clonar: ' + e.message);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Clonar e conectar'; }
-  }
-}
-
-// ------------------------------------------------------------
-// Conexao do Setup com o backend na VPS (modo cliente remoto)
-// ------------------------------------------------------------
-function setRemoteConnectStatus(text, kind) {
-  const hint = document.getElementById('remoteConnectHint');
-  if (!hint) return;
-  hint.textContent = text || '';
-  hint.style.color = kind === 'error' ? '#b3261e' : (kind === 'success' ? '#1a7f37' : '');
-}
-
-async function refreshRemoteConnectCard() {
-  if (!window.electronAPI || !window.electronAPI.remoteConfigGet) return;
-  const card = document.getElementById('remoteConnectCard');
-  const input = document.getElementById('remoteServerUrl');
-  const off = document.getElementById('remoteConnectOff');
-  let cfg = null;
-  try { cfg = await window.electronAPI.remoteConfigGet(); } catch (_) { cfg = null; }
-  if (!cfg) return;
-  if (input && cfg.url) input.value = cfg.url;
-  if (card) card.classList.toggle('is-connected', !!cfg.enabled);
-  if (off) off.style.display = cfg.enabled ? '' : 'none';
-  if (cfg.enabled) {
-    setRemoteConnectStatus(`Conectado ao servidor ${cfg.url}. O bot roda na VPS; este PC e apenas o painel.`, 'success');
-  } else {
-    setRemoteConnectStatus('Conecte este Setup ao backend 24h que roda na VPS. O bot continua no ar mesmo com o PC desligado.');
-  }
-}
-
-async function testRemoteConnection() {
-  const input = document.getElementById('remoteServerUrl');
-  const btn = document.getElementById('remoteConnectTest');
-  if (!window.electronAPI || !window.electronAPI.remoteConfigTest || !input) return;
-  const url = input.value.trim();
-  if (!url) { setRemoteConnectStatus('Informe o endereco do servidor.', 'error'); return; }
-  if (btn) { btn.disabled = true; btn.textContent = 'Testando...'; }
-  setRemoteConnectStatus('Testando conexao...');
-  try {
-    const r = await window.electronAPI.remoteConfigTest(url);
-    if (r && r.ok) {
-      const up = r.health && r.health.uptime != null ? ` (no ar ha ${Math.floor(r.health.uptime / 60)} min)` : '';
-      setRemoteConnectStatus(`Servidor respondeu${up}. Pode salvar para conectar.`, 'success');
-    } else {
-      setRemoteConnectStatus((r && r.error) || 'Nao foi possivel falar com o servidor.', 'error');
-    }
-  } catch (e) {
-    setRemoteConnectStatus('Erro ao testar: ' + e.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Testar conexao'; }
-  }
-}
-
-async function saveRemoteConnection() {
-  const input = document.getElementById('remoteServerUrl');
-  const btn = document.getElementById('remoteConnectSave');
-  if (!window.electronAPI || !window.electronAPI.remoteConfigSave || !input) return;
-  const url = input.value.trim();
-  if (!url) { setRemoteConnectStatus('Informe o endereco do servidor.', 'error'); return; }
-  if (btn) { btn.disabled = true; btn.textContent = 'Salvando...'; }
-  try {
-    const r = await window.electronAPI.remoteConfigSave({ url });
-    if (r && r.ok) {
-      setRemoteConnectStatus('Configurado. Reiniciando no modo cliente...', 'success');
-      alert('Servidor configurado! O programa vai reiniciar e pedir a senha administrativa.');
-      await restartForServerConfig();
-      return;
-    }
-    setRemoteConnectStatus((r && r.error) || 'Nao foi possivel salvar.', 'error');
-  } catch (e) {
-    setRemoteConnectStatus('Erro ao salvar: ' + e.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Salvar e reiniciar'; }
-  }
-}
-
-async function disableRemoteConnection() {
-  if (!window.electronAPI || !window.electronAPI.remoteConfigDisable) return;
-  if (!confirm('Voltar a rodar o bot neste PC? O programa vai reiniciar no modo local.')) return;
-  const r = await window.electronAPI.remoteConfigDisable();
-  if (r && r.ok) {
-    alert('Modo local restaurado. O programa vai reiniciar.');
-    await restartForServerConfig();
-    return;
-  }
-  setRemoteConnectStatus((r && r.error) || 'Nao foi possivel desativar.', 'error');
-}
 
 function initServerPage() {
   if (!window.electronAPI || !window.electronAPI.serverOverview) return;
@@ -7061,12 +7904,13 @@ function initServerPage() {
         serverTerminalHistory.push(entry);
       }
       if (serverTerminalHistory.length > 20000) serverTerminalHistory = serverTerminalHistory.slice(-20000);
+      updateServerErrorBadge();
       renderServerTerminal();
     }).catch(() => {});
   }
 
-  const powerBtn = document.getElementById('serverPowerBtn');
-  if (powerBtn) powerBtn.addEventListener('click', toggleServerPower);
+  const powerBtn = document.getElementById('serverRestartBtn');
+  if (powerBtn) powerBtn.addEventListener('click', restartServer);
 
   const clearBtn = document.getElementById('serverTerminalClear');
   if (clearBtn) clearBtn.addEventListener('click', clearServerTerminal);
@@ -7089,43 +7933,17 @@ function initServerPage() {
           a.download = `terminal-log-${new Date().toISOString().slice(0, 10)}.txt`;
           a.click();
           URL.revokeObjectURL(url);
-          downloadBtn.textContent = 'Baixado!';
+          flashTermAction(downloadBtn, 'Log baixado!');
         } else if (r && r.ok) {
-          downloadBtn.textContent = 'Salvo!';
+          flashTermAction(downloadBtn, 'Log salvo!');
         } else if (r && !r.canceled) {
           alert(r.error || 'Nao foi possivel salvar o log.');
         }
       } catch (e) {
         alert('Erro ao salvar o log: ' + e.message);
       }
-      setTimeout(() => { downloadBtn.textContent = 'Baixar'; }, 1600);
     });
   }
-
-  const connectPick = document.getElementById('serverConnectPick');
-  if (connectPick) connectPick.addEventListener('click', pickServerRepoFolder);
-
-  const connectClone = document.getElementById('serverConnectClone');
-  const clonePanel = document.getElementById('serverClonePanel');
-  if (connectClone && clonePanel) {
-    connectClone.addEventListener('click', () => {
-      clonePanel.style.display = clonePanel.style.display === 'none' ? '' : 'none';
-    });
-  }
-  const cloneGo = document.getElementById('serverCloneGo');
-  if (cloneGo) cloneGo.addEventListener('click', cloneServerRepo);
-  const cloneCancel = document.getElementById('serverCloneCancel');
-  if (cloneCancel && clonePanel) cloneCancel.addEventListener('click', () => { clonePanel.style.display = 'none'; });
-
-  refreshServerConnectCard();
-  refreshRemoteConnectCard();
-
-  const remoteTest = document.getElementById('remoteConnectTest');
-  if (remoteTest) remoteTest.addEventListener('click', testRemoteConnection);
-  const remoteSave = document.getElementById('remoteConnectSave');
-  if (remoteSave) remoteSave.addEventListener('click', saveRemoteConnection);
-  const remoteOff = document.getElementById('remoteConnectOff');
-  if (remoteOff) remoteOff.addEventListener('click', disableRemoteConnection);
 
   const form = document.getElementById('serverTerminalForm');
   if (form) {
@@ -7159,6 +7977,29 @@ function initServerPage() {
     });
   }
 
+  const badgeBtn = document.getElementById('serverErrorBadge');
+  if (badgeBtn) badgeBtn.addEventListener('click', onServerErrorBadgeClick);
+  updateServerErrorBadge();
+
+  // Balao com os stats reais ao passar o mouse no indicador de status.
+  const statusPill = document.getElementById('serverStatusPill');
+  if (statusPill) {
+    ensureServerStatusTooltip();
+    const tip = document.getElementById('serverStatusTooltip');
+    const showTip = () => {
+      const r = statusPill.getBoundingClientRect();
+      tip.style.display = 'block';
+      const tw = tip.offsetWidth;
+      let left = Math.round(r.left + r.width / 2 - tw / 2);
+      left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+      tip.style.left = `${left}px`;
+      tip.style.top = `${Math.round(r.bottom + 8)}px`;
+    };
+    statusPill.addEventListener('mouseenter', showTip);
+    statusPill.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+    window.addEventListener('resize', () => { tip.style.display = 'none'; });
+  }
+
   renderServerUptime();
   if (!serverUptimeTimer) {
     serverUptimeTimer = setInterval(() => {
@@ -7167,9 +8008,20 @@ function initServerPage() {
   }
 
   refreshServerOverview();
+  // 3s: o grafico de RAM precisa de amostras frequentes para parecer "ao vivo".
   setInterval(() => {
     if (getActivePageId() === 'gerenciar-servidor' && !document.hidden) refreshServerOverview();
-  }, 5000);
+  }, 3000);
+
+  // O grafico e desenhado em pixels (viewBox = tamanho real). Ao redimensionar
+  // a janela, redesenha com as amostras que ja existem.
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (getActivePageId() === 'gerenciar-servidor') renderRamChart();
+    }, 120);
+  });
 }
 
 // ============================================
@@ -7188,6 +8040,32 @@ function startApp() {
       refreshServerOverview();
     });
   }
+  // Qualquer erro do proprio painel tambem entra no log (e sobe o badge):
+  // nada quebra em silencio sem deixar rastro visivel para corrigir.
+  window.addEventListener('error', (ev) => {
+    try {
+      const file = ev.filename ? String(ev.filename).split(/[\\/]/).pop() : 'painel';
+      addServerTerminalEntry({
+        ts: new Date().toISOString(),
+        time: serverClock(),
+        level: 'error',
+        source: 'PAINEL',
+        msg: `Erro no painel (${file}:${ev.lineno || '?'}): ${ev.message || 'desconhecido'}`
+      });
+    } catch (_) {}
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    try {
+      const msg = ev.reason && ev.reason.message ? ev.reason.message : String(ev.reason || 'desconhecido');
+      addServerTerminalEntry({
+        ts: new Date().toISOString(),
+        time: serverClock(),
+        level: 'error',
+        source: 'PAINEL',
+        msg: `Promessa nao tratada no painel: ${msg}`
+      });
+    } catch (_) {}
+  });
 }
 
 if (document.readyState === 'loading') {

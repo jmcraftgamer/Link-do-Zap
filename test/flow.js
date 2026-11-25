@@ -304,9 +304,35 @@ async function run() {
     await fakeMgr.cb(mkMsg(person('5522777777777', 'Carlos')));
 
     const sent = lastSent();
+    const output = newLogs(s);
+    const modelCount = Number((output.match(/(\d+) modelo\(s\) disponivel/) || [])[1]);
     assert.strictEqual(sent.text, 'Tudo certo por aqui, posso te ajudar?');
     assert.ok(!sent.text.includes('Jota da'), 'texto cortado foi ao cliente');
-    assert.ok(fetchCalls.slice(s.fetch).length >= 2, 'fallback nao foi tentado');
+    assert.strictEqual(fetchCalls.slice(s.fetch).length, modelCount, 'fallback duplicado ou ausente');
+    assert.ok(!output.includes('[FALLBACK]'), 'fallback interno duplicou o controle do pipeline');
+  });
+
+  testAsync('fluxo: todos os modelos falham uma unica vez e o erro final tem motivo', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = (req) => {
+      if (isGoogle(req)) throw new Error('Google indisponivel');
+      return { ok: false, status: 503, json: { error: { message: 'OpenRouter indisponivel' } } };
+    };
+    const result = await fakeMgr.cb(mkMsg(person('5511888888888', 'Julia')));
+    const output = newLogs(s);
+    const modelCount = Number((output.match(/(\d+) modelo\(s\) disponivel/) || [])[1]);
+    const attempts = output.match(/\[\d+\/\d+\] Tentando [^\n]+/g) || [];
+    const attemptModels = attempts.map((line) => line.replace(/^\[\d+\/\d+\]\s+/, ''));
+
+    assert.strictEqual(result.reason, 'all_models_failed');
+    assert.strictEqual(fetchCalls.slice(s.fetch).length, modelCount, 'cada modelo deve ser tentado uma vez');
+    assert.strictEqual(attempts.length, modelCount, 'tentativa duplicada no log');
+    assert.strictEqual(new Set(attemptModels).size, modelCount, 'o mesmo modelo foi tentado duas vezes');
+    assert.strictEqual((output.match(new RegExp(`\\[1/${modelCount}\\] Tentando Google AI Studio \\/ gemini-a`, 'g')) || []).length, 1);
+    assert.strictEqual((output.match(new RegExp(`\\[${modelCount}/${modelCount}\\] Tentando OpenRouter \\/ meta/llama`, 'g')) || []).length, 1);
+    assert.ok(output.includes('Todos os modelos falharam. Ultimo erro: OpenRouter indisponivel'), 'motivo final ausente');
+    assert.ok(!output.includes('[FALLBACK]'), 'fallback interno duplicou o controle do pipeline');
   });
 
   // ---------------------------------------------------------------
@@ -360,6 +386,43 @@ async function run() {
     assert.strictEqual(fetchCalls.length, s.fetch, 'IA foi chamada para um grupo');
     assert.strictEqual(sentMessages.length, s.sent, 'mensagem foi enviada para um grupo');
     assert.ok(logs.slice(s.logs).some(l => l.includes('[GRUPO]')), 'log de corte de grupo ausente');
+  });
+
+  testAsync('fluxo: contato bloqueado pelo PN em mensagem LID nao inicia IA e liberacao vale na hora', async () => {
+    const zapsPath = path.join(dataDir, 'zaps.json');
+    const original = fs.readFileSync(zapsPath, 'utf8');
+    const blockedData = JSON.parse(original);
+    blockedData[0].blockedContacts = ['553299203662@s.whatsapp.net'];
+    fs.writeFileSync(zapsPath, JSON.stringify(blockedData, null, 2));
+    const lidMessage = () => mkMsg({
+      from: '166687848546375@lid',
+      contact: { id: '553299203662@s.whatsapp.net', name: 'Mae', number: '553299203662' },
+      chat: { id: '166687848546375@lid', name: 'Mae', isGroup: false }
+    });
+    try {
+      const s = snapshot();
+      fetchHandler = () => { throw new Error('IA foi chamada para contato bloqueado'); };
+      const blockedResult = await fakeMgr.cb(lidMessage());
+      const blockedLogs = newLogs(s);
+      assert.strictEqual(blockedResult.accepted, false);
+      assert.strictEqual(blockedResult.reason, 'blocked_contact');
+      assert.strictEqual(fetchCalls.length, s.fetch, 'mensagem bloqueada foi enviada a IA');
+      assert.strictEqual(sentMessages.length, s.sent, 'mensagem bloqueada gerou envio');
+      assert.ok(!blockedLogs.includes('IA iniciando'), 'log de IA iniciando apareceu antes do filtro');
+      assert.ok(!blockedLogs.includes('Recebido'), 'log de mensagem recebida apareceu para contato bloqueado');
+      assert.ok(!blockedLogs.includes('nao autorizado para IA'), 'log de bloqueio apareceu');
+
+      const allowedData = JSON.parse(original);
+      allowedData[0].blockedContacts = [];
+      fs.writeFileSync(zapsPath, JSON.stringify(allowedData, null, 2));
+      fetchHandler = () => googleOk('Oi, Mae!');
+      const allowedResult = await fakeMgr.cb(lidMessage());
+      assert.strictEqual(allowedResult.accepted, true);
+      assert.strictEqual(fetchCalls.length, s.fetch + 1, 'liberacao do contato nao valeu sem reiniciar');
+      assert.strictEqual(lastSent().text, 'Oi, Mae!');
+    } finally {
+      fs.writeFileSync(zapsPath, original);
+    }
   });
 
   // ---------------------------------------------------------------
@@ -552,6 +615,19 @@ async function run() {
     try { await fakeMgr.cb(mkMsg()); } finally { fakeMgr.ownerReplied = false; }
     assert.strictEqual(sentMessages.length, s.sent, 'IA enviou mesmo com resposta do dono');
     assert.ok(newLogs(s).includes('Dono do numero ja respondeu'), 'log da checagem do dono ausente');
+  });
+
+  testAsync('fluxo: dono responde entre baloes e a IA para os demais', async () => {
+    clearCooldown();
+    const s = snapshot();
+    fetchHandler = () => googleOk('primeiro[QUEBRA]segundo[QUEBRA]terceiro');
+    const originalCheck = fakeMgr.hasOwnerReplied;
+    let checks = 0;
+    fakeMgr.hasOwnerReplied = async () => ++checks > 1;
+    try { await fakeMgr.cb(mkMsg()); } finally { fakeMgr.hasOwnerReplied = originalCheck; }
+    const sent = sentMessages.slice(s.sent);
+    assert.deepStrictEqual(sent.map(m => m.text), ['primeiro'], 'a IA continuou depois da resposta humana');
+    assert.strictEqual(checks, 2, 'a resposta humana deveria ser checada antes de cada balao');
   });
 
   // horario de atendimento: fora da janela nada e enviado

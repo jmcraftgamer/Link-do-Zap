@@ -1,0 +1,44 @@
+[Unit]
+Description=Assistente do Zap - STT local (whisper.cpp)
+Documentation=https://github.com/ggerganov/whisper.cpp
+After=network.target
+# Nao reinicia em loop se o modelo nao existir: o backend continua no ar e
+# apenas os audios ficam aguardando.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=zap
+Group=zap
+WorkingDirectory=/opt/assistente-zap
+ExecStart=/opt/assistente-zap/vendor/whisper.cpp/build/bin/whisper-server -m /opt/assistente-zap/models/ggml-tiny.bin --host 127.0.0.1 --port 8191 -t 1 -l pt
+
+Restart=always
+RestartSec=3
+
+# Limites para uma VPS de 2 GB: o worker nunca pode competir com o Electron,
+# o WhatsApp e a IA. Se o kernel precisar matar algo, mata o worker.
+Nice=10
+CPUQuota=70%
+MemoryHigh=550M
+MemoryMax=700M
+MemorySwapMax=256M
+OOMScoreAdjust=500
+IOWeight=50
+
+# Isolamento: so a pasta de dados efemeros e gravavel.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/opt/assistente-zap/models /opt/assistente-zap/vendor/whisper.cpp
+ReadWritePaths=/opt/assistente-zap/data/stt
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

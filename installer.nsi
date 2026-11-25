@@ -1,53 +1,68 @@
+﻿; Instalador do Link no WhatsApp (NSIS).
+; Compilar depois de empacotar o app:
+;   npx electron-builder --win --dir
+;   makensis installer.nsi
+; O electron-builder gera dist\win-unpacked; este script so empacota essa pasta.
+
 !include "MUI2.nsh"
-RequestExecutionLevel admin
 
-; Ícones do instalador (caminho absoluto)
-!define MUI_ICON "C:\\Users\\eojap\\Projetos\\Outros\\Assitente do Zap\\build\\icon.ico"
-!define MUI_UNICON "C:\\Users\\eojap\\Projetos\\Outros\\Assitente do Zap\\build\\icon.ico"
+Unicode true
+RequestExecutionLevel user
 
-Name "Link no WhatsApp"
-OutFile "dist\\Link-no-WhatsApp-Setup-1.0.0.exe"
-InstallDir "$PROGRAMFILES\\LinkNoWhatsApp"
+!define APP_NAME "Link no WhatsApp"
+!define APP_EXE "Link no WhatsApp.exe"
+!define APP_KEY "LinkNoWhatsApp"
+!define APP_VERSION "1.0.0"
+
+Name "${APP_NAME}"
+OutFile "dist\Link-no-WhatsApp-Setup-${APP_VERSION}.exe"
+InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
+InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "InstallLocation"
+BrandingText "${APP_NAME} ${APP_VERSION}"
+
+!define MUI_ICON "${__FILEDIR__}\build\icon.ico"
+!define MUI_UNICON "${__FILEDIR__}\build\icon.ico"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
 !insertmacro MUI_LANGUAGE "PortugueseBR"
 !insertmacro MUI_LANGUAGE "English"
 
-Section "MainSection" SEC01
+Section "Programa" SEC_APP
+  SetShellVarContext current
   SetOutPath "$INSTDIR"
-  SetShellVarContext all
-  File /r "${__FILEDIR__}\\dist\\win-unpacked\\*.*"
-  File "${__FILEDIR__}\\build\\icon.ico"
-  CreateDirectory "$SMPROGRAMS\\LinkNoWhatsApp"
-  CreateShortCut "$SMPROGRAMS\\LinkNoWhatsApp\\Link no WhatsApp.lnk" "$INSTDIR\\Link no WhatsApp.exe" "" "$INSTDIR\\icon.ico" 0
-  ; Desktop shortcut (always)
-  CreateShortCut "$DESKTOP\\Link no WhatsApp.lnk" "$INSTDIR\\Link no WhatsApp.exe" "" "$INSTDIR\\icon.ico" 0
+  File /r "${__FILEDIR__}\dist\win-unpacked\*.*"
+  File "${__FILEDIR__}\build\icon.ico"
 
-  ; Register in "Apps & features"
-  SetRegView 32
-  SetRegView 64
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "DisplayName" "Link no WhatsApp"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "DisplayVersion" "1.0.0"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "Publisher" "Seu Nome ou Empresa"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "UninstallString" "$INSTDIR\\uninstall.exe"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "DisplayIcon" "$INSTDIR\\icon.ico"
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "NoModify" 1
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LinkNoWhatsApp" "NoRepair" 1
+  CreateDirectory "$SMPROGRAMS\${APP_NAME}"
+  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\icon.ico" 0
+  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\icon.ico" 0
 
-  Exec "$INSTDIR\\Link no WhatsApp.exe"
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-  ; Generate uninstaller
-  WriteUninstaller "$INSTDIR\\uninstall.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "DisplayName" "${APP_NAME}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "DisplayVersion" "${APP_VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "Publisher" "Link no WhatsApp"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "DisplayIcon" "$INSTDIR\icon.ico"
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "NoModify" 1
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}" "NoRepair" 1
 SectionEnd
 
 Section "Uninstall"
-  Delete "$INSTDIR\\Link no WhatsApp.exe"
+  SetShellVarContext current
+  Delete "$DESKTOP\${APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
+  RMDir "$SMPROGRAMS\${APP_NAME}"
+
   RMDir /r "$INSTDIR"
-  Delete "$SMPROGRAMS\\LinkNoWhatsApp\\Link no WhatsApp.lnk"
-  RMDir "$SMPROGRAMS\\LinkNoWhatsApp"
-  Delete "$DESKTOP\\Link no WhatsApp.lnk"
+
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_KEY}"
 SectionEnd

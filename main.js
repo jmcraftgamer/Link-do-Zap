@@ -15,6 +15,13 @@ const billingCore = require('./src/core/billing');
 const { createEventBus } = require('./src/core/events');
 const { createTypingService } = require('./src/core/messaging/typing');
 const { createMessagePipeline } = require('./src/core/messaging/pipeline');
+const { AudioTaskStore } = require('./src/core/audio/task-store');
+const { AudioScheduler } = require('./src/core/audio/scheduler');
+const { AudioPipeline } = require('./src/core/audio/pipeline');
+const { createAudioPreparer } = require('./src/core/audio/ffmpeg');
+const { createSttSystem } = require('./src/core/stt');
+const { resourcesSnapshot } = require('./src/core/resources');
+const { spawn } = require('child_process');
 
 // Superficie unica de comandos: o IPC do Setup e a API do backend chamam os
 // mesmos handlers, garantindo comportamento identico nos dois transportes.
@@ -75,10 +82,36 @@ let serverKnownZaps = null;
 const zapErrors = new Map();
 
 // Um evaluate do wwebjs numa pagina morta (teardown de LOGOUT) rejeita sem
-// catcher e no Node derrubaria o processo inteiro - aqui so registra o erro
+// catcher e no Node derrubaria o processo inteiro. Aqui registra no terminal
+// do painel (persistente) e segue rodando: rejeicao nao derruba o servico.
 process.on('unhandledRejection', (reason) => {
-  const msg = reason && reason.message ? reason.message : String(reason);
-  console.error('[UNHANDLED] Promessa rejeitada sem tratamento:', msg);
+  const msg = reason && reason.stack ? String(reason.stack) : String(reason);
+  try {
+    pushLogLine(`${new Date().toISOString()} [UNHANDLED] Promessa rejeitada sem tratamento: ${msg}`);
+    appendServerTerminalEntry({
+      level: 'error',
+      source: 'SISTEMA',
+      msg: `Promessa rejeitada sem tratamento: ${msg}`
+    });
+  } catch (_) {}
+  _err('[UNHANDLED] Promessa rejeitada sem tratamento:', msg);
+});
+
+// Excecao nao tratada deixa o processo em estado indefinido: registra no
+// terminal (o arquivo persiste no disco) e sai; o systemd (Restart=always)
+// sobe o servico de novo em segundos. O erro continua visivel no painel.
+process.on('uncaughtException', (err) => {
+  const msg = err && err.stack ? String(err.stack) : String(err);
+  try {
+    pushLogLine(`${new Date().toISOString()} [FATAL] Excecao nao tratada: ${msg}`);
+    appendServerTerminalEntry({
+      level: 'error',
+      source: 'SISTEMA',
+      msg: `Excecao nao tratada (o servico reinicia sozinho): ${msg}`
+    });
+  } catch (_) {}
+  _err('[FATAL] Excecao nao tratada:', msg);
+  setTimeout(() => process.exit(1), 200);
 });
 
 const MAX_LOG_LINES = 500;
@@ -139,6 +172,7 @@ const TERMINAL_NOISE = [
   /^save-trainings:/i,
   /\[CACHE\]/i,
   /commit sem mudancas/i,
+  /^Pulando .*\(falhou recentemente\)$/i,
   /\bheartbeat\b/i
 ];
 
@@ -263,7 +297,9 @@ function clearServerTerminal() {
 
 function classifyTerminalLevel(msg) {
   const text = String(msg || '');
-  if (/\b(error|erro|erros|falha|falhou|failed|failure|exception|rejeitad[oa]|negad[oa]|timeout|travad[oa]|indisponivel|desconectad[oa]|auth_failure|pairing_error)\b/i.test(text)) return 'error';
+  if (/^Pulando .*\(falhou recentemente\)$/i.test(text)) return 'info';
+  if (/high demand|rate limit|temporarily unavailable|model is currently overloaded|status(?: code)?\s*429|status(?: code)?\s*503/i.test(text)) return 'warn';
+  if (/\b(error|erro|erros|falha|falhou|failed|failure|exception|rejeitad[oa]|negad[oa]|timeout|travad[oa]|indisponivel|desconectad[oa]|auth_failure|pairing_error|corrompid[oa]|corrupt[oa]|invalido|invalida|excecao|nao responde|sem resposta)\b/i.test(text)) return 'error';
   if (/\b(aviso|warning|warn|ignorad[oa]|descartad[oa]|lent[oa]|aguardando|pausad[oa]|pendente)\b/i.test(text)) return 'warn';
   if (/\b(conectado|autenticado|pronto|sucesso|funcionando|ok)\b/i.test(text)) return 'success';
   return 'info';
@@ -287,14 +323,15 @@ function parseConsoleLine(line) {
 
   const rest = raw.replace(/^\d{4}-\d{2}-\d{2}T\S+\s+/, '');
   if (!rest) return null;
-  if (rest.startsWith('[LOG]')) return null;
-  const tagMatch = rest.match(/^\[([^\]]+)\]\s*/);
+  const withoutTime = rest.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '');
+  if (withoutTime.startsWith('[LOG]')) return null;
+  const tagMatch = withoutTime.match(/^\[([^\]]+)\]\s*/);
   const source = tagMatch ? tagMatch[1] : 'SERVIDOR';
-  const msg = tagMatch ? rest.slice(tagMatch[0].length) : rest;
+  const msg = tagMatch ? withoutTime.slice(tagMatch[0].length) : withoutTime;
   if (!msg.trim()) return null;
   return {
     ts: (raw.match(/^(\d{4}-\d{2}-\d{2}T\S+)/) || [])[1] || new Date().toISOString(),
-    level: classifyTerminalLevel(msg),
+    level: source.toUpperCase() === 'CRITICAL' ? 'error' : classifyTerminalLevel(msg),
     source,
     msg: msg.trim()
   };
@@ -336,17 +373,40 @@ function isHeadless() {
 // Quando LINK_API_URL esta definido, o Setup vira cliente do backend:
 // nao inicializa WhatsApp/IA nem jobs locais. A URL pode vir do ambiente ou
 // de data/remote-server.json (salvo pela tela "Conectar ao servidor").
+//
+// Build instalado no PC do cliente: ja vem apontando para o servidor do
+// produto. O usuario so digita a senha administrativa no primeiro uso.
+// Em desenvolvimento (npm start) continua modo local, para nao misturar com
+// os testes de WhatsApp no proprio PC.
+const DEFAULT_REMOTE_SERVER = {
+  url: 'https://linknozap.duckdns.org',
+  apiPrefix: '/api/v1'
+};
+
 function loadRemoteConfig() {
+  let cfg = null;
   try {
-    const cfg = loadJsonFile('remote-server.json', null);
-    if (cfg && typeof cfg === 'object' && cfg.url && cfg.enabled !== false) {
+    cfg = loadJsonFile('remote-server.json', null);
+  } catch (_) { cfg = null; }
+  if (cfg && typeof cfg === 'object') {
+    // Desligado de proposito pelo usuario: respeita o modo local.
+    if (cfg.enabled === false) return null;
+    if (cfg.url) {
       return {
         url: String(cfg.url).replace(/\/+$/, ''),
         apiPrefix: String(cfg.apiPrefix || '/api/v1'),
         savedAt: cfg.savedAt || null
       };
     }
-  } catch (_) {}
+  }
+  if (app && app.isPackaged) {
+    return {
+      url: DEFAULT_REMOTE_SERVER.url,
+      apiPrefix: DEFAULT_REMOTE_SERVER.apiPrefix,
+      savedAt: null,
+      builtin: true
+    };
+  }
   return null;
 }
 
@@ -756,10 +816,348 @@ function getMessagePipeline() {
       isServerMode: () => serverMode,
       log: sendLog,
       typing: typingService,
-      resolveProviderKey
+      resolveProviderKey,
+      runAudioTask: runAudioTaskForMessage
     });
   }
   return messagePipeline;
+}
+
+// ------------------------------------------------------------
+// Audio: fila persistente + retry + DLQ
+// ------------------------------------------------------------
+// O download do audio NAO acontece mais no meio do evento do WhatsApp: ele
+// vira uma tarefa persistida (audio-tasks.json) processada por um pipeline
+// com retry/backoff, validacao real dos bytes e transcricao. A resposta ao
+// cliente continua sendo a mesma IA das mensagens de texto.
+let audioSystem = null;
+
+// Servico de transcricao local (whisper.cpp). Criado uma vez por processo e
+// compartilhado por todos os zaps: um modelo, uma fila, isolamento por zapId.
+let sttSystem = null;
+
+function sttLog(level, msg, meta) {
+  const m = meta || {};
+  const type = level === 'error' ? 'error' : level === 'warning' ? 'warning' : level === 'success' ? 'success' : 'info';
+  const parts = [];
+  if (m.engine) parts.push(m.engine);
+  if (m.model) parts.push(`modelo=${m.model}`);
+  if (m.cached) parts.push('cache');
+  if (m.durationSec) parts.push(`${Number(m.durationSec).toFixed(1)}s`);
+  if (m.queueWaitMs) parts.push(`fila=${m.queueWaitMs}ms`);
+  if (m.sttMs) parts.push(`stt=${m.sttMs}ms`);
+  if (m.chars) parts.push(`${m.chars} caracteres`);
+  if (m.error) parts.push(`erro=${sanitizeAudioLogText(m.error).slice(0, 200)}`);
+  try { sendLog(m.zapId || '', type, `[STT] ${msg}${parts.length ? ' - ' + parts.join(' | ') : ''}`.slice(0, 600)); } catch (_) {}
+}
+
+function getSttSystem() {
+  if (sttSystem) return sttSystem;
+  try {
+    sttSystem = createSttSystem({
+      dataDir: corePaths.getDataDir(),
+      logger: sttLog,
+      fallback: async ({ buffer, mimetype, zapId }) => {
+        // Fallback OPCIONAL (LINK_STT_FALLBACK_API=1). Sem essa flag o manager
+        // nem chama este trecho; a API externa fica totalmente desligada.
+        const zaps = loadZapsData() || [];
+        const zap = zaps.find((z) => String(z.id) === String(zapId)) || { id: zapId };
+        return await transcribeAudio(
+          { data: buffer.toString('base64'), mimetype, size: buffer.length },
+          loadProvidersData() || [],
+          zapId,
+          zap.apiKeySelections
+        );
+      }
+    });
+    // Verificacao inicial fora do caminho critico: se o servico ainda nao
+    // subiu, a fila espera (defer) em vez de derrubar a conversa.
+    if (sttSystem.config.enabled && sttSystem.config.engine !== 'api') {
+      const timer = setTimeout(() => {
+        sttSystem.manager.selfCheck().catch(() => {});
+      }, 5000);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+  } catch (e) {
+    console.error('[STT] falha ao iniciar o motor local:', e && e.message ? e.message : e);
+    sttSystem = null;
+  }
+  return sttSystem;
+}
+
+function localSttRequested() {
+  const engine = String(process.env.LINK_STT_ENGINE || 'local').trim().toLowerCase();
+  const enabledRaw = String(process.env.LINK_STT_ENABLED == null ? '1' : process.env.LINK_STT_ENABLED).trim().toLowerCase();
+  const enabled = !['0', 'false', 'no', 'nao', 'off'].includes(enabledRaw);
+  return enabled && engine !== 'api';
+}
+
+function getLocalSttForZap(zapId) {
+  if (!localSttRequested()) return null;
+  const stt = getSttSystem();
+  if (!stt) {
+    const err = new Error('motor local de transcricao nao inicializado');
+    err.kind = 'infra';
+    err.defer = true;
+    err.code = 'STT_INIT';
+    throw err;
+  }
+  return stt.manager.enabledFor(zapId) ? stt : null;
+}
+
+// Remove URLs assinadas/credenciais de textos de log antes de exibir.
+function sanitizeAudioLogText(value) {
+  return String(value == null ? '' : value).replace(/https?:\/\/[^\s|]+/gi, (url) => {
+    try {
+      const u = new URL(url);
+      return `${u.origin}${u.pathname.slice(0, 24)}...`;
+    } catch (_) {
+      return '[url]';
+    }
+  });
+}
+
+function audioLogLine(msg, meta) {
+  const m = meta || {};
+  const parts = [];
+  if (m.method) parts.push(`metodo=${m.method}`);
+  if (m.attempt) parts.push(`tentativa=${m.attempt}${m.maxAttempts ? '/' + m.maxAttempts : ''}`);
+  if (m.bytes) parts.push(`${m.bytes} bytes`);
+  if (m.mime) parts.push(`mime=${m.mime}`);
+  if (m.durationSec) parts.push(`duracao=${Number(m.durationSec).toFixed(1)}s`);
+  if (m.durationMs != null) parts.push(`tempo=${m.durationMs}ms`);
+  if (m.chars || m.textChars) parts.push(`${m.chars || m.textChars} caracteres`);
+  if (m.kind && !/^(info|success)$/.test(String(m.level || ''))) parts.push(`tipo=${m.kind}`);
+  if (m.stage) parts.push(`etapa=${m.stage}`);
+  if (m.error) parts.push(`erro=${sanitizeAudioLogText(m.error).slice(0, 240)}`);
+  return `[AUDIO] ${msg}${parts.length ? ' - ' + parts.join(' | ') : ''}`.slice(0, 600);
+}
+
+function getAudioSystem() {
+  if (audioSystem) return audioSystem;
+
+  const store = new AudioTaskStore({
+    filePath: path.join(corePaths.getDataDir(), 'audio-tasks.json'),
+    logger: console
+  });
+  const scheduler = new AudioScheduler({
+    maxConcurrent: Number(process.env.LINK_AUDIO_CONCURRENCY) || 3,
+    maxPerKey: Number(process.env.LINK_AUDIO_PER_ZAP) || 1,
+    maxPending: Number(process.env.LINK_AUDIO_MAX_PENDING) || 200
+  });
+  const preparer = createAudioPreparer({
+    logger: (type, msg) => {
+      try { sendLog('', type, `[AUDIO] ${msg}`); } catch (_) {}
+    }
+  });
+  const pipeline = new AudioPipeline({
+    store,
+    scheduler,
+    logger: (type, msg, meta) => {
+      const m = meta || {};
+      try { sendLog(m.zapId || '', type, audioLogLine(msg, m)); } catch (_) {}
+    },
+    config: {
+      // O motor local pode levar mais que os 120 s antigos em audio longo. O
+      // timeout real da transcricao local e aplicado pelo proprio manager
+      // (base + fator x duracao, teto de 300 s); aqui fica apenas a rede de
+      // seguranca do pipeline, sempre acima dele.
+      transcribeTimeoutMs: Number(process.env.LINK_AUDIO_TRANSCRIBE_TIMEOUT_MS) ||
+        (String(process.env.LINK_STT_ENGINE || 'local').toLowerCase() === 'api' ? 180000 : 330000),
+      maxTranscribeDefers: Number(process.env.LINK_STT_MAX_DEFERS) || 10
+    }
+  });
+
+  // Tarefas em execucao neste processo. A recuperacao periodica ignora estas
+  // chaves para nunca baixar/transcrever o mesmo audio duas vezes.
+  const inflight = new Set();
+  // Momento em que esta execucao carregou a fila. Tarefa QUEUED criada depois
+  // disso pertence ao fluxo ao vivo (pode estar na fila do chat) e nao deve ser
+  // retomada pela recuperacao.
+  const bootAt = Date.now();
+
+  async function runTask(messageData) {
+    const taskKey = messageData && messageData.audioTaskKey;
+    if (!taskKey) return { ok: false, deadLetter: true, kind: 'permanent', error: 'tarefa de audio ausente' };
+    const task = store.get(taskKey);
+    if (!task) return { ok: false, deadLetter: true, kind: 'permanent', error: 'tarefa de audio nao encontrada' };
+    // Ja esta rodando neste processo (ex.: recuperacao e fluxo ao vivo se
+    // cruzaram): nao duplica download nem resposta.
+    if (inflight.has(taskKey)) {
+      return { ok: false, retryLater: true, kind: 'duplicate', error: 'tarefa ja em execucao' };
+    }
+    // Concluida, na IA ou na DLQ: nada a fazer. Responder de novo seria pior.
+    if (task.state === 'COMPLETED' || task.state === 'AI_PROCESSING' || task.state === 'DEAD_LETTER') {
+      return { ok: false, retryLater: true, kind: 'duplicate', error: `tarefa em estado ${task.state}` };
+    }
+    // Audio ja transcrito antes de um reinicio: reaproveita o texto e segue
+    // direto para a IA, sem baixar/transcrever outra vez.
+    if (task.state === 'TRANSCRIBED' && String(task.text || '').trim().length >= 2) {
+      inflight.add(taskKey);
+      messageData.audioRunOwned = true;
+      pipeline.mark(taskKey, 'AI_PROCESSING');
+      return {
+        ok: true,
+        text: task.text,
+        method: 'resume',
+        size: task.bytes,
+        mimetype: task.mime
+      };
+    }
+    const zapId = String(task.zapId);
+    inflight.add(taskKey);
+    try {
+      const result = await pipeline.run(taskKey, {
+        download: async (t) => {
+          const manager = getWhatsapp();
+          if (!manager || typeof manager.resolveAudioMessage !== 'function') {
+            throw new Error('gerenciador do WhatsApp indisponivel');
+          }
+          const msg = await manager.resolveAudioMessage(t);
+          const info = await manager._downloadAudio(zapId, msg, t.mimetype, {
+            silent: true,
+            throwOnError: true
+          });
+          if (!info || !info.data) throw new Error('download de audio retornou vazio');
+          return {
+            buffer: Buffer.from(info.data, 'base64'),
+            mimetype: info.mimetype || t.mimetype,
+            method: info.method || 'cdn+decrypt'
+          };
+        },
+        prepare: (audio, t) => preparer.prepare(audio, t),
+        transcribe: async (audio, t) => {
+          const stt = getLocalSttForZap(zapId);
+          if (stt) {
+            const res = await stt.manager.transcribe({
+              buffer: audio.buffer || Buffer.from(String(audio.data || ''), 'base64'),
+              mimetype: audio.mimetype,
+              size: audio.size,
+              zapId,
+              msgId: t.msgId,
+              msgKey: t.msgKey,
+              durationSec: audio.durationSec || 0
+            });
+            return {
+              text: res.text,
+              engine: res.engine,
+              model: res.model,
+              cached: res.cached,
+              sttMs: res.sttMs,
+              queueWaitMs: res.queueWaitMs,
+              sha256: res.sha256
+            };
+          }
+          // Caminho antigo (API externa): usado quando o motor local esta
+          // desligado, em modo api, ou fora do canary de zaps.
+          const zaps = loadZapsData() || [];
+          const zap = zaps.find((z) => String(z.id) === zapId) || { id: zapId };
+          return await transcribeAudio(
+            { data: audio.data, mimetype: audio.mimetype, size: audio.size },
+            loadProvidersData() || [],
+            zapId,
+            zap.apiKeySelections
+          );
+        }
+      });
+      if (result && result.ok) {
+        // A partir daqui a IA assume. A chave continua em `inflight` ate o
+        // finalizeAudioTask; se o processo cair nesta etapa, a tarefa NAO e
+        // retomada (evita resposta duplicada) e vai para a DLQ.
+        messageData.audioRunOwned = true;
+        pipeline.mark(taskKey, 'AI_PROCESSING');
+        return result;
+      }
+      inflight.delete(taskKey);
+      return result;
+    } catch (e) {
+      inflight.delete(taskKey);
+      throw e;
+    }
+  }
+
+  audioSystem = { store, scheduler, pipeline, preparer, inflight, bootAt, runTask };
+  // Inicializa o motor local uma vez (se ainda nao foi). Falha aqui nao
+  // impede o download/IA: apenas mantem o caminho antigo disponivel.
+  try { getSttSystem(); } catch (_) {}
+  return audioSystem;
+}
+
+async function runAudioTaskForMessage(messageData) {
+  try {
+    return await getAudioSystem().runTask(messageData);
+  } catch (e) {
+    console.error('[AUDIO] falha inesperada na tarefa:', e && e.message ? e.message : e);
+    return { ok: false, retryLater: true, kind: 'infra', error: e && e.message ? e.message : String(e) };
+  }
+}
+
+// Retoma audios que ficaram pendentes antes de um reinicio. `force` roda no
+// boot; o ciclo periodico so mexe em tarefas paradas ha mais de 2 minutos.
+async function recoverAudioTasks(force) {
+  const sys = getAudioSystem();
+  const manager = getWhatsapp();
+  try {
+    const stale = sys.store.markStale(2 * 60 * 1000, sys.inflight);
+    if (stale.length) {
+      sendLog('', 'info', `[AUDIO] ${stale.length} tarefa(s) travada(s) reclassificada(s) apos reinicio.`);
+    }
+    sys.store.prune();
+  } catch (e) {
+    console.error('[AUDIO] falha ao reclassificar tarefas:', e.message);
+  }
+
+  let pending = [];
+  try {
+    pending = sys.pipeline.recoverable(24 * 60 * 60 * 1000);
+  } catch (e) {
+    console.error('[AUDIO] falha ao listar tarefas recuperaveis:', e.message);
+    return;
+  }
+  const now = Date.now();
+  let started = 0;
+  for (const task of pending) {
+    if (sys.inflight.has(task.key)) continue;
+    // Criada nesta execucao e ainda na fila do chat: o fluxo ao vivo responde.
+    if (task.createdAt >= sys.bootAt && (task.state === 'QUEUED' || task.state === 'RECEIVED')) continue;
+    if (!force && now - (task.updatedAt || 0) < 90 * 1000) continue;
+    const clientData = manager && manager.clients ? manager.clients.get(String(task.zapId)) : null;
+    if (!clientData || clientData.status !== 'ready') continue; // proximo ciclo tenta
+    if (!task.chatId) continue;
+    const messageData = {
+      zapId: task.zapId,
+      id: task.msgId,
+      body: '[AUDIO]',
+      from: task.chatId,
+      to: task.chatId,
+      timestamp: task.ts,
+      fromMe: false,
+      selfChat: false,
+      hasMedia: true,
+      type: task.type || 'ptt',
+      mimetype: task.mimetype || '',
+      contact: {
+        id: task.contactId,
+        name: task.contactName || task.chatId,
+        number: task.contactNumber
+      },
+      chat: { id: task.chatId, name: task.chatName, isGroup: false },
+      audio: null,
+      audioFailed: false,
+      audioPending: true,
+      audioTaskKey: task.key,
+      audioTask: task,
+      audioWasAudio: true,
+      recovered: true
+    };
+    try {
+      await handleIncomingMessage(messageData);
+      started++;
+    } catch (e) {
+      console.error('[AUDIO] falha ao retomar tarefa:', e.message);
+    }
+  }
+  if (started) sendLog('', 'info', `[AUDIO] ${started} audio(s) retomado(s) apos reinicio.`);
 }
 
 // ------------------------------------------------------------
@@ -833,7 +1231,48 @@ async function transcribeAudio(audio, providersData, zapId, apiKeySelections) {
 // a IA poderia responder a segunda mensagem antes da primeira.
 // ------------------------------------------------------------
 async function handleIncomingMessage(messageData) {
-  return getMessagePipeline().handleIncomingMessage(messageData);
+  let result;
+  try {
+    result = await getMessagePipeline().handleIncomingMessage(messageData);
+  } catch (e) {
+    finalizeAudioTask(messageData, null, e);
+    throw e;
+  }
+  finalizeAudioTask(messageData, result);
+  return result;
+}
+
+// Fecha o ciclo da tarefa de audio. A resposta ao cliente e o unico ponto que
+// nao pode repetir: se o processo cair depois de enviar, a tarefa fica em
+// AI_PROCESSING e vira DLQ no proximo boot (nao responde duas vezes).
+function finalizeAudioTask(messageData, result, error) {
+  if (!messageData || !messageData.audioTaskKey || !audioSystem) return;
+  const key = messageData.audioTaskKey;
+  try {
+    const task = audioSystem.store.get(key);
+    if (!task || task.state === 'DEAD_LETTER' || task.state === 'COMPLETED') return;
+    if (error) {
+      audioSystem.pipeline.failAI(key, error.message || String(error));
+      return;
+    }
+    if (result && result.accepted === false && result.reason === 'audio_retry') {
+      return; // tarefa continua em RETRYING para o proximo ciclo
+    }
+    if (result && result.ok === false && /^audio_/.test(String(result.reason || ''))) {
+      audioSystem.pipeline.failAI(key, result.reason);
+      return;
+    }
+    audioSystem.pipeline.complete(key, {
+      responseReason: result && result.reason ? String(result.reason).slice(0, 200) : 'ok'
+    });
+  } catch (e) {
+    console.error('[AUDIO] falha ao finalizar tarefa:', e && e.message ? e.message : e);
+  } finally {
+    if (messageData.audioRunOwned) {
+      messageData.audioRunOwned = false;
+      try { audioSystem.inflight.delete(key); } catch (_) {}
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -1672,7 +2111,10 @@ function ensureCampaignZapConnected() {
 // - desativa GPU (evita crash por driver)
 // - usa sandbox desativado (evita problemas de permissao)
 // - pasta de dados local (evita Acesso negado em AppData)
-const isPackaged = process.env.NODE_ENV === 'production' || process.elements?.electron?.builtIn;
+// `process.elements` nao existe no Electron; o teste precisa ser app.isPackaged,
+// senao o app instalado acha que roda em dev e tenta gravar dentro do app.asar
+// (ENOTDIR) e morre antes de abrir a janela.
+const isPackaged = app.isPackaged || process.env.NODE_ENV === 'production';
 if (!isPackaged) {
   try {
     app.commandLine.appendSwitch('disable-gpu');
@@ -1801,12 +2243,51 @@ const ready = app.whenReady().then(() => {
     },
     getConversationStore: () => conversationStore || initConversationStore(),
     whatsapp: whatsappManager,
-    log: (type, msg) => console.log(`[AGENTE][${type}] ${msg}`)
+    restartServer: () => restartVps(),
+    getServerOverview: () => getServerOverview(),
+    runServerCommand: async (text) => {
+      const before = terminalLog.length;
+      try {
+        await runServerCommand(text);
+      } catch (e) {
+        return { ok: false, saida: e.message || String(e) };
+      }
+      const saida = terminalLog.slice(before)
+        .map((en) => `[${en.level || 'info'}] ${en.msg}`)
+        .join('\n');
+      return { ok: true, saida: saida || 'Comando executado. Veja o terminal do painel do servidor.' };
+    },
+    requestServerPairing,
+    getServerPairingCodes: () => (serverSync ? serverSync.getPairingCodes() : {}),
+    isServerMode: () => !!serverMode,
+    log: (type, msg) => {
+      const t = String(type || '').toLowerCase();
+      const level = ['error', 'erro', 'fail', 'falha'].includes(t) ? 'error'
+        : ['warn', 'warning', 'aviso'].includes(t) ? 'warn'
+        : 'info';
+      appendServerTerminalEntry({ level, source: 'AGENTE', msg: String(msg) });
+    }
   });
   try { initAutoMessage(); } catch (e) { console.error('[AUTOMSG] Falha ao iniciar mensagem automatica:', e.message); }
   whatsappManager.setOnMessageCallback(async (messageData) => {
-    try { await handleIncomingMessage(messageData); } catch (e) { console.error('handleIncomingMessage erro:', e); }
+    try {
+      return await handleIncomingMessage(messageData);
+    } catch (e) {
+      console.error('handleIncomingMessage erro:', e);
+      return { ok: false, accepted: false, reason: 'exception', error: e.message };
+    }
   });
+  // Fila persistente de audio: o gerenciador adia o download para o pipeline
+  // e recupera tarefas pendentes depois de um reinicio.
+  try {
+    whatsappManager.setAudioPipeline(getAudioSystem().pipeline);
+  } catch (e) {
+    console.error('[AUDIO] fila persistente indisponivel - usando download direto:', e.message);
+  }
+  const audioRecoveryBoot = setTimeout(() => { recoverAudioTasks(true).catch(() => {}); }, 8000);
+  if (typeof audioRecoveryBoot.unref === 'function') audioRecoveryBoot.unref();
+  const audioRecoveryPoll = setInterval(() => { recoverAudioTasks(false).catch(() => {}); }, 60000);
+  if (typeof audioRecoveryPoll.unref === 'function') audioRecoveryPoll.unref();
   startStatusServer();
   if (serverMode) {
     // Mantem o status real do servidor no painel e repassa codigo/QR para a UI
@@ -1840,6 +2321,23 @@ const ready = app.whenReady().then(() => {
     startConnectionWatchdog();
     startPairingRequestWatcher();
     startSessionRecycler();
+  }
+  // Executor de comandos do painel + sync de status/log no backend 24h da
+  // VPS. So o processo com LINK_ROLE=server roda isso (o bot headless do
+  // Actions nao executa comandos: quem executa e o backend sempre no ar).
+  if (String(process.env.LINK_ROLE || '').toLowerCase() === 'server') {
+    try {
+      const execDataDir = ensureDataDir();
+      if (fs.existsSync(path.join(execDataDir, '.git'))) {
+        pollServerExecCommands().catch(() => {});
+        const execPoll = setInterval(() => pollServerExecCommands().catch(() => {}), 15000);
+        if (execPoll && typeof execPoll.unref === 'function') execPoll.unref();
+      } else {
+        console.log('[EXEC] Diretorio de dados sem repositorio git - comandos do painel nao serao executados aqui.');
+      }
+    } catch (e) {
+      console.log(`[EXEC] Executor indisponivel: ${e.message}`);
+    }
   }
   const statusTimer = setInterval(persistBotStatus, 30000);
   if (statusTimer && typeof statusTimer.unref === 'function') statusTimer.unref();
@@ -2013,10 +2511,43 @@ handle('auto-msg-note', (e, payload) => {
   return autoMessage ? autoMessage.getState() : null;
 });
 handle('auto-msg-transcribe', async (e, audio, zapId) => {
-  const providersData = loadProvidersData();
   const zid = String(zapId || '');
+  const stt = getLocalSttForZap(zid);
+  if (stt) {
+    const raw = audio && typeof audio === 'object' ? audio : {};
+    let buffer = Buffer.alloc(0);
+    try {
+      if (raw.data) buffer = Buffer.from(String(raw.data).replace(/^data:[^,]*,/, ''), 'base64');
+      else if (raw.buffer) buffer = Buffer.isBuffer(raw.buffer) ? raw.buffer : Buffer.from(raw.buffer);
+    } catch (_) {}
+    try {
+      const res = await stt.manager.transcribe({
+        buffer,
+        mimetype: raw.mimetype || raw.mime || 'audio/ogg',
+        size: buffer.length,
+        zapId: zid || 'painel',
+        msgId: `auto-${Date.now()}`
+      });
+      return res.text;
+    } catch (err) {
+      if (!err.defer) throw err;
+      sttLog('warning', 'transcricao do painel adiada: motor local indisponivel');
+      throw err;
+    }
+  }
+  const providersData = loadProvidersData();
   const zap = loadZapsData().find(z => String(z.id) === zid);
   return await transcribeAudio(audio, providersData, zid, zap ? zap.apiKeySelections : null);
+});
+
+// Diagnostico do servico de transcricao (consumido pelo /server/status e pelo
+// painel). Inclui fila, motor, cache, recursos e metricas.
+handle('stt-status', () => {
+  const stt = getSttSystem();
+  if (!stt) return { ok: false, enabled: false, error: 'motor local nao inicializado' };
+  let store = null;
+  try { store = getAudioSystem().store.stats(); } catch (_) {}
+  return { ok: true, ...stt.manager.stats(), store };
 });
 
 // ------------------------------------------------------------
@@ -2487,8 +3018,9 @@ handle('server-current-qr', async (e, zapId) => {
 
 // Pede ao servidor 24h que pareie um zap por codigo. Grava o pedido no repo
 // de dados (connect-requests.json); o container le, limpa a sessao antiga e
-// publica o codigo em pairing-codes.json.
-handle('server-connect-zap', async (e, zapId, phone) => {
+// publica o codigo em pairing-codes.json. No modo local, dispara o
+// pareamento direto pelo whatsappManager.
+async function requestServerPairing(zapId, phone) {
   const id = String(zapId || '');
   const cleanPhone = String(phone || '').replace(/\D/g, '');
   if (!id) return { ok: false, error: 'zap invalido' };
@@ -2503,28 +3035,39 @@ handle('server-connect-zap', async (e, zapId, phone) => {
   } catch (err) {
     return { ok: false, error: err.message };
   }
-  try {
-    const reqPath = getFilePath('connect-requests.json');
-    let reqs = {};
-    try {
-      const raw = JSON.parse(fs.readFileSync(reqPath, 'utf8'));
-      if (raw && typeof raw === 'object' && !Array.isArray(raw)) reqs = raw;
-    } catch (_) {}
-    reqs[id] = { phone: cleanPhone, ts: Date.now() };
-    saveJsonAtomic(reqPath, reqs);
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
   if (serverSync) {
-    try { 
+    try {
+      const reqPath = getFilePath('connect-requests.json');
+      let reqs = {};
+      try {
+        const raw = JSON.parse(fs.readFileSync(reqPath, 'utf8'));
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) reqs = raw;
+      } catch (_) {}
+      reqs[id] = { phone: cleanPhone, ts: Date.now() };
+      saveJsonAtomic(reqPath, reqs);
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+    try {
       // A sincronização precisa ser feita em uma função async
       setTimeout(async () => {
         try { await serverSync.syncNow(); } catch (_) {}
       }, 0);
     } catch (_) {}
+  } else {
+    if (!whatsappManager || typeof whatsappManager.connectZap !== 'function') {
+      return { ok: false, error: 'Gerenciador do WhatsApp indisponivel.' };
+    }
+    try {
+      await whatsappManager.connectZap(id, cleanPhone, 'pairing');
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
   }
   return { ok: true };
-});
+}
+
+handle('server-connect-zap', async (e, zapId, phone) => requestServerPairing(zapId, phone));
 
 // ------------------------------------------------------------
 // IPC - Painel "Gerenciar Servidor" (status, liga/desliga e terminal)
@@ -2568,7 +3111,31 @@ function zapStatusLabel(status) {
   return map[status] || status || 'Desconhecido';
 }
 
-function getServerOverview() {
+let vpsHealthCache = { at: 0, ok: null };
+async function probeVpsHealth() {
+  // Cache de 90s para o painel nao bombardear a VPS a cada poll.
+  if (Date.now() - vpsHealthCache.at < 90000) return vpsHealthCache.ok;
+  vpsHealthCache.at = Date.now();
+  const base = (process.env.LINK_API_URL || '').trim()
+    || (DEFAULT_REMOTE_SERVER.url + DEFAULT_REMOTE_SERVER.apiPrefix);
+  if (!base) {
+    vpsHealthCache.ok = null;
+    return null;
+  }
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, '')}/health`, {
+      signal: AbortSignal.timeout(5000),
+      headers: { accept: 'application/json' }
+    });
+    vpsHealthCache.ok = res.ok;
+    return res.ok;
+  } catch (_) {
+    vpsHealthCache.ok = false;
+    return false;
+  }
+}
+
+async function getServerOverview() {
   const now = Date.now();
   const zaps = loadZapsData();
   const states = readConnectionStates();
@@ -2623,42 +3190,92 @@ function getServerOverview() {
   if (serverMode && !paused && Number.isFinite(remoteAge) && remoteAge > 0) {
     uptime += Math.floor(remoteAge / 1000);
   }
+  // Teste de saude da VPS: so faz sentido fora do proprio servidor.
+  const vpsOnline = (serverModeRequested || serverMode) && !isServerRole()
+    ? await probeVpsHealth()
+    : null;
 
   let level = 'ok';
   let label = 'Funcionando';
-  let hint = connected ? `${connected} de ${total} Zap(s) conectado(s)` : 'Servidor ativo';
+  let hint = connected === total && total > 0 ? `${connected} de ${total} Zap(s) conectado(s)` : 'Servidor ativo';
 
+  // Zap com sessao invalidada (deslogou/trocou de aparelho) ou pareamento que
+  // falhou: so volta a funcionar depois de parear de novo = critico.
+  const authBroken = enabledZaps.some((z) => {
+    const st = stateById.get(String(z.id)) || {};
+    return st.status === 'auth_failure' || st.status === 'pairing_error';
+  });
+  // Erros do log desde o ultimo boot da maquina: e o mesmo numero do badge.
+  // O terminal e carregado do disco sob demanda; sem essa chamada, logo apos
+  // um restart do servico a contagem viria 0 ate o primeiro evento novo.
+  loadTerminalFromDisk();
+  const resources = resourcesSnapshot();
+  const bootMs = resources.systemBootAt ? new Date(resources.systemBootAt).getTime() : 0;
+  const errorCount = terminalLog.filter((e) => {
+    if (e.level !== 'error') return false;
+    if (!bootMs) return true;
+    try {
+      const t = new Date(e.ts).getTime();
+      return Number.isNaN(t) || t >= bootMs;
+    } catch (_) { return true; }
+  }).length;
+
+  // Regras em ordem de gravidade (o painel mostra so a bolinha colorida):
+  //  VERDE  = funcionando sem erros e com todos os Zaps prontos
+  //  AMARELO = funcionando, mas com erros no log ou Zaps fora do ar
+  //  VERMELHO = nao envia mensagens (desligado/sem contato/todos fora) ou
+  //             erro critico que compromete algum Zap (sessao invalidada)
   if (remoteMissing) {
     level = 'bad';
-    label = 'Servidor 24h sem conexao';
+    label = 'Sem conexao';
     hint = 'A pasta do repositorio de dados nao foi encontrada. Use "Conectar servidor" abaixo.';
   } else if (paused) {
     level = 'bad';
     label = 'Desligado';
-    hint = 'O bot esta parado e nao responde mensagens.';
+    hint = vpsOnline === false
+      ? 'O bot esta parado e a VPS nao respondeu ao teste de saude.'
+      : 'O bot esta parado e nao responde mensagens.';
   } else if (serverMode && !bot) {
     level = 'warn';
-    label = 'Sem contato com o servidor';
-    hint = 'Aguardando o servidor publicar o status...';
+    label = 'Sem contato';
+    hint = 'Aguardando o servidor publicar o primeiro status...';
   } else if (serverMode && Number.isFinite(remoteAge) && remoteAge > 10 * 60 * 1000) {
+    level = 'bad';
+    label = 'Sem contato';
+    hint = `O servidor nao publica status ha ${Math.floor(remoteAge / 60000)} min - ele pode ter caido.`;
+  } else if (vpsOnline === false) {
+    level = 'bad';
+    label = 'Sem contato';
+    hint = 'A VPS nao respondeu ao teste de saude (health) - as mensagens nao estao saindo.';
+  } else if (authBroken) {
+    level = 'bad';
+    label = 'Zap comprometido';
+    hint = 'Pelo menos um Zap esta com falha de autenticacao - pareie de novo para voltar a responder.';
+  } else if (total > 0 && connected === 0) {
+    level = 'bad';
+    label = 'Zaps desconectados';
+    hint = 'Nenhum Zap esta pronto - o servidor nao envia mensagens.';
+  } else if (errorCount > 0 || recentErrors || syncError) {
     level = 'warn';
-    label = 'Servidor sem atualizacao';
-    hint = 'Aguardando o servidor iniciar ou publicar o status (a execucao roda a cada 15 min).';
-  } else if (recentErrors || syncError) {
-    level = 'warn';
-    label = 'Funcionando com erros';
-    hint = recentErrors
-      ? `${recentErrors} Zap(s) com erro recente`
-      : 'Falha na sincronizacao com o servidor';
+    label = 'Com erros';
+    hint = errorCount > 0
+      ? `${errorCount} ${errorCount === 1 ? 'erro' : 'erros'} no log desde o ultimo reinicio`
+      : (recentErrors
+        ? `${recentErrors} Zap(s) com erro recente`
+        : 'Falha na sincronizacao com o servidor');
   } else if (total === 0) {
     level = 'warn';
-    label = 'Nenhum Zap configurado';
-    hint = 'Adicione um Zap para o servidor comecar a responder.';
-  } else if (connected === 0) {
+    label = 'Funcionando';
+    hint = 'Nenhum Zap configurado ainda - adicione um Zap para o servidor comecar a responder.';
+  } else if (connected < total) {
     level = 'warn';
-    label = 'Nenhum Zap conectado';
-    hint = 'O servidor esta ativo, mas nenhum Zap esta pronto.';
+    label = 'Com erros';
+    hint = `${connected} de ${total} Zap(s) conectado(s) - conecte os que faltam.`;
   }
+
+  const errorEntries = terminalLog.slice().reverse()
+    .filter((e) => e.level === 'error')
+    .slice(0, 5);
 
   return {
     running: !paused && !remoteMissing,
@@ -2668,18 +3285,33 @@ function getServerOverview() {
     level,
     label,
     hint,
+    vpsOnline,
     mode: serverMode ? 'Servidor 24h' : (remoteMissing ? 'Servidor 24h (sem conexao)' : (isHeadless() ? 'Servidor local' : 'Este PC')),
     serverMode,
     headless: isHeadless(),
-    uptime,
+    uptime: paused ? 0 : uptime,
+    // Tempo real da maquina ligada (zera so quando a VPS reinicia de verdade)
+    // e o instante do boot: referencia para contar os erros "daqui pra frente".
+    systemUptime: resources.systemUptimeSeconds || 0,
+    systemBootAt: resources.systemBootAt || null,
+    // Erros do log desde o boot (mesma janela do badge no painel).
+    errorCount,
     connected: paused ? 0 : connected,
     total,
     recentErrors,
     updatedAt,
+    lastUpdateAt: updatedAt,
+    remoteAgeSec: Number.isFinite(remoteAge) ? Math.floor(remoteAge / 1000) : null,
     lastSyncAt: syncStatus ? syncStatus.lastSyncAt : null,
     lastErrorAt: lastErrorAt || null,
     lastError: lastServerError ? lastServerError.msg : null,
+    errors: errorEntries,
     sync: syncStatus,
+    // Resumo do motor de transcricao local. `null` quando o servico nem foi
+    // inicializado neste processo (modo API puro): o painel omite a linha.
+    transcription: sttSystem ? sttSystem.manager.stats() : null,
+    // RAM/swap/disco do servidor (na VPS: os numeros reais da maquina).
+    resources,
     zaps: enabledZaps.map((z) => {
       const st = stateById.get(String(z.id)) || {};
       return {
@@ -2773,13 +3405,17 @@ function findZapByQuery(query) {
 
 async function runServerCommand(text) {
   const raw = String(text || '').trim();
-  if (!raw) return { ok: false };
+  if (!raw) return { ok: false, saida: '' };
   appendServerTerminalEntry({ level: 'command', source: 'VOCE', msg: raw });
 
   const parts = raw.split(/\s+/);
   const cmd = String(parts.shift() || '').toLowerCase();
   const arg = parts.join(' ').trim();
-  const out = (level, msg) => appendServerTerminalEntry({ level, source: 'PAINEL', msg });
+  const lines = [];
+  const out = (level, msg) => {
+    lines.push(String(msg || ''));
+    appendServerTerminalEntry({ level, source: 'PAINEL', msg });
+  };
 
   switch (cmd) {
     case 'ajuda':
@@ -2790,25 +3426,27 @@ async function runServerCommand(text) {
       out('info', '  zaps                   - lista os Zaps e os status');
       out('info', '  ligar                  - liga o servidor/bot');
       out('info', '  desligar               - desliga o servidor/bot');
-      out('info', '  conectar <zap>         - conecta um Zap (modo local)');
-      out('info', '  desconectar <zap>      - desconecta um Zap (modo local)');
+      out('info', '  conectar <zap>         - conecta um Zap');
+      out('info', '  desconectar <zap>      - desconecta um Zap');
       out('info', '  sincronizar            - sincroniza as configuracoes agora');
+      out('info', '  exec <comando shell>   - executa um comando NA VPS (ex: exec uptime)');
       out('info', '  limpar                 - limpa o terminal');
       out('info', '  ping                   - testa o terminal');
       break;
 
     case 'status': {
-      const o = getServerOverview();
+      const o = await getServerOverview();
       out(o.level === 'bad' ? 'error' : (o.level === 'warn' ? 'warn' : 'success'), `${o.label} - ${o.hint}`);
       out('info', `Modo: ${o.mode} | Uptime: ${Math.floor(o.uptime / 60)} min`);
       out('info', `Zaps conectados: ${o.connected}/${o.total}`);
+      if (o.vpsOnline === false) out('error', 'A VPS nao respondeu ao teste de saude (health).');
       if (o.paused) out('warn', 'O bot esta desligado. Use "ligar" para retomar.');
       break;
     }
 
     case 'zaps':
     case 'listar': {
-      const o = getServerOverview();
+      const o = await getServerOverview();
       if (!o.zaps.length) {
         out('info', 'Nenhum Zap configurado.');
       } else {
@@ -2825,6 +3463,7 @@ async function runServerCommand(text) {
     case 'on': {
       const r = await setServerRunning(true);
       if (r && r.ok === false) out('error', `Nao foi possivel ligar: ${r.error || 'erro desconhecido'}`);
+      else out('success', 'Bot ligado. A VPS retoma a execucao em alguns minutos.');
       break;
     }
 
@@ -2833,13 +3472,26 @@ async function runServerCommand(text) {
     case 'off': {
       const r = await setServerRunning(false);
       if (r && r.ok === false) out('error', `Nao foi possivel desligar: ${r.error || 'erro desconhecido'}`);
+      else out('warn', 'Bot desligado. A VPS para a execucao em ate 1 minuto.');
       break;
     }
 
     case 'conectar':
     case 'connect': {
       if (serverMode) {
-        out('warn', 'No modo servidor 24h a conexao e feita pelo proprio servidor. Aguarde o pareamento automatico ou use o painel do Zap.');
+        const zap = findZapByQuery(arg);
+        if (!zap) {
+          out('error', arg ? `Zap nao encontrado: ${arg}` : 'Informe o nome, numero ou id do Zap. Ex.: conectar Meu Zap');
+          break;
+        }
+        out('info', `Pedindo pareamento do Zap ${zap.name || zap.id} ao servidor 24h...`);
+        try {
+          const req = await requestServerPairing(String(zap.id), String(zap.phone || ''));
+          if (req && req.ok === false) out('error', `Falha ao pedir pareamento: ${req.error}`);
+          else out('success', `Pedido enviado. O codigo aparecera no painel do Zap em instantes.`);
+        } catch (e) {
+          out('error', `Falha ao pedir pareamento: ${e.message}`);
+        }
         break;
       }
       if (isServerPaused()) {
@@ -2867,7 +3519,7 @@ async function runServerCommand(text) {
     case 'desconectar':
     case 'disconnect': {
       if (serverMode) {
-        out('warn', 'No modo servidor 24h a desconexao e feita pelo proprio servidor.');
+        out('warn', 'No modo servidor 24h a desconexao e feita pelo proprio servidor. Use o botao Desconectar no painel do Zap.');
         break;
       }
       const zap = findZapByQuery(arg);
@@ -2888,6 +3540,41 @@ async function runServerCommand(text) {
       break;
     }
 
+    case 'exec':
+    case 'sh': {
+      if (!arg) {
+        out('error', 'Informe o comando. Ex.: exec uptime');
+        break;
+      }
+      if (/\r|\n/.test(arg)) {
+        out('error', 'Comando invalido (quebra de linha).');
+        break;
+      }
+      if (isServerRole()) {
+        // Rodando NA VPS (backend/bot): executa de verdade aqui.
+        out('info', `Executando na VPS: ${arg}`);
+        const r = await execOnServer(arg);
+        if (r.ok) {
+          for (const ln of r.saida.split('\n')) out('success', ln);
+        } else {
+          out('error', r.error || 'Falha ao executar.');
+        }
+      } else if (serverMode && serverSync) {
+        // App do PC em modo servidor: envia o comando para a VPS pelo repo.
+        try {
+          const pushed = await serverSync.pushExecCommand(arg);
+          out('info', pushed && pushed.ok
+            ? `Comando enviado para a VPS (id ${pushed.id}). A saida aparece aqui quando a VPS executar (pode levar 1-2 min).`
+            : `Falha ao enviar comando para a VPS: ${(pushed && pushed.error) || 'erro desconhecido'}`);
+        } catch (e) {
+          out('error', `Falha ao enviar comando para a VPS: ${e.message}`);
+        }
+      } else {
+        out('warn', 'Sem canal para a VPS (repositorio do servidor nao encontrado). O comando NAO sera executado na VPS.');
+      }
+      break;
+    }
+
     case 'sincronizar':
     case 'sync': {
       if (!serverSync) {
@@ -2896,17 +3583,10 @@ async function runServerCommand(text) {
       }
       out('info', 'Sincronizando configuracoes...');
       try {
-        // A sincronização precisa ser feita em uma função async
-        setTimeout(async () => {
-          try {
-            const r = await serverSync.syncNow();
-            out(r && r.ok ? 'success' : 'error', r && r.ok
-              ? `Sincronizacao concluida${r.unchanged ? ' (sem alteracoes)' : ''}.`
-              : `Falha na sincronizacao: ${(r && r.error) || 'erro desconhecido'}`);
-          } catch (e) {
-            out('error', `Falha na sincronizacao: ${e.message}`);
-          }
-        }, 0);
+        const r = await serverSync.syncNow();
+        out(r && r.ok ? 'success' : 'error', r && r.ok
+          ? `Sincronizacao concluida${r.unchanged ? ' (sem alteracoes)' : ''}.`
+          : `Falha na sincronizacao: ${(r && r.error) || 'erro desconhecido'}`);
       } catch (e) {
         out('error', `Falha na sincronizacao: ${e.message}`);
       }
@@ -2925,11 +3605,323 @@ async function runServerCommand(text) {
     default:
       out('error', `Comando desconhecido: ${cmd}. Digite "ajuda" para ver os comandos.`);
   }
-  return { ok: true };
+  return { ok: true, saida: lines.join('\n') };
+}
+
+// Executa um comando shell na VPS (usado pelo comando "exec" do painel).
+function execOnServer(command) {
+  return new Promise((resolve) => {
+    try {
+      execFile('bash', ['-lc', String(command)], {
+        timeout: 90000,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+        shell: false
+      }, (err, stdout, stderr) => {
+        const outText = String(stdout || '');
+        const errText = String(stderr || '');
+        const saida = (outText + (errText ? (outText ? '\n' : '') + errText : '')).trim().slice(0, 4000);
+        if (err) {
+          resolve({ ok: false, error: (err.message || String(err)).slice(0, 300), saida: saida.slice(0, 1500) });
+        } else {
+          resolve({ ok: true, saida: saida || '(sem saida)' });
+        }
+      });
+    } catch (e) {
+      resolve({ ok: false, error: e.message || String(e) });
+    }
+  });
+}
+
+// ------------------------------------------------------------
+// Executor de comandos do painel no backend 24h da VPS
+// ------------------------------------------------------------
+// O painel do PC envia comandos criando server-cmds/<id>.json no repo de
+// dados. O backend (LINK_ROLE=server) pega esses arquivos, executa, apaga e
+// publica a saida no server-terminal.jsonl. No mesmo ciclo ele sincroniza o
+// terminal, bot-status.json e pairing-codes.json locais para o repo, para o
+// painel mostrar dados reais e o log nunca sumir.
+let serverExecPollRunning = false;
+let serverExecLastFlush = 0;
+
+function serverExecRunGit(args, env) {
+  return new Promise((resolve) => {
+    try {
+      execFile('git', args, {
+        timeout: 30000,
+        maxBuffer: 16 * 1024 * 1024,
+        windowsHide: true,
+        shell: false,
+        env: env || process.env
+      }, (err, stdout, stderr) => {
+        resolve({ code: err ? ((err && err.code) || 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || '') });
+      });
+    } catch (e) {
+      resolve({ code: 1, stdout: '', stderr: e.message || String(e) });
+    }
+  });
+}
+
+// Junta as entradas locais do terminal com as do origin (dedup por chave).
+// Nunca remove linhas do origin - so acrescenta as novas do backend.
+async function serverExecMergedTerminal() {
+  let originLines = '';
+  const shown = await serverExecRunGit(['show', 'origin/main:server-terminal.jsonl']);
+  if (shown.code === 0) originLines = shown.stdout;
+  const seen = new Set();
+  for (const line of originLines.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e && e.msg) seen.add(terminalEntryKey(e));
+    } catch (_) { /* linha corrompida */ }
+  }
+  let localText = '';
+  try { localText = fs.readFileSync(terminalFilePath(), 'utf8'); } catch (_) {}
+  const merged = originLines ? [originLines.replace(/\r?\n$/, '')] : [];
+  let added = 0;
+  for (const line of localText.split(/\r?\n/)) {
+    if (!line.trim() || added >= 3000) continue;
+    let key = null;
+    try {
+      const e = JSON.parse(line);
+      if (e && e.msg) key = terminalEntryKey(e);
+    } catch (_) {}
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(line);
+    added++;
+  }
+  return { text: merged.join('\n') + '\n', added };
+}
+
+// Commita sobre origin/main com um index temporario (nunca toca o working
+// tree). removeCmdFile: server-cmds/<arquivo> a apagar. extraFiles: arquivos
+// locais incluidos somente se o blob mudou em relacao ao origin.
+async function serverExecCommit(dataDir, { removeCmdFile, mergeTerminal, extraFiles, note }) {
+  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'zap-exec-'));
+  const indexFile = path.join(tmpDir, 'index');
+  const env = { ...process.env, GIT_INDEX_FILE: indexFile };
+  try {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const fetch = await serverExecRunGit(['fetch', '--quiet', 'origin', 'main'], { cwd: dataDir });
+      if (fetch.code !== 0) return false;
+      const head = await serverExecRunGit(['rev-parse', 'origin/main'], { cwd: dataDir });
+      const headSha = head.stdout.trim();
+      if (head.code !== 0 || !headSha) return false;
+
+      let r = await serverExecRunGit(['read-tree', 'origin/main'], { cwd: dataDir, env });
+      if (r.code !== 0) return false;
+      let changed = false;
+
+      if (mergeTerminal) {
+        const merged = await serverExecMergedTerminal();
+        if (merged.added > 0) {
+          const tmpFile = path.join(tmpDir, 'terminal.jsonl');
+          fs.writeFileSync(tmpFile, merged.text);
+          const blob = await serverExecRunGit(['hash-object', '-w', tmpFile], { cwd: dataDir });
+          const sha = blob.stdout.trim();
+          if (blob.code === 0 && sha) {
+            r = await serverExecRunGit(['update-index', '--add', '--cacheinfo', `100644,${sha},server-terminal.jsonl`], { cwd: dataDir, env });
+            if (r.code === 0) changed = true;
+          }
+        }
+      }
+
+      if (extraFiles && extraFiles.length) {
+        for (const f of extraFiles) {
+          if (!fs.existsSync(f.localPath)) continue;
+          const blob = await serverExecRunGit(['hash-object', '-w', f.localPath], { cwd: dataDir });
+          const sha = blob.stdout.trim();
+          if (blob.code !== 0 || !sha) continue;
+          const cur = await serverExecRunGit(['rev-parse', `origin/main:${f.name}`], { cwd: dataDir });
+          if (cur.code === 0 && cur.stdout.trim() === sha) continue;
+          r = await serverExecRunGit(['update-index', '--add', '--cacheinfo', `100644,${sha},${f.name}`], { cwd: dataDir, env });
+          if (r.code === 0) changed = true;
+        }
+      }
+
+      if (removeCmdFile) {
+        const has = await serverExecRunGit(['cat-file', '-e', `origin/main:server-cmds/${removeCmdFile}`], { cwd: dataDir });
+        if (has.code === 0) {
+          r = await serverExecRunGit(['update-index', '--force-remove', `server-cmds/${removeCmdFile}`], { cwd: dataDir, env });
+          if (r.code === 0) changed = true;
+        }
+      }
+
+      if (!changed) return true;
+
+      const tree = await serverExecRunGit(['write-tree'], { cwd: dataDir, env });
+      const treeSha = tree.stdout.trim();
+      if (tree.code !== 0 || !treeSha) return false;
+
+      const commit = await serverExecRunGit([
+        '-c', 'user.name=Link no WhatsApp',
+        '-c', 'user.email=link@localhost',
+        'commit-tree', treeSha, '-p', headSha, '-m', note || 'exec: sync do servidor'
+      ], { cwd: dataDir });
+      const commitSha = commit.stdout.trim();
+      if (commit.code !== 0 || !commitSha) return false;
+
+      const push = await serverExecRunGit(['push', 'origin', `${commitSha}:main`], { cwd: dataDir });
+      if (push.code === 0) return true;
+    }
+    return false;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
+async function serverExecHandleCommand(dataDir, file) {
+  const show = await serverExecRunGit(['show', `origin/main:server-cmds/${file}`], { cwd: dataDir });
+  if (show.code !== 0) return;
+  let cmd = null;
+  try { cmd = JSON.parse(show.stdout); } catch (_) { cmd = null; }
+  if (!cmd || typeof cmd.command !== 'string' || !cmd.command.trim()) {
+    await serverExecCommit(dataDir, { removeCmdFile: file, note: `exec: comando invalido removido (${file})` });
+    return;
+  }
+  if (cmd.ts && Date.now() - Number(cmd.ts) > 30 * 60 * 1000) {
+    console.log(`[EXEC] comando expirado ignorado (${file})`);
+    await serverExecCommit(dataDir, { removeCmdFile: file, mergeTerminal: true, note: `exec: comando expirado ignorado (${file})` });
+    return;
+  }
+  console.log(`[EXEC] executando #${cmd.id || file}: ${cmd.command}`);
+  appendServerTerminalEntry({ level: 'info', source: 'EXEC', msg: `$ ${cmd.command}` });
+  const res = await execOnServer(cmd.command);
+  const out = String(res.saida || '');
+  for (const line of out.split(/\r?\n/)) {
+    if (line.trim()) appendServerTerminalEntry({ level: res.ok ? 'info' : 'error', source: 'EXEC', msg: line });
+  }
+  if (!res.ok && res.error) {
+    appendServerTerminalEntry({ level: 'error', source: 'EXEC', msg: res.error });
+  }
+  await serverExecCommit(dataDir, { removeCmdFile: file, mergeTerminal: true, note: `exec: concluido (${file})` });
+}
+
+async function pollServerExecCommands() {
+  if (serverExecPollRunning) return;
+  serverExecPollRunning = true;
+  try {
+    const dataDir = ensureDataDir();
+    if (!fs.existsSync(path.join(dataDir, '.git'))) return;
+    const fetch = await serverExecRunGit(['fetch', '--quiet', 'origin', 'main'], { cwd: dataDir });
+    if (fetch.code !== 0) return;
+
+    // Comandos enviados pelo painel do PC (no maximo 3 por ciclo)
+    const list = await serverExecRunGit(['ls-tree', '--name-only', 'origin/main:server-cmds/'], { cwd: dataDir });
+    if (list.code === 0) {
+      const files = list.stdout.split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => /\.json$/.test(s))
+        .slice(0, 3);
+      for (const file of files) await serverExecHandleCommand(dataDir, file);
+    }
+
+    // Flush periodico: terminal + status + pairing para o repo (dados reais)
+    const now = Date.now();
+    if (now - serverExecLastFlush >= 60000) {
+      serverExecLastFlush = now;
+      const extra = [
+        { name: 'bot-status.json', localPath: getFilePath('bot-status.json') },
+        { name: 'pairing-codes.json', localPath: getFilePath('pairing-codes.json') }
+      ];
+      try {
+        for (const n of fs.readdirSync(dataDir).filter((x) => /^qr-.*\.png$/.test(x)).slice(0, 20)) {
+          extra.push({ name: n, localPath: path.join(dataDir, n) });
+        }
+      } catch (_) {}
+      await serverExecCommit(dataDir, { mergeTerminal: true, extraFiles: extra, note: 'exec: sync automatico do servidor' });
+    }
+  } catch (_) {
+    // silencioso: nao deixa o loop de execucao derrubar o backend
+  } finally {
+    serverExecPollRunning = false;
+  }
 }
 
 handle('server-overview', () => getServerOverview());
 handle('server-power', (e, running) => setServerRunning(!!running));
+
+// ------------------------------------------------------------
+// Reiniciar a VPS
+// ------------------------------------------------------------
+// Roda um script root-only (/usr/local/sbin/link-reboot) liberado no sudoers
+// pelo install.sh. O backend roda como usuario comum: sem essa regra o
+// comando falharia pedindo senha.
+const VPS_REBOOT_HELPER = '/usr/local/sbin/link-reboot';
+
+function runQuiet(cmd, args, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (code) => {
+      if (done) return;
+      done = true;
+      resolve(code);
+    };
+    try {
+      const child = spawn(cmd, args, { stdio: 'ignore', windowsHide: true });
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch (_) {}
+        finish(-1);
+      }, timeoutMs);
+      if (timer.unref) timer.unref();
+      child.on('error', () => { clearTimeout(timer); finish(-1); });
+      child.on('exit', (code) => { clearTimeout(timer); finish(code == null ? -1 : code); });
+    } catch (_) {
+      finish(-1);
+    }
+  });
+}
+
+async function restartVps() {
+  if (!isHeadless() && !isServerRole()) {
+    return { ok: false, error: 'Reiniciar a VPS so funciona no servidor 24h.' };
+  }
+  if (process.platform === 'win32') {
+    return { ok: false, error: 'Reiniciar a VPS so funciona no servidor Linux.' };
+  }
+  // Testa a permissao antes: "sudo -n -l <cmd>" sai 0 quando o usuario pode
+  // rodar o comando sem senha.
+  const allowed = await runQuiet('sudo', ['-n', '-l', VPS_REBOOT_HELPER], 6000);
+  if (allowed !== 0) {
+    appendServerTerminalEntry({
+      level: 'error',
+      source: 'PAINEL',
+      msg: `Sem permissao para reiniciar: falta a regra de sudo para ${VPS_REBOOT_HELPER}. Rode scripts/install.sh na VPS.`
+    });
+    return { ok: false, error: 'O servidor nao tem permissao para reiniciar. Rode scripts/install.sh na VPS.' };
+  }
+  appendServerTerminalEntry({
+    level: 'warn',
+    source: 'PAINEL',
+    msg: 'Reinicio da VPS solicitado pelo painel. O servidor volta sozinho em cerca de 1 minuto.'
+  });
+  // Dispara depois de responder: o cliente precisa receber o "ok" antes de a
+  // maquina cair.
+  setTimeout(() => {
+    try {
+      const child = spawn('sudo', ['-n', VPS_REBOOT_HELPER], { stdio: 'ignore', detached: true });
+      child.on('error', (err) => {
+        appendServerTerminalEntry({
+          level: 'error',
+          source: 'PAINEL',
+          msg: `Falha ao reiniciar a VPS: ${err.message}`
+        });
+      });
+      if (typeof child.unref === 'function') child.unref();
+    } catch (err) {
+      appendServerTerminalEntry({
+        level: 'error',
+        source: 'PAINEL',
+        msg: `Falha ao reiniciar a VPS: ${err.message}`
+      });
+    }
+  }, 600);
+  return { ok: true, restarting: true };
+}
+
+handle('server-restart', () => restartVps());
 
 handle('zap-block-all-existing', (e, zapRef) => {
   try {

@@ -49,11 +49,14 @@ function isWithinWorkHours(wh, when) {
   const { day, minutes } = partsInZone(date, wh.tz);
 
   const days = Array.isArray(wh.days) ? wh.days.map(Number).filter(n => n >= 0 && n <= 6) : [];
-  if (days.length && !days.includes(day)) return false;
+  const dayAllowed = days.length === 0 || days.includes(day);
+  const previousDay = (day + 6) % 7;
 
-  if (start === end) return true; // janela de 24h
-  if (start < end) return minutes >= start && minutes < end;
-  return minutes >= start || minutes < end; // vira o dia
+  if (start === end) return dayAllowed;
+  if (start < end) return dayAllowed && minutes >= start && minutes < end;
+  const afterStart = dayAllowed && minutes >= start;
+  const beforeEnd = (days.length === 0 || days.includes(previousDay)) && minutes < end;
+  return afterStart || beforeEnd;
 }
 
 module.exports = { isWithinWorkHours, parseHHMM, partsInZone };

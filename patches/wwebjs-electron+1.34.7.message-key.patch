@@ -1,0 +1,34 @@
+diff --git a/src/util/Injected/Utils.js b/src/util/Injected/Utils.js
+index 540078a..016f707 100644
+--- a/src/util/Injected/Utils.js
++++ b/src/util/Injected/Utils.js
+@@ -1000,17 +1000,17 @@ exports.LoadUtils = () => {
+         model.lastMessage = null;
+         if (model.msgs && model.msgs.length) {
+-            const lastMessage = chat.lastReceivedKey
+-                ? window
+-                      .require('WAWebCollections')
+-                      .Msg.get(chat.lastReceivedKey._serialized) ||
+-                  (
+-                      await window
+-                          .require('WAWebCollections')
+-                          .Msg.getMessagesById([
+-                              chat.lastReceivedKey._serialized,
+-                          ])
+-                  )?.messages?.[0]
+-                : null;
++            const lastReceivedKey = chat.lastReceivedKey;
++            const lastReceivedKeyId = lastReceivedKey && (lastReceivedKey._serialized || String(lastReceivedKey));
++            const lastMessage = lastReceivedKeyId
++                ? window
++                      .require('WAWebCollections')
++                      .Msg.get(lastReceivedKeyId) ||
++                  (
++                      await window
++                          .require('WAWebCollections')
++                          .Msg.getMessagesById([lastReceivedKeyId])
++                  )?.messages?.[0]
++                : null;
+             lastMessage &&
+                 (model.lastMessage =
+                     window.WWebJS.getMessageModel(lastMessage));

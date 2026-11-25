@@ -215,23 +215,41 @@ e número de CPUs. O `/api/v1/server/status` (com token) traz o mesmo bloco —
 
 ### Áudio (transcrição)
 
-O áudio do WhatsApp é baixado, descriptografado e enviado para Whisper
-(OpenAI/Groq) ou Gemini. **Não roda nada localmente** — não há ffmpeg nem
-modelo na VPS; só rede e memória.
+Por padrão o áudio do WhatsApp é transcrito **na própria VPS**, sem API paga:
 
-O que segura o consumo de RAM:
+```
+WhatsApp -> download/decrypt -> FFmpeg (WAV 16 kHz mono) -> whisper.cpp (modelo tiny)
+```
 
-- **O base64 do áudio não fica no histórico.** Ele existe só durante a
-  transcrição e é liberado logo depois. A interface baixa a mídia sob demanda.
-- **Fila de transcrição** (`LINK_TRANSCRIBE_CONCURRENCY`, padrão 2): no máximo
-  dois áudios sobem para a IA ao mesmo tempo. Os demais esperam alguns segundos.
-- **Timeout** (`LINK_TRANSCRIBE_TIMEOUT_MS`, padrão 60 s): provedor travado é
-  abandonado e a próxima opção da lista assume, em vez de pendurar a conversa.
+O motor roda como serviço separado (`assistente-zap-stt`), com o modelo carregado
+uma única vez e compartilhado por todos os Zaps. Se ele estiver parado, os áudios
+ficam na fila persistente e são transcritos quando voltar — nada é perdido e a
+conversa de texto continua funcionando.
+
+O que segura o consumo de RAM e CPU (VPS de 2 GB / 1 vCPU):
+
+- **Uma transcrição por vez** (`LINK_STT_CONCURRENCY=1`) e **1 thread**
+  (`LINK_STT_THREADS=1`). O worker tem teto de 700 MB no systemd e prioridade
+  menor que o bot.
+- **Fila justa**: um cliente com 50 áudios não monopoliza o motor; a vez alterna
+  entre os Zaps e cada um tem no máximo 1 áudio em processamento.
+- **Cache por conteúdo** (SHA-256): o mesmo áudio reenviado não passa de novo
+  pelo modelo.
+- **Fila única persistente** (`data/audio-tasks.json`): reinício do bot não perde
+  áudio pendente, e falha de infraestrutura não gasta tentativa.
+- **Fallback externo desligado**: `LINK_STT_FALLBACK_API=0`. Se quiser permitir
+  API externa apenas quando o motor local cair, mude para `1`.
 
 ```bash
-LINK_TRANSCRIBE_CONCURRENCY=2
-LINK_TRANSCRIBE_TIMEOUT_MS=60000
+LINK_STT_ENGINE=local
+LINK_STT_MODEL=tiny
+LINK_STT_CONCURRENCY=1
+LINK_STT_FALLBACK_API=0
 ```
+
+Diagnóstico em tempo real: `GET /api/v1/transcription/status` (com token) e a
+linha **Áudio** no balão de status do servidor. Detalhes de instalação,
+medição e solução de problemas em `TRANSCRICAO-LOCAL.md`.
 
 Se chegar uma rajada de áudios, a resposta atrasa (fila), mas nada trava nem
 consome memória proporcional ao número de áudios ao mesmo tempo.

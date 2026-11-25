@@ -347,7 +347,7 @@ async function main() {
 
     const logs = await remote.serverTerminalLogs();
     assert.deepStrictEqual(logs, [{ msg: 'linha' }]);
-    assert.strictEqual(lastCall(httpStub).path, '/api/v1/logs');
+    assert.strictEqual(lastCall(httpStub).path, '/api/v1/logs?limit=20000');
 
     const exported = await remote.serverTerminalExport();
     assert.deepStrictEqual(exported, [{ msg: 'linha' }]);

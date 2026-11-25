@@ -12,6 +12,39 @@ const MEMORY_DAYS = 3;
 const MEMORY_MAX_CHARS = 6000;
 const QUOTE_CHANCE = 0.35;
 
+// Contato bloqueado pode estar salvo como JID (@c.us/@s.whatsapp.net/@lid),
+// so numero (com ou sem DDI 55) ou com sufixo de aparelho (:12). A mensagem
+// pode chegar por @c.us OU @lid (novo ID do WhatsApp), por isso comparamos
+// varios identificadores normalizados em vez de string exata.
+function normContactKey(v) {
+  return String(v == null ? '' : v).split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
+function isContactBlocked(candidates, blockedContacts) {
+  const raw = new Set();
+  const nums = new Set();
+  for (const b of blockedContacts) {
+    if (!b) continue;
+    const s = String(b).trim();
+    if (!s) continue;
+    raw.add(s);
+    const n = normContactKey(s);
+    if (n) {
+      nums.add(n);
+      if (/^55\d{10,13}$/.test(n)) nums.add(n.slice(2));
+      else if (/^\d{10,11}$/.test(n)) nums.add('55' + n);
+    }
+  }
+  for (const c of candidates) {
+    const s = String(c == null ? '' : c).trim();
+    if (!s) continue;
+    if (raw.has(s)) return true;
+    const n = normContactKey(s);
+    if (n && nums.has(n)) return true;
+  }
+  return false;
+}
+
 function defaultResolveProviderKey(provider) {
   if (!provider) return null;
   if (provider.apiKey) return { ...provider, apiKey: provider.apiKey };
@@ -52,6 +85,9 @@ function createMessagePipeline(deps) {
   const paths = deps.paths || {};
   const typing = deps.typing;
   const resolveProviderKey = deps.resolveProviderKey || defaultResolveProviderKey;
+  // Executor da fila persistente de audio. Recebe o messageData (com
+  // audioTaskKey) e devolve { ok,text } | { retryLater } | { deadLetter }.
+  const runAudioTask = deps.runAudioTask || null;
 
   if (!typing) throw new Error('createMessagePipeline: dependencia typing obrigatoria');
 
@@ -88,7 +124,7 @@ function createMessagePipeline(deps) {
     throw new Error('Transcricao de audio nao configurada');
   }
 
-  async function processMessage(messageData) {
+  async function processMessage(messageData, state) {
     const manager = getWhatsapp();
     const aiResponder = getAiResponder();
     const conversationStore = getConversationStore();
@@ -107,23 +143,20 @@ function createMessagePipeline(deps) {
       jidRef.includes('@broadcast');
     if (isGroupMsg) {
       console.log(`[GRUPO] mensagem de grupo nao processada (zap ${zapId}) - IA bloqueada`);
-      return { ok: false, reason: 'group' };
+      return { ok: false, accepted: false, reason: 'group' };
     }
 
     // Bot desligado pelo painel.
     if (!isServerMode() && isServerPaused()) {
       log(zapId, 'info', 'Servidor desligado pelo painel - IA ignorada.');
-      return { ok: false, reason: 'paused' };
+      return { ok: false, accepted: false, reason: 'paused' };
     }
 
     if (fromMe) {
       if (!messageData.selfChat) {
         log(zapId, 'info', 'Ignorada: mensagem enviada por mim para outro contato.');
-        return { ok: false, reason: 'from_me' };
+        return { ok: false, accepted: false, reason: 'from_me' };
       }
-      log(zapId, 'ai', `Autochat: IA iniciando para o proprio numero (${(to || from || '').split('@')[0]}): "${body}"`);
-    } else {
-      log(zapId, 'ai', `IA iniciando para ${contactName}: "${body}"`);
     }
 
     const zapsData = loadZaps();
@@ -134,40 +167,41 @@ function createMessagePipeline(deps) {
 
     if (!zap) {
       log(zapId, 'error', 'Zap nao encontrado no arquivo.');
-      return { ok: false, reason: 'zap_not_found' };
+      return { ok: false, accepted: false, reason: 'zap_not_found' };
     }
     if (zap.enabled === false) {
       log(zapId, 'warning', 'Zap desativado. Ignorando mensagem.');
-      return { ok: false, reason: 'zap_disabled' };
+      return { ok: false, accepted: false, reason: 'zap_disabled' };
     }
     // ================= PLANO DE PAGAMENTO =================
     const billing = checkBilling(zap);
     if (!billing.active && billing.reason !== 'own_use' && billing.reason !== 'no_plan') {
       log(zapId, 'warning', 'Zap suspenso por atraso de pagamento (mes ' + billing.todayKey + '). Mensagem ignorada.');
-      return { ok: false, reason: 'billing', billing };
+      return { ok: false, accepted: false, reason: 'billing', billing };
     }
     if (zap.autoReply === false) {
       log(zapId, 'warning', 'Auto-reply desativado para este Zap');
-      return { ok: false, reason: 'auto_reply_off' };
+      return { ok: false, accepted: false, reason: 'auto_reply_off' };
     }
 
     // Horario de atendimento
     if (zap.workHours && zap.workHours.enabled === true && !isWithinWorkHours(zap.workHours)) {
       log(zapId, 'info', `Fora do horario de atendimento (${zap.workHours.start}-${zap.workHours.end}) - mensagem ignorada, nao enviada a IA.`);
-      return { ok: false, reason: 'work_hours' };
+      return { ok: false, accepted: false, reason: 'work_hours' };
     }
     // Contatos bloqueados
     if (zap.blockedContacts && zap.blockedContacts.length) {
-      const fromNumber = (from || '').split('@')[0];
-      const isBlocked = zap.blockedContacts.some((b) => {
-        if (!b) return false;
-        if (b.includes('@')) return b === from || b.split('@')[0] === fromNumber;
-        return b === fromNumber || b === from;
-      });
-      if (isBlocked) {
-        log(zapId, 'warning', `Contato ${contactName} nao autorizado para IA. Ignorando.`);
-        return { ok: false, reason: 'blocked_contact' };
+      const candidates = [from, chat && chat.id, contact && contact.id, contact && contact.number];
+      if (isContactBlocked(candidates, zap.blockedContacts)) {
+        return { ok: false, accepted: false, reason: 'blocked_contact' };
       }
+    }
+
+    if (state) state.accepted = true;
+    if (fromMe) {
+      log(zapId, 'ai', `Autochat: IA iniciando para o proprio numero (${(to || from || '').split('@')[0]}): "${body}"`);
+    } else {
+      log(zapId, 'ai', `IA iniciando para ${contactName}: "${body}"`);
     }
 
     const enabledTrainings = zapTrainings.filter((t) => t && t.enabled !== false);
@@ -223,30 +257,55 @@ function createMessagePipeline(deps) {
       log(zapId, 'warning', `Audio de ${contactName} nao pôde ser baixado. Pedindo para enviar como texto.`);
       await sendErrorToWhatsApp(zapId, chatId, 'Nao consegui baixar seu audio, pode mandar como texto?');
       log(zapId, 'outgoing', 'Mensagem de audio nao baixado respondida.');
-      return { ok: false, reason: 'audio_download_failed' };
+      return { ok: false, accepted: true, reason: 'audio_download_failed' };
     }
 
-    if (audio && (body === '[AUDIO]' || !body || body.trim() === '')) {
-      log(zapId, 'info', `Audio recebido de ${contactName}. Transcrevendo...`);
+    // Audio entregue pela fila persistente: download com retry, validacao real
+    // e transcricao acontecem ANTES de chegar aqui, mas a IA continua sendo a
+    // mesma deste pipeline. Se a fila adiou, a tarefa sobrevive ao reinicio.
+    if (messageData.audioPending && messageData.audioTaskKey) {
+      if (typeof runAudioTask !== 'function') {
+        log(zapId, 'error', 'Fila de audio nao configurada.');
+        await sendErrorToWhatsApp(zapId, chatId, 'Nao consegui processar seu audio. Pode mandar como texto?');
+        return { ok: false, accepted: true, reason: 'audio_no_queue' };
+      }
+      log(zapId, 'info', `Audio de ${contactName}: baixando e transcrevendo pela fila...`);
+      const res = await runAudioTask(messageData);
+      if (res && res.ok && res.text) {
+        finalBody = res.text;
+        log(zapId, 'success', `Audio transcrito (${res.method || 'fila'}, ${res.size || 0} bytes): "${String(finalBody).substring(0, 100)}"`);
+      } else if (res && res.retryLater) {
+        log(zapId, 'warning', `Audio de ${contactName} adiado para nova tentativa (${res.kind || '?'}): ${res.error || ''}`);
+        return { ok: false, accepted: true, reason: 'audio_retry' };
+      } else {
+        const kind = (res && res.kind) || '?';
+        const detail = (res && res.error) || 'erro desconhecido';
+        log(zapId, 'error', `Audio de ${contactName} nao pode ser processado (${kind}): ${detail}`);
+        await sendErrorToWhatsApp(zapId, chatId, 'Nao consegui entender seu audio. Pode mandar como texto?');
+        return { ok: false, accepted: true, reason: 'audio_dead_letter' };
+      }
+    }
+
+    if (audio && (body === '[AUDIO]' || !body || body.trim() === '')) {      log(zapId, 'info', `Audio recebido de ${contactName}. Transcrevendo...`);
       try {
         finalBody = await transcribeAudio(audio, providersData, zapId, zap.apiKeySelections);
         if (!finalBody || !finalBody.trim() || finalBody.trim().length < 2) {
           log(zapId, 'warning', 'Transcricao vazia ou invalida. Pedindo para repetir.');
           await manager.sendMessage(String(zapId), chatId, 'Nao consegui entender seu audio, pode repetir?', { source: 'ai' });
           log(zapId, 'outgoing', 'Mensagem de audio nao compreendido enviada.');
-          return { ok: false, reason: 'audio_empty' };
+          return { ok: false, accepted: true, reason: 'audio_empty' };
         }
         if (finalBody.length < 3 || /^\W+$/.test(finalBody)) {
           log(zapId, 'warning', `Transcricao parece invalida: "${finalBody}". Pedindo para repetir.`);
           await manager.sendMessage(String(zapId), chatId, 'Nao entendi seu audio, pode mandar de novo?', { source: 'ai' });
           log(zapId, 'outgoing', 'Mensagem de audio invalida respondida.');
-          return { ok: false, reason: 'audio_invalid' };
+          return { ok: false, accepted: true, reason: 'audio_invalid' };
         }
         log(zapId, 'success', `Audio transcrito: "${finalBody.substring(0, 100)}"`);
       } catch (e) {
         log(zapId, 'error', `Erro na transcricao: ${e.message}`);
         await sendErrorToWhatsApp(zapId, chatId, 'Tive um problema para entender seu audio. Pode enviar como texto?');
-        return { ok: false, reason: 'audio_error' };
+        return { ok: false, accepted: true, reason: 'audio_error' };
       } finally {
         // O base64 do audio ja cumpriu o papel (transcricao). Liberar agora
         // evita que ele fique na RAM ate o GC passar, inclusive nos erros.
@@ -282,7 +341,7 @@ function createMessagePipeline(deps) {
     if (!modelsToTry || modelsToTry.length === 0) {
       log(zapId, 'error', 'Nenhum modelo disponivel em nenhum provedor');
       await sendErrorToWhatsApp(zapId, chatId, 'No momento estou sem conexao com a IA. Tente novamente em instantes.');
-      return { ok: false, reason: 'no_model' };
+      return { ok: false, accepted: true, reason: 'no_model' };
     }
     log(zapId, 'info', `${modelsToTry.length} modelo(s) disponivel(is) para tentar`);
 
@@ -322,12 +381,7 @@ function createMessagePipeline(deps) {
 
       try {
         const msgForAI = { ...messageData, body: finalBody };
-        let r = null;
-        if (aiResponder.generateResponse.length >= 3) {
-          r = await aiResponder.generateResponse(msgForAI, zapConfig, providersData);
-        } else {
-          r = await aiResponder.generateResponse(msgForAI, zapConfig, providersData);
-        }
+        const r = await aiResponder.generateResponse(msgForAI, zapConfig, providersData, false);
         const isJunk = !!(aiResponder && typeof aiResponder.isJunkResponse === 'function' && aiResponder.isJunkResponse(r));
         if (r && r.trim().length > 0 && !isJunk) {
           response = r;
@@ -342,7 +396,11 @@ function createMessagePipeline(deps) {
         }
       } catch (e) {
         lastError = e.message;
-        log(zapId, 'error', `${entry.provider.name} / ${entry.model.id} falhou: ${e.message}`);
+        if (/Resposta reprovada pelo verificador/i.test(e.message)) {
+          log(zapId, 'warning', `${entry.provider.name} / ${entry.model.id} retornou texto invalido - descartado: ${e.message}`);
+        } else {
+          log(zapId, 'error', `${entry.provider.name} / ${entry.model.id} falhou: ${e.message}`);
+        }
       }
     }
 
@@ -350,7 +408,7 @@ function createMessagePipeline(deps) {
       log(zapId, 'error', `Todos os modelos falharam. Ultimo erro: ${lastError}`);
       await typing.clear(zapId, chatId);
       await sendErrorToWhatsApp(zapId, chatId, 'Desculpe, tive um problema tecnico. Pode repetir sua mensagem?');
-      return { ok: false, reason: 'all_models_failed', error: lastError };
+      return { ok: false, accepted: true, reason: 'all_models_failed', error: lastError };
     }
 
     const media = resolveReplyMedia(response, finalBody, enabledTrainings, (type, msg) => log(zapId, type, msg));
@@ -371,7 +429,7 @@ function createMessagePipeline(deps) {
       log(zapId, 'error', 'Todas as mensagens foram reprovadas pelo verificador - enviando aviso padrao.');
       await typing.clear(zapId, chatId);
       await sendErrorToWhatsApp(zapId, chatId, 'Desculpe, tive um problema tecnico. Pode repetir sua mensagem?');
-      return { ok: false, reason: 'guard_rejected' };
+      return { ok: false, accepted: true, reason: 'guard_rejected' };
     }
 
     if (aiResponder && typeof aiResponder.updateLastAssistant === 'function') {
@@ -404,7 +462,7 @@ function createMessagePipeline(deps) {
       typing.clear(zapId, chatId).catch(() => {});
 
       let ownerReplied = false;
-      if (i === 0 && manager && typeof manager.hasOwnerReplied === 'function') {
+      if (manager && typeof manager.hasOwnerReplied === 'function') {
         try {
           ownerReplied = await manager.hasOwnerReplied(String(zapId), chatId, triggerTs, { live: true });
         } catch (e) {
@@ -414,7 +472,7 @@ function createMessagePipeline(deps) {
       }
       if (ownerReplied) {
         log(zapId, 'info', 'Dono do numero ja respondeu esta conversa - IA nao vai responder por cima.');
-        return { ok: false, reason: 'owner_replied' };
+        return { ok: false, accepted: true, reason: 'owner_replied' };
       }
 
       const preview = text.substring(0, 80);
@@ -492,19 +550,20 @@ function createMessagePipeline(deps) {
       log(zapId, 'warning', 'Resposta vazia apos remocao de marcadores de imagem');
     }
 
-    return { ok: true, parts: parts.length, images: resolvedImages.length, links: resolvedLinks.length };
+    return { ok: true, accepted: true, parts: parts.length, images: resolvedImages.length, links: resolvedLinks.length };
   }
 
   async function handleIncomingMessage(messageData) {
     const cid = (messageData.chat && messageData.chat.id) || messageData.from || messageData.to || '';
     const key = `${messageData.zapId}|${cid}`;
     const prev = chatQueues.get(key) || Promise.resolve();
+    const state = { accepted: false };
     const run = prev
       .catch(() => {})
-      .then(() => processMessage(messageData))
+      .then(() => processMessage(messageData, state))
       .catch((e) => {
         console.error('handleIncomingMessage erro:', e);
-        return { ok: false, reason: 'exception', error: e && e.message };
+        return { ok: false, accepted: state.accepted, reason: 'exception', error: e && e.message };
       });
     chatQueues.set(key, run);
     run.then(() => { if (chatQueues.get(key) === run) chatQueues.delete(key); });
@@ -516,6 +575,8 @@ function createMessagePipeline(deps) {
 
 module.exports = {
   createMessagePipeline,
+  isContactBlocked,
+  normContactKey,
   MEMORY_DAYS,
   MEMORY_MAX_CHARS,
   QUOTE_CHANCE
