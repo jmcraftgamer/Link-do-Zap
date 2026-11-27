@@ -16,6 +16,8 @@ const root = path.join(__dirname, '..');
 const { startBackend } = require(path.join(root, 'backend', 'src', 'index'));
 const { createEventBus } = require(path.join(root, 'src', 'core', 'events'));
 const { createRemoteApi } = require(path.join(root, 'src', 'js', 'api-client'));
+const billingCore = require(path.join(root, 'src', 'core', 'billing'));
+const { BillingStore } = require(path.join(root, 'src', 'core', 'billing-store'));
 
 const pending = [];
 let passed = 0;
@@ -32,6 +34,7 @@ async function main() {
   const dataDir = path.join(tmp, 'data');
   fs.mkdirSync(dataDir, { recursive: true });
 
+  const signature = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=';
   const password = 'senha-de-teste';
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -75,8 +78,15 @@ async function main() {
         }
       ]
     },
-    logs: []
+    logs: [],
+    providers: [{ id: 'p1', name: 'Provedor Teste', models: [{ id: 'm1' }] }]
   };
+
+  state.billingStore = new BillingStore({ filePath: path.join(dataDir, 'billing-ledger.json'), logger: { error() {} } });
+
+  function describeZapBilling(zap) {
+    return billingCore.describeBilling(zap, new Date(), state.billingStore.snapshot());
+  }
 
   const handlers = {
     'load-zaps': () => state.zaps,
@@ -97,12 +107,75 @@ async function main() {
     'server-power': (running) => ({ ok: true, running }),
     'server-command': (text) => ({ ok: true, output: text }),
     'server-delete-zap-session': () => ({ ok: true }),
-    'load-providers': () => [],
+    'load-providers': () => state.providers,
+    'save-provider': (id, provider) => {
+      const saved = { ...provider, id };
+      const index = state.providers.findIndex((item) => item.id === id);
+      if (index >= 0) state.providers[index] = saved;
+      else state.providers.push(saved);
+      return saved;
+    },
+    'delete-provider': (id) => {
+      const before = state.providers.length;
+      state.providers = state.providers.filter((item) => item.id !== id);
+      return state.providers.length !== before;
+    },
+    'discover-provider-models': (input) => ({ ok: true, models: [{ id: `modelo-${input.name}`, name: 'Modelo real' }] }),
+    'test-provider-model': (input) => ({ ok: true, text: `testado ${input.modelId}` }),
     'load-trainings': () => ({}),
+    'billing-detail': (zapId) => {
+      const zap = state.zaps.find((z) => String(z.id) === String(zapId));
+      if (!zap) return { ok: false, error: 'zap nao encontrado' };
+      return { ok: true, ...describeZapBilling(zap) };
+    },
     'billing-save': (zapId, data) => {
       const zap = state.zaps.find((z) => String(z.id) === String(zapId));
-      if (zap) zap.billingPlan = data;
-      return { ok: true };
+      if (!zap) return { ok: false, error: 'zap nao encontrado' };
+      zap.billingPlan = billingCore.normalizeBillingConfig(data, zap.billingPlan || {}, new Date());
+      return { ok: true, billingPlan: zap.billingPlan, billing: describeZapBilling(zap) };
+    },
+    'billing-pay': (zapId, period, paymentSignature) => {
+      const zap = state.zaps.find((z) => String(z.id) === String(zapId));
+      if (!zap) return { ok: false, error: 'zap nao encontrado' };
+      const billing = describeZapBilling(zap);
+      const invoice = billing.invoices.find((item) => item.period === period);
+      if (!invoice || !invoice.payable || invoice.paid) return { ok: false, error: 'fatura nao elegivel' };
+      const result = state.billingStore.appendPayment({ zapId, period, amountCents: invoice.amountCents, currency: invoice.currency, signature: paymentSignature });
+      return { ok: true, payment: result.payment, duplicate: result.duplicate, billing: describeZapBilling(zap) };
+    },
+    'billing-extend': (zapId, period, days, reason, requestId) => {
+      const zap = state.zaps.find((z) => String(z.id) === String(zapId));
+      if (!zap) return { ok: false, error: 'zap nao encontrado' };
+      const billing = describeZapBilling(zap);
+      const invoice = billing.invoices.find((item) => item.period === period);
+      if (!invoice || invoice.paid) return { ok: false, error: 'fatura nao elegivel' };
+      const extension = state.billingStore.appendExtension({
+        zapId,
+        period,
+        days,
+        previousGraceEndsAt: invoice.graceEndsAt,
+        newGraceEndsAt: new Date(Date.parse(invoice.graceEndsAt) + Number(days) * billingCore.DAY_MS).toISOString(),
+        reason,
+        requestId
+      });
+      return { ok: true, extension, billing: describeZapBilling(zap) };
+    },
+    'billing-overview': () => {
+      const subscriptions = state.zaps
+        .map((zap) => ({ zap, billing: describeZapBilling(zap) }))
+        .filter((item) => item.billing.enabled);
+      return {
+        ok: true,
+        subscriptions,
+        totals: {
+          active: subscriptions.filter((item) => item.billing.active).length,
+          grace: subscriptions.filter((item) => item.billing.status === 'grace').length,
+          overdue: subscriptions.filter((item) => item.billing.status === 'overdue').length,
+          amountDueCents: subscriptions.reduce((sum, item) => sum + item.billing.arrearsAmountCents, 0)
+        },
+        items: subscriptions.map((item) => ({ zapId: String(item.zap.id), name: item.zap.name, ...item.billing })),
+        total: subscriptions.length
+      };
     },
     'server-terminal-logs': () => state.logs
   };
@@ -176,6 +249,24 @@ async function main() {
     assert.strictEqual(r.data.user.role, 'owner');
   });
 
+  testAsync('backend: provedores permitem descoberta, cadastro, teste e exclusao', async () => {
+    let r = await api('POST', '/providers/discover', { name: 'Minha API', baseUrl: 'https://api.exemplo.com/v1', apiKey: 'k' });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.data.models[0].id, 'modelo-Minha API');
+
+    r = await api('PUT', '/providers/p2', { provider: { name: 'Novo Provedor', baseUrl: 'https://api.exemplo.com/v1', models: [{ id: 'm2' }] } });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.data.id, 'p2');
+
+    r = await api('POST', '/providers/test', { providerId: 'p2', modelId: 'm2' });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.data.text, 'testado m2');
+
+    r = await api('DELETE', '/providers/p2');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.data.ok, true);
+  });
+
   testAsync('backend: lista zaps pelo mesmo handler do IPC', async () => {
     const r = await api('GET', '/zaps');
     assert.strictEqual(r.status, 200);
@@ -223,20 +314,30 @@ async function main() {
     assert.strictEqual(r.data.contacts[0].name, 'Joao');
   });
 
-  testAsync('backend: billing mostra vencimento e aceita pagamento', async () => {
-    const put = await api('PUT', '/zaps/z1/billing', { dueDay: 10, graceDays: 5, monthlyAmount: 99 });
-    assert.strictEqual(put.status, 200);
-    const before = await api('GET', '/zaps/z1/billing');
-    assert.strictEqual(before.status, 200);
-    assert.strictEqual(before.data.dueDay, 10);
-    assert.ok(['pending', 'grace', 'overdue', 'paid'].includes(before.data.status));
-
+  testAsync('backend: billing mostra vencimento e aceita pagamento assinado', async () => {
     const now = new Date();
     const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    const pay = await api('POST', '/zaps/z1/billing/pay', { month });
+    const put = await api('PUT', '/zaps/z1/billing', { enabled: true, dueDay: 1, graceDays: 15, monthlyAmount: 99, startMonth: month });
+    assert.strictEqual(put.status, 200);
+    assert.strictEqual(put.data.ok, true);
+    const before = await api('GET', '/zaps/z1/billing');
+    assert.strictEqual(before.status, 200);
+    assert.strictEqual(before.data.dueDay, 1);
+    assert.ok(['pending', 'grace', 'overdue', 'paid'].includes(before.data.status));
+
+    const rejected = await api('POST', '/zaps/z1/billing/pay', { period: month });
+    assert.strictEqual(rejected.data.ok, false);
+    const pay = await api('POST', '/zaps/z1/billing/pay', { period: month, signature });
     assert.strictEqual(pay.status, 200);
+    assert.strictEqual(pay.data.ok, true, pay.data.error);
     assert.strictEqual(pay.data.billing.status, 'paid');
     assert.strictEqual(pay.data.billing.active, true);
+    assert.strictEqual(pay.data.payment.signature, signature);
+
+    const overview = await api('GET', '/billing/overview');
+    assert.strictEqual(overview.status, 200);
+    assert.strictEqual(overview.data.total, 1);
+    assert.strictEqual(overview.data.subscriptions[0].billing.payments.length, 1);
   });
 
   testAsync('backend: /server/status inclui os zaps para o painel', async () => {

@@ -12,6 +12,7 @@ const { isWithinWorkHours } = require('./src/js/work-hours');
 const { createPaths } = require('./src/core/paths');
 const { createJsonStore } = require('./src/core/json-store');
 const billingCore = require('./src/core/billing');
+const { BillingStore } = require('./src/core/billing-store');
 const { createEventBus } = require('./src/core/events');
 const { createTypingService } = require('./src/core/messaging/typing');
 const { createMessagePipeline } = require('./src/core/messaging/pipeline');
@@ -21,6 +22,7 @@ const { AudioPipeline } = require('./src/core/audio/pipeline');
 const { createAudioPreparer } = require('./src/core/audio/ffmpeg');
 const { createSttSystem } = require('./src/core/stt');
 const { resourcesSnapshot } = require('./src/core/resources');
+const { normalizeProvider, discoverProviderModels } = require('./src/core/providers');
 const { spawn } = require('child_process');
 
 // Superficie unica de comandos: o IPC do Setup e a API do backend chamam os
@@ -651,23 +653,58 @@ function loadJsonFile(filename, fallback) {
   return coreStore.loadJsonFile(filename, fallback);
 }
 function loadZapsData() { return loadJsonFile('zaps.json', []); }
+
+function preserveBillingPlans(data) {
+  if (!Array.isArray(data)) return data;
+  const before = loadZapsData();
+  const beforeById = new Map((Array.isArray(before) ? before : []).map((zap) => [String(zap.id), zap]));
+  return data.map((zap) => {
+    const previous = beforeById.get(String(zap.id));
+    if (previous && previous.billingPlan) return { ...zap, billingPlan: previous.billingPlan };
+    const { billingPlan, ...safeZap } = zap;
+    const now = new Date();
+    return {
+      ...safeZap,
+      billingPlan: billingCore.normalizeBillingConfig({
+        enabled: true,
+        ...billingCore.billingDefaultsForZap(safeZap, now)
+      }, {}, now)
+    };
+  });
+}
 // ------------------------------------------------------------
-// Pagamento por Zap: cada zap tem um plano de pagamento.
-// Se a pessoa nao marque "pago" ate o dia do prazo (gracePeriod), o zap
-// para de responder. Apos a ultima data vencida, se nao foi pago,
-// o zap fica definitivamente indisponivel ("em atraso") para evitar
-// prorrogamentos absurdos.
+// Plano de pagamento por Zap, com carencia e prorrogacao por fatura.
 // ------------------------------------------------------------
 function getBillingForZap(id) {
   const list = loadZapsData();
-  const z = list.find(z => String(z.id) === String(id));
-  return billingCore.getBillingForZap(z);
+  const zap = list.find((z) => String(z.id) === String(id));
+  return billingCore.getBillingForZap(zap);
 }
-// Checa se um zap pode responder agora. Retorna { active: true|false, reason, todayKey, currentDue }
-function checkBillingActive(zapId) {
+
+function describeBillingForZap(id) {
   const list = loadZapsData();
-  const z = list.find(z => String(z.id) === String(zapId));
-  return billingCore.checkBillingActive(z || null);
+  const zap = list.find((z) => String(z.id) === String(id));
+  if (!zap) return null;
+  return billingCore.describeBilling(zap, new Date(), getBillingStore().snapshot());
+}
+
+// Checa se o zap pode operar agora, incluindo o livro de pagamentos real.
+function checkBillingActive(zapId) {
+  const id = String(zapId || '');
+  const cached = billingAccessCache.get(id);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const list = loadZapsData();
+  const zap = list.find((z) => String(z.id) === id);
+  let value;
+  if (!zap || zap.enabled === false) {
+    value = { active: false, reason: zap ? 'zap_disabled' : 'zap_not_found', status: 'disabled', todayKey: billingCore.monthKeyOf(new Date()), currentDue: null, dueDate: null, graceEndsAt: null, oldestUnpaidPeriod: null, arrearsCount: 0 };
+  } else {
+    const plan = billingCore.getBillingForZap(zap);
+    const ledger = plan && plan.enabled ? getBillingStore().accessSnapshot() : {};
+    value = billingCore.checkBillingActive(zap, new Date(), ledger);
+  }
+  billingAccessCache.set(id, { value, expiresAt: Date.now() + 1000 });
+  return value;
 }
 
 function loadProvidersData() {
@@ -811,7 +848,7 @@ function getMessagePipeline() {
       loadZaps: loadZapsData,
       loadProviders: loadProvidersData,
       loadTrainings: loadTrainingsData,
-      checkBillingActive: (zap) => billingCore.checkBillingActive(zap),
+      checkBillingActive: (zap) => checkBillingActive(zap.id),
       isServerPaused,
       isServerMode: () => serverMode,
       log: sendLog,
@@ -831,6 +868,19 @@ function getMessagePipeline() {
 // com retry/backoff, validacao real dos bytes e transcricao. A resposta ao
 // cliente continua sendo a mesma IA das mensagens de texto.
 let audioSystem = null;
+let billingStore = null;
+const billingAccessCache = new Map();
+
+function invalidateBillingAccess(zapId) {
+  if (zapId != null) billingAccessCache.delete(String(zapId));
+}
+
+function getBillingStore() {
+  if (!billingStore) {
+    billingStore = new BillingStore({ filePath: getFilePath('billing-ledger.json'), logger: console });
+  }
+  return billingStore;
+}
 
 // Servico de transcricao local (whisper.cpp). Criado uma vez por processo e
 // compartilhado por todos os zaps: um modelo, uma fila, isolamento por zapId.
@@ -1009,7 +1059,7 @@ function getAudioSystem() {
     try {
       const result = await pipeline.run(taskKey, {
         download: async (t) => {
-          const manager = getWhatsapp();
+          const manager = whatsappManager;
           if (!manager || typeof manager.resolveAudioMessage !== 'function') {
             throw new Error('gerenciador do WhatsApp indisponivel');
           }
@@ -1096,9 +1146,10 @@ async function runAudioTaskForMessage(messageData) {
 // boot; o ciclo periodico so mexe em tarefas paradas ha mais de 2 minutos.
 async function recoverAudioTasks(force) {
   const sys = getAudioSystem();
-  const manager = getWhatsapp();
+  const manager = whatsappManager;
+  let stale = [];
   try {
-    const stale = sys.store.markStale(2 * 60 * 1000, sys.inflight);
+    stale = sys.store.markStale(2 * 60 * 1000, sys.inflight);
     if (stale.length) {
       sendLog('', 'info', `[AUDIO] ${stale.length} tarefa(s) travada(s) reclassificada(s) apos reinicio.`);
     }
@@ -1114,13 +1165,15 @@ async function recoverAudioTasks(force) {
     console.error('[AUDIO] falha ao listar tarefas recuperaveis:', e.message);
     return;
   }
+  const staleKeys = new Set(stale.map((task) => task.key));
   const now = Date.now();
   let started = 0;
   for (const task of pending) {
     if (sys.inflight.has(task.key)) continue;
     // Criada nesta execucao e ainda na fila do chat: o fluxo ao vivo responde.
     if (task.createdAt >= sys.bootAt && (task.state === 'QUEUED' || task.state === 'RECEIVED')) continue;
-    if (!force && now - (task.updatedAt || 0) < 90 * 1000) continue;
+    // markStale acabou de atualizar updatedAt; nao adiar de novo a mesma tarefa.
+    if (!force && !staleKeys.has(task.key) && now - (task.updatedAt || 0) < 90 * 1000) continue;
     const clientData = manager && manager.clients ? manager.clients.get(String(task.zapId)) : null;
     if (!clientData || clientData.status !== 'ready') continue; // proximo ciclo tenta
     if (!task.chatId) continue;
@@ -1584,6 +1637,11 @@ function startConnectionWatchdog(intervalMs = 60000) {
         if (!z || z.enabled === false) continue;
         const id = String(z.id);
         if (inFlight.has(id)) continue;
+        try {
+          if (!checkBillingActive(id).active) continue;
+        } catch (_) {
+          continue;
+        }
         const st = (whatsappManager.getStatus(id) || { status: 'disconnected' });
 
         // O proprio WhatsApp Web renova o QR a cada ~20s (evento 'qr').
@@ -1655,7 +1713,11 @@ function snapshotServerZaps() {
   const map = new Map();
   const list = loadZapsData();
   if (!Array.isArray(list)) return map;
-  for (const z of list) map.set(String(z.id), { enabled: z.enabled !== false });
+  for (const z of list) {
+    let billingActive = false;
+    try { billingActive = checkBillingActive(z.id).active; } catch (_) {}
+    map.set(String(z.id), { enabled: z.enabled !== false, billingActive });
+  }
   return map;
 }
 
@@ -1703,13 +1765,20 @@ async function reconcileServerZapsOnce() {
         const id = String(z.id);
         const prev = serverKnownZaps.get(id);
         const st = whatsappManager.getStatus(id) || { status: 'disconnected' };
-        const busy = ['connecting', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated', 'ready'].includes(st.status);
-        if (z.enabled === false) {
+        const busy = ['connecting', 'initializing', 'waiting_qr', 'waiting_pairing', 'pairing_accepted', 'authenticated', 'ready'].includes(st.status);
+        let billingActive = false;
+        try { billingActive = checkBillingActive(id).active; } catch (_) {}
+        const allowed = z.enabled !== false && billingActive;
+        if (!allowed) {
           if (busy) {
-            console.log(`[SYNC] Zap ${id} desativado no painel - desconectando`);
-            try { await whatsappManager.disconnectZap(id, 'desativado no painel'); } catch (_) {}
+            const reason = z.enabled === false ? 'desativado no painel' : 'assinatura atrasada ou acesso indisponivel';
+            console.log(`[SYNC] Zap ${id} sem acesso (${reason}) - desconectando`);
+            try { await whatsappManager.disconnectZap(id, reason); } catch (_) {}
           }
-        } else if ((!prev || prev.enabled === false) && !busy) {
+          serverKnownZaps.set(id, { enabled: z.enabled !== false, billingActive });
+          continue;
+        }
+        if ((!prev || prev.enabled === false || prev.billingActive === false) && !busy) {
           const sessionDir = path.join(getDataDir(), 'sessions', id);
           const hasSession = fs.existsSync(sessionDir);
           const phone = String(z.phone || '').replace(/\D/g, '');
@@ -1723,7 +1792,7 @@ async function reconcileServerZapsOnce() {
               .catch((e) => console.error(`[SYNC] pairing(${id}) falhou: ${e.message}`));
           }
         }
-        serverKnownZaps.set(id, { enabled: z.enabled !== false });
+        serverKnownZaps.set(id, { enabled: z.enabled !== false, billingActive });
       }
     } catch (e) {
       console.error('[SYNC] reconciler falhou:', e.message);
@@ -1771,6 +1840,7 @@ function startSessionRecycler() {
     try {
       for (const z of list) {
         const id = String(z.id);
+        try { if (!checkBillingActive(id).active) continue; } catch (_) { continue; }
         const st = whatsappManager.getStatus(id) || { status: 'disconnected' };
         if (st.status !== 'ready') continue;
         try {
@@ -2197,6 +2267,7 @@ const ready = app.whenReady().then(() => {
   });
 
   whatsappManager = new WhatsAppManager(mainWindow);
+  if (typeof whatsappManager.setAccessGate === 'function') whatsappManager.setAccessGate(checkBillingActive);
   // Todo evento do gerenciador (status, QR, mensagens) tambem vai para o
   // barramento do nucleo, que alimenta o WebSocket do backend.
   if (typeof whatsappManager.sendToRenderer === 'function') {
@@ -2232,7 +2303,7 @@ const ready = app.whenReady().then(() => {
     saveZaps: (zaps) => {
       const problem = validateZapsPayload(zaps);
       if (problem) throw new Error(`lista de zaps invalida: ${problem}`);
-      saveJsonAtomic(getFilePath('zaps.json'), zaps);
+      saveJsonAtomic(getFilePath('zaps.json'), preserveBillingPlans(zaps));
       if (serverSync) serverSync.scheduleSync();
     },
     loadTrainings: loadTrainingsData,
@@ -2571,14 +2642,117 @@ handle('agent-chat', async (e, payload) => {
 // IPC - Data persistence
 // ------------------------------------------------------------
 handle('billing-check', (e, zapId) => checkBillingActive(String(zapId)));
+handle('billing-detail', (e, zapId) => {
+  try {
+    const billing = describeBillingForZap(zapId);
+    if (!billing) throw new Error('Zap nao encontrado');
+    return { ok: true, ...billing };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+handle('billing-overview', () => {
+  try {
+    const ledger = getBillingStore().snapshot();
+    const now = new Date();
+    const zaps = loadZapsData();
+    const subscriptions = zaps
+      .map((zap) => ({ zap, billing: billingCore.describeBilling(zap, now, ledger) }))
+      .filter((item) => item.billing.enabled)
+      .sort((a, b) => String(a.zap.name || '').localeCompare(String(b.zap.name || ''), 'pt-BR'));
+    return {
+      ok: true,
+      subscriptions,
+      totals: {
+        active: subscriptions.filter((item) => item.billing.active).length,
+        grace: subscriptions.filter((item) => item.billing.status === 'grace').length,
+        overdue: subscriptions.filter((item) => item.billing.status === 'overdue').length,
+        amountDueCents: subscriptions.reduce((sum, item) => sum + item.billing.arrearsAmountCents, 0)
+      },
+      items: subscriptions.map((item) => ({ zapId: String(item.zap.id), name: item.zap.name || '', enabled: item.zap.enabled !== false, ...item.billing })),
+      total: subscriptions.length,
+      overdue: subscriptions.filter((item) => item.billing.status === 'overdue').length,
+      pending: subscriptions.filter((item) => item.billing.status === 'pending').length,
+      grace: subscriptions.filter((item) => item.billing.status === 'grace').length,
+      suspended: subscriptions.filter((item) => item.billing.status === 'overdue').length
+    };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+handle('billing-pay', (e, zapId, period, signature) => {
+  try {
+    const id = String(zapId || '').trim();
+    const zaps = loadZapsData();
+    const zap = zaps.find((item) => String(item.id) === id);
+    if (!zap) throw new Error('Zap nao encontrado');
+    const billing = billingCore.describeBilling(zap, new Date(), getBillingStore().snapshot());
+    if (!billing.enabled) throw new Error('assinatura desativada');
+    const invoice = billing.invoices.find((item) => item.period === period);
+    if (!invoice) throw new Error('fatura nao encontrada');
+    if (invoice.paid) return { ok: true, alreadyPaid: true, billing: describeBillingForZap(id) };
+    if (!invoice.payable) throw new Error('o pagamento so pode ser confirmado a partir de 5 dias antes do vencimento');
+    const result = getBillingStore().appendPayment({
+      zapId: id,
+      period: invoice.period,
+      amountCents: invoice.amountCents,
+      amount: invoice.amount,
+      currency: invoice.currency,
+      signature
+    });
+    invalidateBillingAccess(id);
+    return { ok: true, payment: result.payment, duplicate: result.duplicate, billing: describeBillingForZap(id) };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
+handle('billing-extend', (e, zapId, period, days, reason, requestId) => {
+  try {
+    const id = String(zapId || '').trim();
+    const amount = Number(days);
+    if (!Number.isInteger(amount) || amount < 1 || amount > 365) throw new Error('a prorrogacao deve ter entre 1 e 365 dias');
+    const zaps = loadZapsData();
+    const zap = zaps.find((item) => String(item.id) === id);
+    if (!zap) throw new Error('Zap nao encontrado');
+    const billing = billingCore.describeBilling(zap, new Date(), getBillingStore().snapshot());
+    if (!billing.enabled) throw new Error('assinatura desativada');
+    const invoice = billing.invoices.find((item) => item.period === period);
+    if (!invoice || invoice.paid) throw new Error(invoice ? 'fatura ja paga' : 'fatura nao encontrada');
+    const previousGraceEndsAt = Date.parse(invoice.graceEndsAt);
+    const newGraceEndsAt = new Date(previousGraceEndsAt + amount * billingCore.DAY_MS).toISOString();
+    const extension = getBillingStore().appendExtension({
+      zapId: id,
+      period: invoice.period,
+      days: amount,
+      previousGraceEndsAt: invoice.graceEndsAt,
+      newGraceEndsAt,
+      reason: String(reason || '').trim(),
+      requestId: String(requestId || '').trim()
+    });
+    invalidateBillingAccess(id);
+    return { ok: true, extension, billing: describeBillingForZap(id) };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
 handle('billing-save', (e, zapId, data) => {
   try {
+    const id = String(zapId || '').trim();
     const zaps = loadZapsData();
-    const z = zaps.find(z => String(z.id) === String(zapId));
-    if (z) z.billingPlan = data || {};
+    const zap = zaps.find((item) => String(item.id) === id);
+    if (!zap) throw new Error('Zap nao encontrado');
+    const now = new Date();
+    const existing = billingCore.resolveBillingPlan(zap, now) || {};
+    const patch = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    zap.billingPlan = billingCore.normalizeBillingConfig({ ...existing, ...patch }, existing, now);
+    const billing = describeBillingForZap(id);
+    ensureDataDir();
     saveJsonAtomic(getFilePath('zaps.json'), zaps);
-    return { ok: true };
-  } catch (err) { return { ok: false, error: err.message }; }
+    invalidateBillingAccess(id);
+    return { ok: true, billingPlan: zap.billingPlan, billing };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
 });
 
 handle('load-zaps', () => {
@@ -2599,29 +2773,32 @@ handle('save-zaps', (e, data, opts) => {
   ensureDataDir();
   const p = getFilePath('zaps.json');
   const before = fs.existsSync(p) ? loadZapsData() : [];
+  const beforeById = new Map((Array.isArray(before) ? before : []).map((zap) => [String(zap.id), zap]));
+  // Configuracao generica do Zap nao pode sobrescrever o plano financeiro.
+  // Alteracoes de assinatura passam exclusivamente por billing-save.
+  const safeData = preserveBillingPlans(data);
   const allowEmpty = !!(opts && opts.allowEmpty);
   // Guarda contra bug de UI/IPC que apagaria todos os Zaps. No servidor isso
   // faria o reconciliador remover todas as sessoes.
-  if (data.length === 0 && Array.isArray(before) && before.length > 0 && !allowEmpty) {
+  if (safeData.length === 0 && Array.isArray(before) && before.length > 0 && !allowEmpty) {
     console.error('[CONFIG] save-zaps recusou esvaziar a lista sem allowEmpty explicito');
     return false;
   }
   try {
-    const size = saveJsonAtomic(p, data);
+    const size = saveJsonAtomic(p, safeData);
     // Marcador explicito: o servidor so aceita uma lista vazia quando o painel
     // confirmou a exclusao (allowEmpty). Sem isso, lista vazia = possivel
     // corrupcao e o reconciliador deve abortar.
     try {
       saveJsonAtomic(getFilePath('zaps.empty-ok.json'), {
-        empty: data.length === 0,
+        empty: safeData.length === 0,
         at: Date.now()
       });
     } catch (_) {}
-    console.log(`save-zaps: ${size} bytes, ${data.length} zaps`);
+    console.log(`save-zaps: ${size} bytes, ${safeData.length} zaps`);
     if (Array.isArray(before)) {
-      const beforeById = new Map(before.map((z) => [String(z.id), z]));
-      const afterIds = new Set(data.map((z) => String(z.id)));
-      for (const z of data) {
+      const afterIds = new Set(safeData.map((z) => String(z.id)));
+      for (const z of safeData) {
         if (!beforeById.has(String(z.id))) {
           appendServerTerminalEntry({ level: 'success', source: 'PAINEL', msg: `Zap adicionado: ${z.name || z.id}` });
         }
@@ -2666,6 +2843,90 @@ handle('save-providers', (e, data) => {
   if (serverSync) serverSync.scheduleSync();
   return true;
 });
+handle('save-provider', (e, providerId, data) => {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  ensureDataDir();
+  const list = loadProvidersData();
+  const id = String(providerId || data.id || '').trim();
+  if (!id) throw new Error('provedor sem id');
+  const existing = list.find((provider) => String(provider.id) === id);
+  let provider;
+  try {
+    provider = normalizeProvider({ ...data, id }, existing || {});
+  } catch (error) {
+    console.error('[CONFIG] provedor invalido:', error.message);
+    throw new Error(error.message);
+  }
+  const safe = JSON.parse(JSON.stringify(provider));
+  encryptAllProvidersKeys([safe]);
+  const index = list.findIndex((item) => String(item.id) === id);
+  if (index >= 0) list[index] = safe;
+  else list.push(safe);
+  try {
+    saveJsonAtomic(getFilePath('providers.json'), list);
+  } catch (error) {
+    console.error('[CONFIG] save-provider falhou:', error.message);
+    throw new Error('nao foi possivel gravar providers.json; o arquivo anterior foi preservado');
+  }
+  if (serverSync) serverSync.scheduleSync();
+  return loadProvidersData().find((item) => String(item.id) === id) || null;
+});
+
+handle('delete-provider', (e, providerId) => {
+  const id = String(providerId || '').trim();
+  if (!id) return false;
+  const list = loadProvidersData();
+  const next = list.filter((provider) => String(provider.id) !== id);
+  if (next.length === list.length) return false;
+  try {
+    saveJsonAtomic(getFilePath('providers.json'), next);
+  } catch (error) {
+    console.error('[CONFIG] delete-provider falhou:', error.message);
+    return false;
+  }
+  if (serverSync) serverSync.scheduleSync();
+  return true;
+});
+
+handle('discover-provider-models', async (e, data) => {
+  const input = data && typeof data === 'object' ? data : {};
+  const existing = input.id ? loadProvidersData().find((provider) => String(provider.id) === String(input.id)) : null;
+  if (existing && input.apiKey == null) input.apiKey = existing.apiKey;
+  try {
+    const models = await discoverProviderModels(input, { existing });
+    return { ok: true, models };
+  } catch (error) {
+    const message = String(error && error.message ? error.message : error).replace(/([?&]key=)[^&\s]+/gi, '$1[oculta]');
+    console.error('[CONFIG] descoberta de modelos falhou:', message);
+    throw new Error(message);
+  }
+});
+
+handle('test-provider-model', async (e, data) => {
+  const input = data && typeof data === 'object' ? data : {};
+  const provider = loadProvidersData().find((item) => String(item.id) === String(input.providerId || ''));
+  const modelId = String(input.modelId || '').trim();
+  if (!provider || !modelId || !(provider.models || []).some((model) => model.id === modelId)) {
+    throw new Error('provedor ou modelo nao encontrado');
+  }
+  const keys = Array.isArray(provider.apiKeys) && provider.apiKeys.length
+    ? provider.apiKeys
+    : (provider.apiKey ? [provider.apiKey] : []);
+  const keyIndex = Number.isInteger(input.keyIndex) && input.keyIndex >= 0 ? input.keyIndex : 0;
+  const apiKey = keys[keyIndex] || keys[0] || '';
+  const responder = aiResponder || new AIResponder();
+  const text = await responder.callAI(
+    { ...provider, apiKey },
+    { id: modelId },
+    apiKey,
+    [
+      { role: 'system', content: 'Responda em portugues, em uma frase curta, confirmando que a conexao funcionou.' },
+      { role: 'user', content: 'Diga apenas: conexao funcionando.' }
+    ]
+  );
+  return { ok: true, text: String(text || '').trim() };
+});
+
 handle('load-trainings', () => loadTrainingsData());
 handle('save-trainings', (e, data, deletedFiles) => {
   ensureDataDir();

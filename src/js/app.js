@@ -23,6 +23,14 @@ function safeParseLS(key, fallback) {
 let zapsData = safeParseLS('linknozap_zaps', []);
 let providersData = safeParseLS('linknozap_providers', []);
 
+let billingOverview = null;
+let billingExpandedIds = new Set();
+let billingFocusZapId = null;
+let pendingBillingPayment = null;
+let pendingBillingExtension = null;
+let billingSignatureDrawing = false;
+let billingSignatureHasInk = false;
+
 // Modo servidor: o app local e o painel; o WhatsApp roda 24h no servidor.
 // Nesse modo nao conectamos nada por aqui e as configs sincronizam sozinhas.
 let serverManaged = false;
@@ -470,6 +478,7 @@ function init() {
   }
 
   setupEventListeners();
+  initBillingPage();
   setupCustomSelects();
   initProviders();
   initProviderConfig();
@@ -830,6 +839,10 @@ function setupEventListeners() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && addZapModal.classList.contains('active')) {
       closeModalHandler();
+    } else if (e.key === 'Escape' && document.getElementById('billingPaymentModal').classList.contains('active')) {
+      closeBillingPaymentModal();
+    } else if (e.key === 'Escape' && document.getElementById('billingExtensionModal').classList.contains('active')) {
+      closeBillingExtensionModal();
     }
   });
 }
@@ -865,6 +878,10 @@ function navigateTo(page) {
     onAutoMsgPageOpen();
   }
 
+  if (page === 'assinaturas') {
+    loadBillingOverview();
+  }
+
   // Abrir o painel do servidor marca os erros como vistos (badge sem pulso)
   if (page === 'gerenciar-servidor') {
     serverErrorBadgeSeen = countServerTerminalErrors();
@@ -893,6 +910,7 @@ const SEARCH_PLACEHOLDERS = {
   'adicionar-whatsapp': 'Buscar Zaps, nmeros...',
   'gerenciar-servidor': 'Buscar no terminal...',
   'contatos': 'Buscar contatos, nmeros...',
+  'assinaturas': 'Buscar assinaturas, faturas...',
   'conversas': 'Buscar conversas...',
   'treinamento': 'Buscar Zaps e treinamentos...',
   'provedores': 'Buscar provedores...',
@@ -1082,6 +1100,8 @@ function refreshPageList() {
     renderZaps(zapsData);
   } else if (page === 'contatos') {
     renderContactsPage();
+  } else if (page === 'assinaturas') {
+    renderBillingPage();
   } else if (page === 'treinamento') {
     renderTrainingZapsList();
     renderTrainingsList();
@@ -1331,6 +1351,7 @@ function updateModelSelect() {
           id: model.id || model,
           name: model.name || model,
           provider: provider.name,
+          providerId: provider.id,
           free: model.free || false
         });
       });
@@ -1346,7 +1367,7 @@ function updateModelSelect() {
 
   allModels.forEach(model => {
     const opt = document.createElement('option');
-    opt.value = `${model.provider}|${model.id}`;
+    opt.value = `${model.providerId}|${model.id}`;
     opt.textContent = `${model.name} (${model.provider})${model.free ? ' - Gratuito' : ''}`;
     modelSelect.appendChild(opt);
   });
@@ -1523,6 +1544,318 @@ function openPersonalityModal(onDone) {
   };
 }
 
+const BILLING_PAYMENT_DAYS_BEFORE = 5;
+
+function billingMonthNow() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function billingMonthKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function billingDateKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function billingAddMonths(period, amount) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(period || ''));
+  if (!match) return period;
+  return billingMonthKey(new Date(Number(match[1]), Number(match[2]) - 1 + amount, 1));
+}
+
+function billingPeriodSequence(start, end) {
+  const valid = (value) => /^\d{4}-(0[1-9]|1[0-2])$/.test(String(value || ''));
+  if (!valid(start) || !valid(end)) return [];
+  const periods = [];
+  let current = start;
+  for (let i = 0; i < 240 && current <= end; i++) {
+    periods.push(current);
+    current = billingAddMonths(current, 1);
+  }
+  return periods;
+}
+
+function billingPeriodDate(period, dueDay) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(period || ''));
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const lastDay = new Date(year, month, 0).getDate();
+  return new Date(year, month - 1, Math.min(Math.max(1, dueDay), lastDay), 0, 0, 0, 0);
+}
+
+function normalizeBillingDetail(result, zap, now = new Date()) {
+  if (!result || typeof result !== 'object') return result;
+  if (result.enabled === false || result.status === 'own_use') return result;
+  const defaults = getZapBillingDefaults(zap);
+  const savedPlan = zap && zap.billingPlan && typeof zap.billingPlan === 'object' ? zap.billingPlan : {};
+  const dueDayValue = Number(result.dueDay == null ? (savedPlan.dueDay == null ? defaults.dueDay : savedPlan.dueDay) : result.dueDay);
+  const dueDay = Number.isInteger(dueDayValue) && dueDayValue >= 1 && dueDayValue <= 31 ? dueDayValue : defaults.dueDay;
+  const graceValue = Number(result.graceDays == null ? (savedPlan.graceDays == null ? defaults.graceDays : savedPlan.graceDays) : result.graceDays);
+  const graceDays = Number.isInteger(graceValue) && graceValue >= 0 && graceValue <= 365 ? graceValue : defaults.graceDays;
+  const amountValue = Number(result.monthlyAmount == null ? (savedPlan.monthlyAmount == null ? defaults.monthlyAmount : savedPlan.monthlyAmount) : result.monthlyAmount);
+  const monthlyAmount = Number.isFinite(amountValue) ? Math.max(0, amountValue) : defaults.monthlyAmount;
+  const currency = String(result.currency || savedPlan.currency || defaults.currency || 'BRL').toUpperCase().slice(0, 3);
+  const periodPattern = /^\d{4}-(0[1-9]|1[0-2])$/;
+  const startMonth = periodPattern.test(String(result.startMonth || ''))
+    ? result.startMonth
+    : periodPattern.test(String(savedPlan.startMonth || ''))
+      ? savedPlan.startMonth
+      : defaults.startMonth;
+  const currentPeriod = billingMonthKey(now);
+  const nextPeriod = billingAddMonths(currentPeriod, 1);
+  const paidMonths = { ...(savedPlan.paidMonths || {}), ...(result.paidMonths || {}) };
+  const payments = Array.isArray(result.payments) ? result.payments : [];
+  for (const payment of payments) {
+    if (payment && periodPattern.test(String(payment.period || ''))) paidMonths[payment.period] = true;
+  }
+  const extensions = Array.isArray(result.extensions) ? result.extensions : [];
+  const amountCents = Math.round(monthlyAmount * 100);
+  const sourceInvoices = Array.isArray(result.invoices) ? result.invoices : [];
+  const periods = sourceInvoices.length
+    ? sourceInvoices.map((invoice) => invoice.period).filter((period) => periodPattern.test(String(period || '')))
+    : billingPeriodSequence(startMonth, nextPeriod);
+  const invoices = periods.map((period) => {
+    const source = sourceInvoices.find((invoice) => invoice.period === period) || {};
+    const calculatedDue = billingPeriodDate(period, dueDay);
+    const parsedDue = Date.parse(source.dueAt || (source.dueDate ? `${source.dueDate}T00:00:00` : ''));
+    const dueAt = Number.isFinite(parsedDue) ? new Date(parsedDue) : calculatedDue;
+    const paymentOpensAt = new Date(dueAt.getTime() - BILLING_PAYMENT_DAYS_BEFORE * 24 * 60 * 60 * 1000);
+    const parsedGrace = Date.parse(source.graceEndsAt || '');
+    const graceEndsAt = Number.isFinite(parsedGrace)
+      ? new Date(parsedGrace)
+      : new Date(dueAt.getTime() + graceDays * 24 * 60 * 60 * 1000);
+    const paid = source.paid === true || paidMonths[period] === true || !!(paidMonths[period] && paidMonths[period].paidAt);
+    const status = paid ? 'paid' : now < dueAt ? 'pending' : now < graceEndsAt ? 'grace' : 'overdue';
+    return {
+      ...source,
+      id: source.id || `${zap ? zap.id : ''}:${period}`,
+      zapId: String(zap ? zap.id : source.zapId || ''),
+      period,
+      dueAt: dueAt.toISOString(),
+      dueDate: billingDateKey(dueAt),
+      paymentOpensAt: paymentOpensAt.toISOString(),
+      originalGraceEndsAt: source.originalGraceEndsAt || new Date(dueAt.getTime() + graceDays * 24 * 60 * 60 * 1000).toISOString(),
+      graceEndsAt: graceEndsAt.toISOString(),
+      amountCents: Number.isInteger(source.amountCents) ? source.amountCents : amountCents,
+      amount: source.amount == null ? monthlyAmount : source.amount,
+      currency: source.currency || currency,
+      status,
+      paid,
+      payable: !paid && now >= paymentOpensAt,
+      daysOverdue: status === 'overdue' ? Math.max(0, Math.floor((now.getTime() - graceEndsAt.getTime()) / (24 * 60 * 60 * 1000))) : 0,
+      extensions: Array.isArray(source.extensions)
+        ? source.extensions
+        : extensions.filter((extension) => extension && extension.period === period)
+    };
+  });
+
+  if (result.status === 'overdue' && !invoices.some((invoice) => invoice.status === 'overdue')) {
+    const invoice = invoices.find((entry) => entry.period === currentPeriod && !entry.paid) || invoices.find((entry) => !entry.paid);
+    const graceEndsAt = Date.parse(result.graceEndsAt || '');
+    if (invoice) {
+      if (Number.isFinite(graceEndsAt)) invoice.graceEndsAt = new Date(graceEndsAt).toISOString();
+      invoice.status = 'overdue';
+      invoice.payable = true;
+      invoice.daysOverdue = Math.max(0, Math.floor((now.getTime() - Date.parse(invoice.graceEndsAt)) / (24 * 60 * 60 * 1000)));
+    }
+  } else if (result.status === 'grace' && !invoices.some((invoice) => invoice.period <= currentPeriod && invoice.status === 'grace')) {
+    const invoice = invoices.find((entry) => entry.period === currentPeriod);
+    const graceEndsAt = Date.parse(result.graceEndsAt || '');
+    if (invoice && !invoice.paid && Number.isFinite(graceEndsAt) && now < graceEndsAt) {
+      invoice.graceEndsAt = new Date(graceEndsAt).toISOString();
+      invoice.status = 'grace';
+      invoice.payable = true;
+    }
+  }
+
+  const currentInvoice = invoices.find((invoice) => invoice.period === currentPeriod) || null;
+  const dueMonths = invoices.filter((invoice) => invoice.payable);
+  const overdueMonths = invoices.filter((invoice) => invoice.status === 'overdue');
+  const oldestUnpaid = dueMonths[0] || null;
+  const status = overdueMonths.length
+    ? 'overdue'
+    : invoices.some((invoice) => invoice.period <= currentPeriod && invoice.status === 'grace')
+      ? 'grace'
+      : !currentInvoice || currentInvoice.status === 'pending'
+        ? 'pending'
+        : 'paid';
+  const nextPending = invoices.find((invoice) => !invoice.paid) || null;
+  const remainingMs = oldestUnpaid ? Math.max(0, Date.parse(oldestUnpaid.graceEndsAt) - now.getTime()) : 0;
+  return {
+    ...result,
+    status,
+    active: status !== 'overdue',
+    reason: status === 'overdue' ? 'atrasado' : status === 'grace' ? 'carencia' : status === 'pending' ? 'no_vencimento' : 'pago',
+    enabled: true,
+    todayKey: currentPeriod,
+    currentPeriod,
+    dueDay,
+    dueDate: currentInvoice ? currentInvoice.dueDate : result.dueDate || null,
+    graceDays,
+    graceEndsAt: oldestUnpaid ? oldestUnpaid.graceEndsAt : currentInvoice ? currentInvoice.graceEndsAt : null,
+    nextDueDate: nextPending ? nextPending.dueDate : result.nextDueDate || null,
+    daysRemaining: oldestUnpaid ? Math.ceil(remainingMs / (24 * 60 * 60 * 1000)) : null,
+    hoursRemaining: oldestUnpaid ? Math.ceil(remainingMs / (60 * 60 * 1000)) : null,
+    monthlyAmount,
+    currency,
+    startMonth,
+    paidMonths,
+    invoices,
+    dueMonths,
+    overdueMonths,
+    arrearsCount: dueMonths.length,
+    arrearsAmountCents: dueMonths.reduce((total, invoice) => total + invoice.amountCents, 0),
+    oldestUnpaidPeriod: oldestUnpaid ? oldestUnpaid.period : null,
+    payments,
+    extensions
+  };
+}
+
+function getZapBillingDefaults(zap) {
+  let created = null;
+  const candidates = [zap && zap.createdAtISO, zap && zap.createdAt, zap && zap.id];
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === '') continue;
+    const raw = String(candidate).trim();
+    const parsed = /^\d{13}$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+    if (Number.isFinite(parsed.getTime())) {
+      created = parsed;
+      break;
+    }
+  }
+  if (!created) created = new Date();
+  return {
+    dueDay: created.getDate(),
+    graceDays: 3,
+    monthlyAmount: 349,
+    currency: 'BRL',
+    startMonth: `${created.getFullYear()}-${String(created.getMonth() + 1).padStart(2, '0')}`
+  };
+}
+
+function applyBillingDetailToPanel(zapId, billing) {
+  if (currentPanelZapId == null || String(currentPanelZapId) !== String(zapId)) return;
+  const enabled = document.getElementById('panelSubscriptionEnabled');
+  const label = document.getElementById('panelSubscriptionLabel');
+  const config = document.getElementById('panelSubscriptionConfig');
+  const status = document.getElementById('panelSubscriptionStatus');
+  if (!enabled || !billing) return;
+  enabled.checked = billing.enabled === true;
+  if (label) label.textContent = enabled.checked ? 'Cobranca de assinatura ativada' : 'Cobranca de assinatura desativada';
+  if (config) config.style.display = enabled.checked ? 'block' : 'none';
+  const zap = zapsData.find((item) => String(item.id) === String(zapId));
+  const defaults = getZapBillingDefaults(zap);
+  document.getElementById('panelBillingDueDay').value = billing.dueDay == null ? defaults.dueDay : billing.dueDay;
+  document.getElementById('panelBillingGraceDays').value = billing.graceDays == null ? defaults.graceDays : billing.graceDays;
+  document.getElementById('panelBillingAmount').value = Number(billing.monthlyAmount == null ? defaults.monthlyAmount : billing.monthlyAmount).toFixed(2);
+  if (status) {
+    const labels = { paid: 'Em dia', pending: 'A vencer', grace: 'Em carencia', overdue: 'Pagamento em atraso', own_use: 'Desativada' };
+    status.textContent = enabled.checked ? (labels[billing.status] || billing.status) : '';
+    status.className = `panel-subscription-status billing-status-text-${billing.status || 'own_use'}`;
+  }
+}
+
+async function refreshPanelBilling(zapId) {
+  if (!window.electronAPI || !window.electronAPI.billingDetail) return null;
+  try {
+    const result = await window.electronAPI.billingDetail(String(zapId));
+    if (!result || result.ok === false) throw new Error((result && result.error) || 'falha ao carregar assinatura');
+    const zap = zapsData.find((item) => String(item.id) === String(zapId));
+    const normalized = normalizeBillingDetail(result, zap);
+    applyBillingDetailToPanel(zapId, normalized);
+    return normalized;
+  } catch (error) {
+    const status = document.getElementById('panelSubscriptionStatus');
+    if (status && currentPanelZapId != null && String(currentPanelZapId) === String(zapId)) {
+      status.textContent = error.message || String(error);
+      status.className = 'panel-subscription-status billing-status-text-overdue';
+    }
+    return null;
+  }
+}
+
+async function savePanelBilling(zapId, enabled) {
+  if (!window.electronAPI || !window.electronAPI.billingSave) throw new Error('API de assinatura indisponivel');
+  const status = document.getElementById('panelSubscriptionStatus');
+  const toggle = document.getElementById('panelSubscriptionEnabled');
+  if (toggle) toggle.disabled = true;
+  if (status) {
+    status.textContent = 'Salvando assinatura...';
+    status.className = 'panel-subscription-status';
+  }
+  try {
+    const result = await window.electronAPI.billingSave(String(zapId), {
+      enabled: !!enabled,
+      dueDay: Number(document.getElementById('panelBillingDueDay').value),
+      graceDays: Number(document.getElementById('panelBillingGraceDays').value),
+      monthlyAmount: Number(document.getElementById('panelBillingAmount').value),
+      currency: 'BRL'
+    });
+    if (!result || result.ok === false) throw new Error((result && result.error) || 'falha ao salvar assinatura');
+    const zap = zapsData.find((item) => String(item.id) === String(zapId));
+    if (zap) {
+      zap.billingPlan = result.billingPlan;
+      try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
+    }
+    const normalizedBilling = normalizeBillingDetail(result.billing, zap);
+    if (billingOverview && Array.isArray(billingOverview.subscriptions)) {
+      const item = billingOverview.subscriptions.find((entry) => String(entry.zap.id) === String(zapId));
+      if (item && normalizedBilling) {
+        item.billing = normalizedBilling;
+        if (zap) item.zap.billingPlan = result.billingPlan;
+      }
+    }
+    applyBillingDetailToPanel(zapId, normalizedBilling);
+    loadBillingOverview().catch(() => {});
+    return result;
+  } finally {
+    if (toggle) toggle.disabled = false;
+  }
+}
+
+function setupPanelBilling(zapId) {
+  const toggle = document.getElementById('panelSubscriptionEnabled');
+  if (!toggle) return;
+  toggle.onchange = async () => {
+    try {
+      await savePanelBilling(zapId, toggle.checked);
+    } catch (error) {
+      toggle.checked = !toggle.checked;
+      const status = document.getElementById('panelSubscriptionStatus');
+      if (status) {
+        status.textContent = error.message || String(error);
+        status.className = 'panel-subscription-status billing-status-text-overdue';
+      }
+    }
+  };
+  ['panelBillingDueDay', 'panelBillingGraceDays', 'panelBillingAmount'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) input.onchange = async () => {
+      if (!toggle.checked) return;
+      try {
+        await savePanelBilling(zapId, true);
+      } catch (error) {
+        const status = document.getElementById('panelSubscriptionStatus');
+        if (status) {
+          status.textContent = error.message || String(error);
+          status.className = 'panel-subscription-status billing-status-text-overdue';
+        }
+        await refreshPanelBilling(zapId);
+      }
+    };
+  });
+  const manage = document.getElementById('panelManageSubscription');
+  if (manage) manage.onclick = () => {
+    billingFocusZapId = String(zapId);
+    billingExpandedIds.add(String(zapId));
+    navigateTo('assinaturas');
+  };
+  refreshPanelBilling(zapId);
+}
+
 function openZapPanel(zapId) {
   const zap = zapsData.find(z => String(z.id) === String(zapId));
   if (!zap) return;
@@ -1646,6 +1979,8 @@ function openZapPanel(zapId) {
   whStart.onchange = persistWorkHours;
   whEnd.onchange = persistWorkHours;
   whDayBoxes.forEach(cb => { cb.onchange = persistWorkHours; });
+
+  setupPanelBilling(zapId);
 
   // Personalidade (lista de opcoes)
   const areaRow = document.getElementById('panelAreaRow');
@@ -2302,7 +2637,7 @@ function renderPanelModelConfig(zap) {
     const sep = zap.model.indexOf('|');
     const provName = zap.model.slice(0, sep);
     const modelId = zap.model.slice(sep + 1);
-    const prov = providersData.find(p => p.name === provName);
+    const prov = providersData.find(p => p.id === provName || p.name === provName);
     const legacyKey = prov ? `${prov.id}|${modelId}` : null;
     if (legacyKey && available.has(legacyKey)) saved = [legacyKey];
   }
@@ -2660,6 +2995,532 @@ async function loadContactsForZap(zap, container) {
   }
 }
 
+let billingRequestId = 0;
+
+function billingStatusMeta(status) {
+  const labels = {
+    paid: ['Pago', 'paid'],
+    pending: ['A vencer', 'pending'],
+    grace: ['Em carencia', 'grace'],
+    overdue: ['Em atraso', 'overdue'],
+    own_use: ['Desativada', 'pending'],
+    no_plan: ['Sem assinatura', 'pending']
+  };
+  const item = labels[status] || [status || 'Indefinido', 'pending'];
+  return { label: item[0], className: item[1] };
+}
+
+function formatBillingDate(value, withTime = false) {
+  if (!value) return '--';
+  const raw = String(value);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? new Date(`${raw}T12:00:00`) : new Date(raw);
+  if (Number.isNaN(date.getTime())) return '--';
+  return date.toLocaleDateString('pt-BR', withTime
+    ? { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }
+    : { day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+
+function formatBillingPeriod(period) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(period || ''));
+  return match ? `${match[2]}/${match[1]}` : String(period || '--');
+}
+
+function formatBillingMoney(amountCents, currency = 'BRL') {
+  const value = Number(amountCents || 0) / 100;
+  try {
+    return new Intl.NumberFormat('pt-BR', { style: 'currency', currency }).format(value);
+  } catch (_) {
+    return `R$ ${value.toFixed(2)}`;
+  }
+}
+
+async function loadBillingOverview() {
+  const request = ++billingRequestId;
+  if (!window.electronAPI || !window.electronAPI.billingOverview) {
+    billingOverview = { error: 'API de assinaturas indisponivel.' };
+    renderBillingPage();
+    return;
+  }
+  try {
+    const result = await window.electronAPI.billingOverview();
+    if (request !== billingRequestId) return;
+    if (!result || result.ok === false) throw new Error((result && result.error) || 'falha ao carregar assinaturas');
+    if (Array.isArray(result.subscriptions)) {
+      result.subscriptions = result.subscriptions.map((item) => ({
+        ...item,
+        billing: normalizeBillingDetail(item.billing, item.zap)
+      }));
+    } else if (Array.isArray(result.items)) {
+      result.subscriptions = result.items
+        .filter((item) => !['no_plan', 'own_use'].includes(item.status))
+        .map((item) => {
+          const zap = zapsData.find((entry) => String(entry.id) === String(item.zapId)) || { id: item.zapId, name: item.name, phone: '' };
+          return { zap, billing: normalizeBillingDetail({ ...item, enabled: true }, zap) };
+        });
+    }
+    if (!result.totals && Array.isArray(result.subscriptions)) {
+      result.totals = {
+        active: result.subscriptions.filter((item) => item.billing.active).length,
+        grace: result.subscriptions.filter((item) => item.billing.status === 'grace').length,
+        overdue: result.subscriptions.filter((item) => item.billing.status === 'overdue').length,
+        amountDueCents: result.subscriptions.reduce((sum, item) => sum + Number(item.billing.arrearsAmountCents || 0), 0)
+      };
+    }
+    billingOverview = result;
+    renderBillingPage();
+  } catch (error) {
+    if (request !== billingRequestId) return;
+    billingOverview = { error: error.message || String(error) };
+    renderBillingPage();
+  }
+}
+
+function billingInvoiceHtml(invoice, payments) {
+  const status = billingStatusMeta(invoice.status);
+  const payment = payments.find((item) => item.period === invoice.period) || null;
+  const extensions = Array.isArray(invoice.extensions) ? invoice.extensions : [];
+  const actions = [];
+  if (!invoice.paid && invoice.payable) {
+    actions.push(`<button type="button" class="btn btn-primary btn-sm billing-pay-btn" data-period="${escapeHtml(invoice.period)}">Pagar ${escapeHtml(formatBillingPeriod(invoice.period))}</button>`);
+  }
+  if (!invoice.paid) {
+    actions.push(`<button type="button" class="btn btn-outline btn-sm billing-extend-btn" data-period="${escapeHtml(invoice.period)}">Prorrogar</button>`);
+  }
+  return `
+    <div class="billing-invoice ${invoice.paid ? 'is-paid' : ''}">
+      <div class="billing-invoice-main">
+        <div class="billing-invoice-top">
+          <strong class="billing-invoice-period">${escapeHtml(formatBillingPeriod(invoice.period))}</strong>
+          <span class="billing-status-badge billing-status-${status.className}">${status.label}</span>
+        </div>
+        <div class="billing-invoice-dates">
+          <span>Vencimento: <strong>${escapeHtml(formatBillingDate(invoice.dueDate))}</strong></span>
+          ${invoice.paid
+            ? `<span class="billing-paid-label">Pagamento Realizado em ${escapeHtml(formatBillingDate(payment && payment.paidAt, true))}</span>`
+            : `<span>Carencia ate: <strong>${escapeHtml(formatBillingDate(invoice.graceEndsAt))}</strong></span>`}
+          ${invoice.status === 'overdue' ? `<span class="billing-overdue-days">${Number(invoice.daysOverdue || 0)} dia(s) de atraso</span>` : ''}
+        </div>
+        ${extensions.length ? `<div class="billing-invoice-extensions">${extensions.map((extension) => `<span>Prorrogado em ${escapeHtml(formatBillingDate(extension.createdAt, true))}: +${Number(extension.days)} dia(s), ate ${escapeHtml(formatBillingDate(extension.newGraceEndsAt))}${extension.reason ? ` — ${escapeHtml(extension.reason)}` : ''}</span>`).join('')}</div>` : ''}
+      </div>
+      <div class="billing-invoice-side">
+        <strong class="billing-invoice-amount">${escapeHtml(formatBillingMoney(invoice.amountCents, invoice.currency))}</strong>
+        ${actions.length ? `<div class="billing-invoice-actions">${actions.join('')}</div>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function billingCardHtml(item) {
+  const { zap, billing } = item;
+  const id = String(zap.id);
+  const expanded = billingExpandedIds.has(id);
+  const status = billingStatusMeta(billing.status);
+  const payments = Array.isArray(billing.payments) ? billing.payments : [];
+  const invoices = Array.isArray(billing.invoices) ? billing.invoices.slice().sort((a, b) => String(a.period).localeCompare(String(b.period))) : [];
+  const dueText = billing.nextDueDate ? `Proximo vencimento: ${formatBillingDate(billing.nextDueDate)}` : 'Sem vencimento definido';
+  return `
+    <div class="billing-zap-item ${expanded ? '' : 'collapsed'}" data-billing-zap="${escapeHtml(id)}">
+      <div class="billing-zap-card" role="button" tabindex="0" aria-expanded="${expanded}">
+        <div class="billing-zap-info">
+          <div class="billing-zap-name-line">
+            <strong class="billing-zap-name">${escapeHtml(zap.name || id)}</strong>
+            <span class="billing-status-badge billing-status-${status.className}">${status.label}</span>
+          </div>
+          <div class="billing-zap-meta">${escapeHtml(dueText)}</div>
+        </div>
+        <div class="billing-zap-card-right">
+          <div class="billing-zap-amount">${escapeHtml(formatBillingMoney(billing.monthlyAmount * 100, billing.currency))}<span>/mes</span></div>
+          <span class="billing-zap-chevron">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"/></svg>
+          </span>
+        </div>
+      </div>
+      <div class="billing-zap-details">
+        <form class="billing-plan-form" data-zap="${escapeHtml(id)}">
+          <div class="billing-section-heading">
+            <h3>Configuracao da assinatura</h3>
+            <button type="submit" class="btn btn-primary btn-sm">Salvar</button>
+          </div>
+          <div class="billing-plan-fields">
+            <label>Dia de vencimento<input type="number" name="dueDay" min="1" max="31" value="${Number(billing.dueDay || 1)}" required></label>
+            <label>Carencia (dias)<input type="number" name="graceDays" min="0" max="365" value="${Number(billing.graceDays == null ? 3 : billing.graceDays)}" required></label>
+            <label>Valor mensal<input type="number" name="monthlyAmount" min="0" step="0.01" value="${Number(billing.monthlyAmount == null ? 349 : billing.monthlyAmount).toFixed(2)}" required></label>
+          </div>
+        </form>
+
+        <section class="billing-detail-section">
+          <div class="billing-section-heading"><h3>Faturas mensais</h3></div>
+          <div class="billing-invoices">${invoices.length ? invoices.map((invoice) => billingInvoiceHtml(invoice, payments)).join('') : '<p class="billing-empty-hint">Nenhuma fatura gerada ainda.</p>'}</div>
+        </section>
+
+        <section class="billing-detail-section">
+          <div class="billing-section-heading"><h3>Historico de pagamentos</h3></div>
+          <div class="billing-payment-history">
+            ${payments.length ? payments.map((payment) => `
+              <div class="billing-history-row">
+                <div class="billing-history-info">
+                  <strong>Pagamento Realizado</strong>
+                  <span>${escapeHtml(formatBillingPeriod(payment.period))} — ${escapeHtml(formatBillingDate(payment.paidAt, true))}</span>
+                  <span>${escapeHtml(formatBillingMoney(payment.amountCents, payment.currency))}${payment.note ? ` — ${escapeHtml(payment.note)}` : ''}</span>
+                </div>
+                ${payment.signature ? `<img class="billing-history-signature" src="${escapeHtml(payment.signature)}" alt="Assinatura do pagamento de ${escapeHtml(formatBillingPeriod(payment.period))}">` : '<span class="billing-empty-hint">Assinatura nao disponivel</span>'}
+              </div>
+            `).join('') : '<p class="billing-empty-hint">Nenhum pagamento realizado.</p>'}
+          </div>
+        </section>
+      </div>
+    </div>
+  `;
+}
+
+function renderBillingPage() {
+  const container = document.getElementById('billingList');
+  if (!container) return;
+  if (!billingOverview) {
+    container.innerHTML = '<div class="spinner" style="margin:36px auto;"></div>';
+    return;
+  }
+  if (billingOverview.error) {
+    container.innerHTML = `<div class="billing-error-box">${escapeHtml(billingOverview.error)}<button type="button" class="btn btn-outline btn-sm" id="retryBillingBtn">Tentar novamente</button></div>`;
+    const retry = document.getElementById('retryBillingBtn');
+    if (retry) retry.onclick = loadBillingOverview;
+    return;
+  }
+  const subscriptions = Array.isArray(billingOverview.subscriptions) ? billingOverview.subscriptions : [];
+  if (!subscriptions.length) {
+    container.innerHTML = '<div class="billing-empty-message"><strong>Nenhuma assinatura ativa</strong><p>Ative a assinatura no painel de um Zap para comecar a acompanhar os pagamentos.</p></div>';
+    return;
+  }
+  container.innerHTML = subscriptions.map(billingCardHtml).join('');
+  container.querySelectorAll('.billing-zap-item').forEach((card) => {
+    const id = card.dataset.billingZap;
+    const header = card.querySelector('.billing-zap-card');
+    const toggle = () => {
+      if (billingExpandedIds.has(id)) billingExpandedIds.delete(id);
+      else billingExpandedIds.add(id);
+      renderBillingPage();
+    };
+    header.addEventListener('click', toggle);
+    header.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggle();
+      }
+    });
+    const form = card.querySelector('.billing-plan-form');
+    if (form) form.onsubmit = async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await saveBillingPlan(id, {
+          enabled: true,
+          dueDay: Number(form.elements.dueDay.value),
+          graceDays: Number(form.elements.graceDays.value),
+          monthlyAmount: Number(form.elements.monthlyAmount.value)
+        });
+      } catch (error) {
+        alert('Nao foi possivel salvar a assinatura: ' + (error.message || String(error)));
+        button.disabled = false;
+      }
+    };
+    card.querySelectorAll('.billing-pay-btn').forEach((button) => {
+      button.onclick = () => openBillingPaymentModal(id, button.dataset.period);
+    });
+    card.querySelectorAll('.billing-extend-btn').forEach((button) => {
+      button.onclick = () => openBillingExtensionModal(id, button.dataset.period);
+    });
+  });
+  filterBillingDOM();
+  if (billingFocusZapId) {
+    const id = billingFocusZapId;
+    billingFocusZapId = null;
+    requestAnimationFrame(() => {
+      const card = container.querySelector(`[data-billing-zap="${CSS.escape(id)}"]`);
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+}
+
+function filterBillingDOM() {
+  const container = document.getElementById('billingList');
+  if (!container || !billingOverview || billingOverview.error) return;
+  container.querySelectorAll('.billing-zap-item').forEach((card) => {
+    card.style.display = !globalSearchQuery || searchMatches(card.textContent, globalSearchQuery) ? '' : 'none';
+  });
+}
+
+async function saveBillingPlan(zapId, data) {
+  if (!window.electronAPI || !window.electronAPI.billingSave) throw new Error('API de assinatura indisponivel');
+  const result = await window.electronAPI.billingSave(String(zapId), data);
+  if (!result || result.ok === false) throw new Error((result && result.error) || 'falha ao salvar assinatura');
+  const zap = zapsData.find((item) => String(item.id) === String(zapId));
+  if (zap) {
+    zap.billingPlan = result.billingPlan;
+    try { localStorage.setItem('linknozap_zaps', JSON.stringify(zapsData)); } catch (_) {}
+  }
+  const normalizedBilling = normalizeBillingDetail(result.billing, zap);
+  if (billingOverview && Array.isArray(billingOverview.subscriptions)) {
+    const item = billingOverview.subscriptions.find((entry) => String(entry.zap.id) === String(zapId));
+    if (item && normalizedBilling) {
+      item.billing = normalizedBilling;
+      if (zap) item.zap.billingPlan = result.billingPlan;
+    }
+  }
+  renderBillingPage();
+  return result;
+}
+
+function findBillingItem(zapId) {
+  if (!billingOverview || !Array.isArray(billingOverview.subscriptions)) return null;
+  return billingOverview.subscriptions.find((item) => String(item.zap.id) === String(zapId)) || null;
+}
+
+function updateBillingPaymentButton() {
+  const button = document.getElementById('confirmBillingPayment');
+  const checkbox = document.getElementById('billingPaymentConfirm');
+  const modal = document.getElementById('billingPaymentModal');
+  if (!button || !checkbox) return;
+  button.disabled = !billingSignatureHasInk || !checkbox.checked || !pendingBillingPayment || (modal && modal.dataset.busy === '1');
+}
+
+function clearBillingSignature() {
+  const canvas = document.getElementById('billingSignatureCanvas');
+  const placeholder = document.getElementById('billingSignaturePlaceholder');
+  if (!canvas) return;
+  const context = canvas.getContext('2d');
+  context.save();
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.restore();
+  billingSignatureHasInk = false;
+  billingSignatureDrawing = false;
+  if (placeholder) placeholder.style.display = '';
+  updateBillingPaymentButton();
+}
+
+function setupBillingSignatureCanvas() {
+  const canvas = document.getElementById('billingSignatureCanvas');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const ratio = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  canvas.width = Math.max(1, Math.round(rect.width * ratio));
+  canvas.height = Math.max(1, Math.round(rect.height * ratio));
+  const context = canvas.getContext('2d');
+  context.lineWidth = 2.4 * ratio;
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+  context.strokeStyle = '#111111';
+  const point = (event) => {
+    const bounds = canvas.getBoundingClientRect();
+    return {
+      x: (event.clientX - bounds.left) * canvas.width / bounds.width,
+      y: (event.clientY - bounds.top) * canvas.height / bounds.height
+    };
+  };
+  canvas.onpointerdown = (event) => {
+    if (event.button !== 0 && event.pointerType === 'mouse') return;
+    event.preventDefault();
+    billingSignatureDrawing = true;
+    billingSignatureHasInk = true;
+    const position = point(event);
+    context.beginPath();
+    context.moveTo(position.x, position.y);
+    context.lineTo(position.x + 0.1, position.y + 0.1);
+    context.stroke();
+    try { canvas.setPointerCapture(event.pointerId); } catch (_) {}
+    document.getElementById('billingSignaturePlaceholder').style.display = 'none';
+    updateBillingPaymentButton();
+  };
+  canvas.onpointermove = (event) => {
+    if (!billingSignatureDrawing) return;
+    event.preventDefault();
+    const position = point(event);
+    context.lineTo(position.x, position.y);
+    context.stroke();
+  };
+  const finish = (event) => {
+    billingSignatureDrawing = false;
+    try { if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+  };
+  canvas.onpointerup = finish;
+  canvas.onpointercancel = finish;
+}
+
+function openBillingPaymentModal(zapId, period) {
+  const item = findBillingItem(zapId);
+  const invoice = item && item.billing.invoices.find((entry) => entry.period === period);
+  if (!item || !invoice) return;
+  if (!invoice.payable || invoice.paid) {
+    alert(invoice && invoice.paid ? 'Esta fatura ja foi paga.' : 'O pagamento so pode ser confirmado a partir de 5 dias antes do vencimento.');
+    return;
+  }
+  pendingBillingPayment = { zapId: String(zapId), period, invoice };
+  document.getElementById('billingPaymentTitle').textContent = `Confirmar pagamento — ${item.zap.name}`;
+  document.getElementById('billingPaymentSubtitle').textContent = 'O registro sera permanente e incluira a assinatura desenhada.';
+  document.getElementById('billingPaymentPeriod').textContent = formatBillingPeriod(period);
+  document.getElementById('billingPaymentDue').textContent = formatBillingDate(invoice.dueDate);
+  document.getElementById('billingPaymentAmount').textContent = formatBillingMoney(invoice.amountCents, invoice.currency);
+  document.getElementById('billingPaymentConfirm').checked = false;
+  document.getElementById('billingPaymentStatus').textContent = '';
+  document.getElementById('billingPaymentStatus').classList.remove('error');
+  const modal = document.getElementById('billingPaymentModal');
+  delete modal.dataset.busy;
+  modal.classList.add('active');
+  clearBillingSignature();
+  requestAnimationFrame(setupBillingSignatureCanvas);
+  updateBillingPaymentButton();
+}
+
+function setBillingPaymentBusy(busy) {
+  const modal = document.getElementById('billingPaymentModal');
+  if (!modal) return;
+  if (busy) modal.dataset.busy = '1';
+  else delete modal.dataset.busy;
+  modal.classList.toggle('is-busy', busy);
+  ['closeBillingPaymentModal', 'cancelBillingPayment', 'clearBillingSignature', 'billingPaymentConfirm'].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.disabled = busy;
+  });
+  updateBillingPaymentButton();
+}
+
+function closeBillingPaymentModal() {
+  const modal = document.getElementById('billingPaymentModal');
+  if (!modal || modal.dataset.busy === '1') return;
+  modal.classList.remove('active');
+  pendingBillingPayment = null;
+  billingSignatureDrawing = false;
+  billingSignatureHasInk = false;
+}
+
+async function confirmBillingPayment() {
+  if (!pendingBillingPayment || !billingSignatureHasInk) return;
+  const checkbox = document.getElementById('billingPaymentConfirm');
+  if (!checkbox.checked) return;
+  const canvas = document.getElementById('billingSignatureCanvas');
+  const status = document.getElementById('billingPaymentStatus');
+  setBillingPaymentBusy(true);
+  status.textContent = 'Registrando pagamento...';
+  status.classList.remove('error');
+  try {
+    const result = await window.electronAPI.billingPay(pendingBillingPayment.zapId, pendingBillingPayment.period, canvas.toDataURL('image/png'));
+    if (!result || result.ok === false) throw new Error((result && result.error) || 'falha ao registrar pagamento');
+    setBillingPaymentBusy(false);
+    document.getElementById('billingPaymentModal').classList.remove('active');
+    pendingBillingPayment = null;
+    await loadBillingOverview();
+  } catch (error) {
+    status.textContent = error.message || String(error);
+    status.classList.add('error');
+    setBillingPaymentBusy(false);
+  }
+}
+
+function updateBillingExtensionPreview() {
+  if (!pendingBillingExtension) return;
+  const days = Number(document.getElementById('billingExtensionDays').value);
+  const preview = document.getElementById('billingExtensionPreview');
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    preview.textContent = 'Informe entre 1 e 365 dias.';
+    return;
+  }
+  const next = new Date(Date.parse(pendingBillingExtension.invoice.graceEndsAt) + days * 24 * 60 * 60 * 1000);
+  preview.textContent = `Nova carencia: ${formatBillingDate(next.toISOString())} (${days} dia(s) adicional).`;
+}
+
+function openBillingExtensionModal(zapId, period) {
+  const item = findBillingItem(zapId);
+  const invoice = item && item.billing.invoices.find((entry) => entry.period === period);
+  if (!item || !invoice || invoice.paid) return;
+  const requestId = window.crypto && typeof window.crypto.randomUUID === 'function'
+    ? window.crypto.randomUUID()
+    : `ext-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  pendingBillingExtension = { zapId: String(zapId), period, invoice, requestId };
+  document.getElementById('billingExtensionSubtitle').textContent = `${item.zap.name} — fatura ${formatBillingPeriod(period)}`;
+  document.getElementById('billingExtensionDays').value = '5';
+  document.getElementById('billingExtensionReason').value = '';
+  document.getElementById('billingExtensionStatus').textContent = '';
+  document.getElementById('billingExtensionStatus').classList.remove('error');
+  const modal = document.getElementById('billingExtensionModal');
+  delete modal.dataset.busy;
+  modal.classList.remove('is-busy');
+  ['confirmBillingExtension', 'cancelBillingExtension', 'closeBillingExtensionModal'].forEach((id) => { document.getElementById(id).disabled = false; });
+  modal.classList.add('active');
+  updateBillingExtensionPreview();
+}
+
+function closeBillingExtensionModal() {
+  const modal = document.getElementById('billingExtensionModal');
+  if (!modal || modal.dataset.busy === '1') return;
+  modal.classList.remove('active');
+  pendingBillingExtension = null;
+}
+
+async function confirmBillingExtension() {
+  if (!pendingBillingExtension) return;
+  const days = Number(document.getElementById('billingExtensionDays').value);
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    document.getElementById('billingExtensionStatus').textContent = 'Informe entre 1 e 365 dias.';
+    return;
+  }
+  const modal = document.getElementById('billingExtensionModal');
+  const status = document.getElementById('billingExtensionStatus');
+  modal.dataset.busy = '1';
+  modal.classList.add('is-busy');
+  document.getElementById('confirmBillingExtension').disabled = true;
+  document.getElementById('cancelBillingExtension').disabled = true;
+  document.getElementById('closeBillingExtensionModal').disabled = true;
+  status.textContent = 'Salvando prorrogacao...';
+  status.classList.remove('error');
+  try {
+    const result = await window.electronAPI.billingExtend(
+      pendingBillingExtension.zapId,
+      pendingBillingExtension.period,
+      days,
+      document.getElementById('billingExtensionReason').value,
+      pendingBillingExtension.requestId
+    );
+    if (!result || result.ok === false) throw new Error((result && result.error) || 'falha ao prorrogar');
+    delete modal.dataset.busy;
+    modal.classList.remove('active', 'is-busy');
+    pendingBillingExtension = null;
+    await loadBillingOverview();
+  } catch (error) {
+    status.textContent = error.message || String(error);
+    status.classList.add('error');
+    delete modal.dataset.busy;
+    modal.classList.remove('is-busy');
+    document.getElementById('confirmBillingExtension').disabled = false;
+    document.getElementById('cancelBillingExtension').disabled = false;
+    document.getElementById('closeBillingExtensionModal').disabled = false;
+  }
+}
+
+function initBillingPage() {
+  setInterval(() => {
+    if (getActivePageId() !== 'assinaturas') return;
+    if (document.querySelector('#billingPaymentModal.active, #billingExtensionModal.active')) return;
+    const active = document.activeElement;
+    const list = document.getElementById('billingList');
+    if (active && list && list.contains(active) && ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(active.tagName)) return;
+    loadBillingOverview().catch(() => {});
+  }, 5000);
+  const paymentModal = document.getElementById('billingPaymentModal');
+  const extensionModal = document.getElementById('billingExtensionModal');
+  document.getElementById('closeBillingPaymentModal').onclick = closeBillingPaymentModal;
+  document.getElementById('cancelBillingPayment').onclick = closeBillingPaymentModal;
+  document.getElementById('clearBillingSignature').onclick = clearBillingSignature;
+  document.getElementById('confirmBillingPayment').onclick = confirmBillingPayment;
+  document.getElementById('billingPaymentConfirm').onchange = updateBillingPaymentButton;
+  if (paymentModal) paymentModal.onclick = (event) => { if (event.target === paymentModal) closeBillingPaymentModal(); };
+  document.getElementById('closeBillingExtensionModal').onclick = closeBillingExtensionModal;
+  document.getElementById('cancelBillingExtension').onclick = closeBillingExtensionModal;
+  document.getElementById('confirmBillingExtension').onclick = confirmBillingExtension;
+  document.getElementById('billingExtensionDays').oninput = updateBillingExtensionPreview;
+  if (extensionModal) extensionModal.onclick = (event) => { if (event.target === extensionModal) closeBillingExtensionModal(); };
+}
+
 async function openContactChat(zapId, contactId) {
   navigateTo('conversas');
   updateZapSelector();
@@ -2821,10 +3682,10 @@ function addNewZap() {
   }
 
   const now = new Date();
-  const createdAt = now.toLocaleDateString('pt-BR') + ' s ' + now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  const newZapId = Date.now();
 
   const newZap = {
-    id: Date.now(),
+    id: newZapId,
     name: name,
     phone: phone,
     personality: personality,
@@ -2837,7 +3698,13 @@ function addNewZap() {
     runtimeStatus: 'disconnected',
     status: 'Desconectado',
     statusClass: 'offline',
-    createdAt: createdAt
+    createdAt: now.toISOString(),
+    billingPlan: {
+      enabled: true,
+      ...getZapBillingDefaults({ id: newZapId, createdAt: now.toISOString() }),
+      startedAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    }
   };
 
   zapsData.unshift(newZap);
@@ -2858,41 +3725,43 @@ function addNewZap() {
 // Providers System
 // ============================================
 let currentProviderModels = [];
-
-const PROVIDER_APIS = {
-  openai: { url: 'https://api.openai.com/v1/models', auth: 'Bearer' },
-  groq: { url: 'https://api.groq.com/openai/v1/models', auth: 'Bearer' },
-  anthropic: { url: null, auth: 'x-api-key' },
-  google: { url: null, auth: 'x-goog-api-key' },
-  deepseek: { url: 'https://api.deepseek.com/v1/models', auth: 'Bearer' },
-  mistral: { url: 'https://api.mistral.ai/v1/models', auth: 'Bearer' },
-  openrouter: { url: 'https://openrouter.ai/api/v1/models', auth: 'Bearer' },
-  together: { url: 'https://api.together.xyz/v1/models', auth: 'Bearer' },
-  fireworks: { url: 'https://api.fireworks.ai/inference/v1/models', auth: 'Bearer' },
-  nvidia: { url: 'https://integrate.api.nvidia.com/v1/models', auth: 'Bearer' },
-  ollama: { url: 'http://localhost:11434/api/tags', auth: null },
-  huggingface: { url: 'https://huggingface.co/api/models', auth: 'Bearer' }
-};
+let currentProviderOriginal = null;
+let currentProviderDirty = false;
+let currentProviderModelEditId = null;
+let providerModelIdMap = new Map();
+let providerDeletedModelIds = new Set();
 
 function initProviders() {
   const addProviderBtn = document.getElementById('addProviderBtn');
   const providerModal = document.getElementById('providerModal');
   const closeProviderModalBtn = document.getElementById('closeProviderModal');
   const cancelProviderConfig = document.getElementById('cancelProviderConfig');
-  const cancelProviderConfig2 = document.getElementById('cancelProviderConfig2');
-  const cancelProviderConfig3 = document.getElementById('cancelProviderConfig3');
   const saveProviderConfig = document.getElementById('saveProviderConfig');
-  const confirmSaveProvider = document.getElementById('confirmSaveProvider');
-  const retryProviderConfig = document.getElementById('retryProviderConfig');
+  const discoverBtn = document.getElementById('discoverProviderModelsBtn');
+  const addModelBtn = document.getElementById('addProviderModelBtn');
+  const saveModelBtn = document.getElementById('saveProviderModelBtn');
+  const cancelModelBtn = document.getElementById('cancelProviderModelBtn');
 
-  if (addProviderBtn) addProviderBtn.addEventListener('click', openProviderModal);
+  if (addProviderBtn) addProviderBtn.addEventListener('click', () => openProviderModal());
   if (closeProviderModalBtn) closeProviderModalBtn.addEventListener('click', closeProviderModal);
   if (cancelProviderConfig) cancelProviderConfig.addEventListener('click', closeProviderModal);
-  if (cancelProviderConfig2) cancelProviderConfig2.addEventListener('click', closeProviderModal);
-  if (cancelProviderConfig3) cancelProviderConfig3.addEventListener('click', closeProviderModal);
-  if (saveProviderConfig) saveProviderConfig.addEventListener('click', saveAndFetchModels);
-  if (confirmSaveProvider) confirmSaveProvider.addEventListener('click', confirmSaveProviderHandler);
-  if (retryProviderConfig) retryProviderConfig.addEventListener('click', retryFetchModels);
+  if (saveProviderConfig) saveProviderConfig.addEventListener('click', saveProviderConfigHandler);
+  if (discoverBtn) discoverBtn.addEventListener('click', discoverProviderModels);
+  if (addModelBtn) addModelBtn.addEventListener('click', () => startProviderModelEdit(null));
+  if (saveModelBtn) saveModelBtn.addEventListener('click', saveProviderModel);
+  if (cancelModelBtn) cancelModelBtn.addEventListener('click', closeProviderModelForm);
+
+  ['providerName', 'apiKey', 'providerUrl'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) input.addEventListener('input', () => { currentProviderDirty = true; });
+  });
+  ['providerModelName', 'providerModelId'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); saveProviderModel(); }
+      if (event.key === 'Escape') { event.preventDefault(); closeProviderModelForm(); }
+    });
+  });
 
   if (providerModal) {
     providerModal.addEventListener('click', (e) => {
@@ -2959,7 +3828,7 @@ function renderProvidersList() {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const id = btn.dataset.id;
-      openProviderConfig(id);
+      openProviderModal(id);
     });
   });
 
@@ -2968,138 +3837,308 @@ function renderProvidersList() {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const id = btn.dataset.id;
-      if (confirm('Tem certeza que deseja excluir este provedor?')) {
-        providersData = providersData.filter(p => p.id !== id);
-        saveProviders();
-        renderProvidersList();
-      }
+      deleteProvider(id);
     });
   });
 }
 
-function openProviderModal() {
-  document.getElementById('providerName').value = '';
-  document.getElementById('apiKey').value = '';
-  document.getElementById('providerFormStep').style.display = 'block';
-  document.getElementById('providerModelsStep').style.display = 'none';
-  document.getElementById('loadingModels').style.display = 'none';
-  document.getElementById('modelsResult').style.display = 'none';
-  document.getElementById('modelsError').style.display = 'none';
-  currentProviderModels = [];
-  currentProviderName = '';
-  currentProviderApiKey = '';
+function defaultProviderUrl(name) {
+  const value = String(name || '').toLowerCase();
+  if (value.includes('openrouter')) return 'https://openrouter.ai/api/v1';
+  if (value.includes('google') || value.includes('gemini')) return 'https://generativelanguage.googleapis.com/v1beta';
+  if (value.includes('groq')) return 'https://api.groq.com/openai/v1';
+  if (value.includes('deepseek')) return 'https://api.deepseek.com/v1';
+  if (value.includes('mistral')) return 'https://api.mistral.ai/v1';
+  return 'https://api.openai.com/v1';
+}
+
+function cacheProvidersLocal() {
+  try { localStorage.setItem('linknozap_providers', JSON.stringify(providersData)); } catch (_) {}
+}
+
+function openProviderModal(providerId) {
+  const existing = providerId ? providersData.find((provider) => String(provider.id) === String(providerId)) : null;
+  currentProviderOriginal = existing ? JSON.parse(JSON.stringify(existing)) : null;
+  currentProviderModels = existing ? JSON.parse(JSON.stringify(existing.models || [])) : [];
+  currentProviderDirty = false;
+  providerModelIdMap = new Map();
+  providerDeletedModelIds = new Set();
+  closeProviderModelForm();
+
+  document.getElementById('providerModalTitle').textContent = existing ? 'Editar Provedor' : 'Adicionar Provedor';
+  document.getElementById('providerName').value = existing ? existing.name : '';
+  document.getElementById('apiKey').value = existing ? (existing.apiKey || (existing.apiKeys || [])[0] || '') : '';
+  document.getElementById('providerUrl').value = existing ? (existing.baseUrl || existing.url || defaultProviderUrl(existing.name)) : defaultProviderUrl('');
+  setProviderModelsStatus('');
+  renderModelsList();
   document.getElementById('providerModal').classList.add('active');
-  setTimeout(() => {
-    document.getElementById('providerName').focus();
-  }, 50);
+  setTimeout(() => document.getElementById('providerName').focus(), 50);
 }
 
 function closeProviderModal() {
+  if (currentProviderDirty && !confirm('Descartar as alteracoes feitas neste provedor?')) return;
   document.getElementById('providerModal').classList.remove('active');
+  currentProviderOriginal = null;
   currentProviderModels = [];
-  currentProviderName = '';
-  currentProviderApiKey = '';
+  currentProviderDirty = false;
+  providerModelIdMap = new Map();
+  providerDeletedModelIds = new Set();
+  closeProviderModelForm();
 }
 
-let currentProviderName = '';
-let currentProviderApiKey = '';
-
-async function saveAndFetchModels() {
-  const name = document.getElementById('providerName').value.trim();
-  const apiKey = document.getElementById('apiKey').value.trim();
-
-  if (!name) {
-    alert('Por favor, insira um nome para o provedor.');
-    return;
-  }
-
-  if (!apiKey) {
-    alert('Por favor, insira uma chave API.');
-    return;
-  }
-
-  currentProviderName = name;
-  currentProviderApiKey = apiKey;
-
-  // Show loading step
-  document.getElementById('providerFormStep').style.display = 'none';
-  document.getElementById('providerModelsStep').style.display = 'block';
-  document.getElementById('loadingModels').style.display = 'block';
-  document.getElementById('modelsResult').style.display = 'none';
-  document.getElementById('modelsError').style.display = 'none';
-
-  try {
-    const models = await fetchFromKnownProviders(name.toLowerCase(), apiKey);
-
-    if (models.length === 0) {
-      throw new Error('Nenhum modelo encontrado');
-    }
-
-    currentProviderModels = models;
-    renderModelsList(models);
-    document.getElementById('loadingModels').style.display = 'none';
-    document.getElementById('modelsResult').style.display = 'block';
-
-  } catch (error) {
-    console.error('Erro ao buscar modelos:', error);
-    document.getElementById('loadingModels').style.display = 'none';
-    document.getElementById('modelsError').style.display = 'block';
-  }
+function setProviderModelsStatus(message, type) {
+  const status = document.getElementById('providerModelsStatus');
+  if (!status) return;
+  status.textContent = message || '';
+  status.className = `provider-model-status${message ? ` ${type || ''}` : ''}`;
 }
 
-function retryFetchModels() {
-  document.getElementById('modelsError').style.display = 'none';
-  document.getElementById('providerFormStep').style.display = 'block';
-  document.getElementById('providerModelsStep').style.display = 'none';
-  document.getElementById('providerName').value = currentProviderName;
-  document.getElementById('apiKey').value = currentProviderApiKey;
-}
-
-function confirmSaveProviderHandler() {
-  const selectedModels = [];
-  document.querySelectorAll('#modelsList input[type="checkbox"]:checked').forEach(cb => {
-    const model = currentProviderModels.find(m => m.id === cb.value);
-    if (model) {
-      selectedModels.push(model);
-    }
-  });
-
-  if (selectedModels.length === 0) {
-    alert('Selecione pelo menos um modelo.');
-    return;
-  }
-
-  const newProvider = {
-    id: Date.now().toString(),
-    name: currentProviderName,
-    apiKey: currentProviderApiKey,
-    models: selectedModels,
-    createdAt: new Date().toISOString()
+function providerFormData() {
+  return {
+    name: document.getElementById('providerName').value.trim(),
+    apiKey: document.getElementById('apiKey').value.trim(),
+    baseUrl: document.getElementById('providerUrl').value.trim(),
+    models: JSON.parse(JSON.stringify(currentProviderModels))
   };
-
-  providersData.push(newProvider);
-  saveProviders();
-  renderProvidersList();
-  closeProviderModal();
 }
 
-function renderModelsList(models) {
-  const container = document.getElementById('modelsList');
-  container.innerHTML = '';
+function validateProviderForm(data) {
+  if (!data.name) throw new Error('Informe um nome para o provedor.');
+  try {
+    const url = new URL(data.baseUrl);
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
+  } catch (_) {
+    throw new Error('Informe uma URL valida usando http:// ou https://.');
+  }
+  if (!data.models.length) throw new Error('Adicione ou busque pelo menos um modelo.');
+}
 
-  models.forEach(model => {
-    const item = document.createElement('div');
-    item.className = 'model-item';
-    item.innerHTML = `
-      <input type="checkbox" id="model-${model.id}" value="${model.id}" checked>
-      <label for="model-${model.id}">
-        <span class="model-id">${model.id}</span>
-        <span class="model-name">${model.name}</span>
-        ${model.free ? '<span class="model-free-badge">Gratuito</span>' : ''}
-      </label>
-    `;
-    container.appendChild(item);
+async function discoverProviderModels() {
+  const data = providerFormData();
+  if (!data.name || !data.baseUrl) {
+    setProviderModelsStatus('Preencha o nome e a URL antes de buscar os modelos.', 'error');
+    return;
+  }
+  const button = document.getElementById('discoverProviderModelsBtn');
+  button.disabled = true;
+  setProviderModelsStatus('Buscando modelos na API...', 'loading');
+  try {
+    const response = await window.electronAPI.discoverProviderModels({
+      ...data,
+      id: currentProviderOriginal ? currentProviderOriginal.id : undefined
+    });
+    const found = Array.isArray(response && response.models) ? response.models : [];
+    const merged = new Map(currentProviderModels.map((model) => [model.id, model]));
+    found.forEach((model) => merged.set(model.id, { ...model, ...(merged.get(model.id) || {}) }));
+    currentProviderModels = [...merged.values()];
+    currentProviderDirty = true;
+    renderModelsList();
+    setProviderModelsStatus(`${found.length} modelo(s) encontrado(s). Os ja cadastrados foram preservados.`, 'success');
+  } catch (error) {
+    setProviderModelsStatus(`Nao foi possivel buscar os modelos: ${error.message || error}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderModelsList() {
+  const container = document.getElementById('modelsList');
+  if (!container) return;
+  container.innerHTML = '';
+  if (!currentProviderModels.length) {
+    container.innerHTML = '<div class="provider-empty">Nenhum modelo adicionado. Use o botao + ou busque na API.</div>';
+    return;
+  }
+
+  currentProviderModels.forEach((model) => {
+    const row = document.createElement('div');
+    row.className = 'provider-modal-model-row';
+
+    const info = document.createElement('div');
+    info.className = 'provider-modal-model-info';
+    const name = document.createElement('span');
+    name.className = 'provider-modal-model-name';
+    name.textContent = model.name || model.id;
+    const id = document.createElement('span');
+    id.className = 'provider-modal-model-id';
+    id.textContent = model.id;
+    info.appendChild(name);
+    info.appendChild(id);
+
+    const actions = document.createElement('div');
+    actions.className = 'provider-modal-model-actions';
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'prov-icon-btn';
+    edit.title = 'Editar modelo';
+    edit.textContent = 'Editar';
+    edit.addEventListener('click', () => startProviderModelEdit(model));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'prov-icon-btn danger';
+    remove.title = 'Apagar modelo';
+    remove.textContent = 'Apagar';
+    remove.addEventListener('click', () => removeProviderModel(model));
+    actions.appendChild(edit);
+    actions.appendChild(remove);
+
+    row.appendChild(info);
+    row.appendChild(actions);
+    container.appendChild(row);
   });
+}
+
+function startProviderModelEdit(model) {
+  currentProviderModelEditId = model ? model.id : null;
+  document.getElementById('providerModelName').value = model ? model.name || '' : '';
+  document.getElementById('providerModelId').value = model ? model.id : '';
+  document.getElementById('providerModelForm').style.display = 'grid';
+  document.getElementById('providerModelName').focus();
+}
+
+function closeProviderModelForm() {
+  currentProviderModelEditId = null;
+  const form = document.getElementById('providerModelForm');
+  if (form) form.style.display = 'none';
+  const name = document.getElementById('providerModelName');
+  const id = document.getElementById('providerModelId');
+  if (name) name.value = '';
+  if (id) id.value = '';
+}
+
+function saveProviderModel() {
+  const name = document.getElementById('providerModelName').value.trim();
+  const id = document.getElementById('providerModelId').value.trim();
+  if (!name || !id) {
+    setProviderModelsStatus('Preencha o nome e o ID do modelo.', 'error');
+    return;
+  }
+  const duplicate = currentProviderModels.some((model) => model.id === id && model.id !== currentProviderModelEditId);
+  if (duplicate) {
+    setProviderModelsStatus('Ja existe um modelo com este ID.', 'error');
+    return;
+  }
+  if (currentProviderModelEditId) {
+    const index = currentProviderModels.findIndex((model) => model.id === currentProviderModelEditId);
+    if (index >= 0) {
+      const previousId = currentProviderModels[index].id;
+      currentProviderModels[index] = { ...currentProviderModels[index], name, id };
+      if (previousId !== id) providerModelIdMap.set(previousId, id);
+    }
+  } else {
+    currentProviderModels.push({ id, name, free: false });
+  }
+  currentProviderDirty = true;
+  closeProviderModelForm();
+  renderModelsList();
+  setProviderModelsStatus('Modelo salvo na lista. Clique em Salvar Provedor para gravar.', 'success');
+}
+
+function removeProviderModel(model) {
+  if (!confirm(`Apagar o modelo "${model.name || model.id}"?`)) return;
+  currentProviderModels = currentProviderModels.filter((item) => item.id !== model.id);
+  providerDeletedModelIds.add(model.id);
+  if (currentProviderModelEditId === model.id) closeProviderModelForm();
+  currentProviderDirty = true;
+  renderModelsList();
+}
+
+function syncZapsAfterProviderSave(original, saved) {
+  let changed = false;
+  const validIds = new Set((saved.models || []).map((model) => model.id));
+  const oldName = original && original.name ? original.name : saved.name;
+  zapsData.forEach((zap) => {
+    if (Array.isArray(zap.selectedModels)) {
+      const next = [];
+      zap.selectedModels.forEach((key) => {
+        const sep = String(key).indexOf('|');
+        const providerId = sep >= 0 ? String(key).slice(0, sep) : '';
+        const modelId = sep >= 0 ? String(key).slice(sep + 1) : '';
+        if (providerId !== saved.id) { next.push(key); return; }
+        const mapped = providerModelIdMap.get(modelId) || modelId;
+        if (validIds.has(mapped)) next.push(`${saved.id}|${mapped}`);
+        else changed = true;
+      });
+      if (next.length !== zap.selectedModels.length || next.some((key, index) => key !== zap.selectedModels[index])) changed = true;
+      if (next.length) zap.selectedModels = next;
+      else delete zap.selectedModels;
+    }
+
+    if (typeof zap.model === 'string' && zap.model.includes('|')) {
+      const sep = zap.model.indexOf('|');
+      const providerRef = zap.model.slice(0, sep);
+      const modelId = zap.model.slice(sep + 1);
+      if (providerRef === saved.id || providerRef === oldName) {
+        const mapped = providerModelIdMap.get(modelId) || modelId;
+        const next = validIds.has(mapped) ? `${saved.id}|${mapped}` : 'auto';
+        if (next !== zap.model) { zap.model = next; changed = true; }
+      }
+    }
+  });
+  return changed;
+}
+
+async function saveProviderConfigHandler() {
+  const button = document.getElementById('saveProviderConfig');
+  button.disabled = true;
+  setProviderModelsStatus('');
+  try {
+    const data = providerFormData();
+    validateProviderForm(data);
+    const id = currentProviderOriginal ? currentProviderOriginal.id : `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const saved = await window.electronAPI.saveProvider(id, data);
+    if (!saved || !saved.id) throw new Error('O servidor nao confirmou a gravacao do provedor.');
+    const original = currentProviderOriginal;
+    const index = providersData.findIndex((provider) => String(provider.id) === id);
+    if (index >= 0) providersData[index] = saved;
+    else providersData.push(saved);
+    if (syncZapsAfterProviderSave(original, saved)) {
+      await saveZaps();
+      renderZaps(zapsData);
+    }
+    cacheProvidersLocal();
+    renderProvidersList();
+    currentProviderDirty = false;
+    closeProviderModal();
+  } catch (error) {
+    setProviderModelsStatus(`Nao foi possivel salvar: ${error.message || error}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteProvider(providerId) {
+  const provider = providersData.find((item) => String(item.id) === String(providerId));
+  if (!provider) return;
+  if (!confirm(`Excluir "${provider.name}"? Os Zaps que usam este provedor serao atualizados.`)) return;
+  try {
+    const ok = await window.electronAPI.deleteProvider(providerId);
+    if (!ok) throw new Error('O servidor nao confirmou a exclusao.');
+    providersData = providersData.filter((item) => String(item.id) !== String(providerId));
+    let changed = false;
+    zapsData.forEach((zap) => {
+      if (Array.isArray(zap.providers) && zap.providers.includes(providerId)) {
+        zap.providers = zap.providers.filter((id) => id !== providerId);
+        changed = true;
+      }
+      if (zap.apiKeySelections) delete zap.apiKeySelections[providerId];
+      if (Array.isArray(zap.selectedModels)) {
+        const next = zap.selectedModels.filter((key) => !String(key).startsWith(`${providerId}|`));
+        if (next.length !== zap.selectedModels.length) changed = true;
+        if (next.length) zap.selectedModels = next;
+        else delete zap.selectedModels;
+      }
+      if (typeof zap.model === 'string' && (zap.model.startsWith(`${providerId}|`) || zap.model.startsWith(`${provider.name}|`))) {
+        zap.model = 'auto';
+        changed = true;
+      }
+    });
+    if (changed) { await saveZaps(); renderZaps(zapsData); }
+    cacheProvidersLocal();
+    renderProvidersList();
+  } catch (error) {
+    alert(`Nao foi possivel excluir o provedor: ${error.message || error}`);
+  }
 }
 
 // ============================================
@@ -3678,36 +4717,14 @@ async function sendTestMessage() {
   // Show loading
   const loadingId = addChatMessage('assistant', 'Pensando...', true);
 
-  // Chaves do provedor (apiKeys primeiro, limpas). Testa UMA a UMA: uma
-  // chave invalida no topo da lista nao pode derrubar o teste - usa a proxima.
-  const apiKeys = (Array.isArray(currentTestProvider.apiKeys) && currentTestProvider.apiKeys.length)
-    ? currentTestProvider.apiKeys
-    : [currentTestProvider.apiKey];
-  const keys = apiKeys.map(k => normalizeKeyValue(k)).filter(Boolean);
-
-  if (!keys.length) {
-    updateChatMessage(loadingId, 'error', 'Nenhuma chave API configurada.');
-    return;
-  }
-
   try {
-    let response = null;
-    let lastErr = null;
-    for (const key of keys) {
-      try {
-        response = await callAIModel(currentTestProvider.name, currentTestModel.id, key, message);
-        break;
-      } catch (e) {
-        lastErr = e;
-        const msg = String((e && e.message) || '');
-        const keyError = /api[_ ]?key|unauthorized|forbidden|invalid.*key|permiss/i.test(msg);
-        if (!keyError) throw e; // erro do modelo/rede: trocar de chave nao resolve
-      }
-    }
-    if (response == null && lastErr) throw lastErr;
-    updateChatMessage(loadingId, 'assistant', response);
+    const response = await window.electronAPI.testProviderModel({
+      providerId: currentTestProvider.id,
+      modelId: currentTestModel.id
+    });
+    updateChatMessage(loadingId, 'assistant', response.text || 'Sem resposta');
   } catch (error) {
-    updateChatMessage(loadingId, 'error', `Erro: ${error.message}`);
+    updateChatMessage(loadingId, 'error', `Erro: ${error.message || error}`);
   }
 }
 
@@ -3742,114 +4759,6 @@ function updateChatMessage(id, role, content) {
 
   const container = document.getElementById('testChatHistory');
   container.scrollTop = container.scrollHeight;
-}
-
-const TEST_SYSTEM_PROMPT = `Voce e um jovem de 17 anos, homem, que gosta de celulares e tecnologia. Voce conversa no WhatsApp como uma pessoa normal, educada e que sabe puxar conversa.
-
-REGRAS DE RESPOSTA (IMPORTANTE):
-- Responda com NO MAXIMO 1 frase. 2 frases so se realmente necessario. NUNCA mais que 2 linhas.
-- Se a pessoa mandar "oi" ou "ola", responda em 1 frase curta: "Oi, em que posso ajudar?".
-- Nao faca listas, nao faca paragrafos, nao seja formal e NAO repita a pergunta da pessoa.
-- Responda apenas o que foi perguntado. Nao adicione informacoes extras, nem explicacoes longas.
-
-ESTILO DE CONVERSA:
-- Abreviacoes as vezes: "tmj", "vlw", "blz", "td bem".
-- "kkkkkk" ou "rsrsrs" quando a conversa for engraçada.
-- Seja descontraido, mas educado. Fale como um jovem normal no WhatsApp.
-
-FORMATO DA RESPOSTA (LEIA POR ULTIMO - OBRIGATORIO):
-- Responda com NO MAXIMO 1 frase. NUNCA mais de 2 linhas: tudo em uma unica linha.
-- Direto ao ponto: sem preambulo, sem repetir a pergunta da pessoa, sem lista.
-- Saudacao -> 1 frase: "Oi, em que posso ajudar?". Pergunta simples -> so a resposta.
-- Economia de tokens: quanto mais curta e direta a resposta, melhor.`;
-
-async function callAIModel(providerName, modelId, apiKey, message) {
-  const lowerProvider = providerName.toLowerCase();
-  const systemMessages = [{ role: 'system', content: TEST_SYSTEM_PROMPT }];
-
-  // OpenRouter
-  if (lowerProvider.includes('openrouter')) {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://link-no-whatsapp.app',
-        'X-Title': 'Link no WhatsApp'
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [...systemMessages, { role: 'user', content: message }],
-        max_tokens: 200,
-        temperature: 0.6
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.error?.message || `Erro HTTP: ${response.status}`);
-    }
-
-    return data.choices?.[0]?.message?.content || 'Sem resposta';
-  }
-
-  // Google AI Studio
-  if (lowerProvider.includes('google')) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: message }] }],
-        systemInstruction: { parts: [{ text: TEST_SYSTEM_PROMPT }] },
-        generationConfig: {
-          maxOutputTokens: 200,
-          temperature: 0.6
-        }
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.error?.message || `Erro HTTP: ${response.status}`);
-    }
-
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Sem resposta';
-  }
-
-  // OpenAI compatible
-  if (lowerProvider.includes('openai') || lowerProvider.includes('groq') || lowerProvider.includes('deepseek') || lowerProvider.includes('mistral')) {
-    const baseUrl = lowerProvider.includes('groq') ? 'https://api.groq.com/openai' :
-                    lowerProvider.includes('deepseek') ? 'https://api.deepseek.com' :
-                    lowerProvider.includes('mistral') ? 'https://api.mistral.ai' :
-                    'https://api.openai.com';
-
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [...systemMessages, { role: 'user', content: message }],
-        max_tokens: 200,
-        temperature: 0.6
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.error?.message || `Erro HTTP: ${response.status}`);
-    }
-
-    return data.choices?.[0]?.message?.content || 'Sem resposta';
-  }
-
-  throw new Error('Provedor no suportado para teste');
 }
 
 // ============================================

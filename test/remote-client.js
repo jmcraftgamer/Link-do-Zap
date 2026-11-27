@@ -414,12 +414,32 @@ async function main() {
 
     const billing = await remote.billingCheck('z1');
     assert.strictEqual(billing.dueDay, 10);
+    await remote.billingDetail('z1');
+    assert.strictEqual(lastCall(httpStub).path, '/api/v1/zaps/z1/billing');
+    await remote.billingOverview();
+    assert.deepStrictEqual(lastCall(httpStub), { method: 'GET', path: '/api/v1/billing/overview', body: undefined });
+    await remote.billingPay('z1', '2026-10', 'data:image/png;base64,abc');
+    assert.deepStrictEqual(lastCall(httpStub), { method: 'POST', path: '/api/v1/zaps/z1/billing/pay', body: { period: '2026-10', signature: 'data:image/png;base64,abc' } });
+    await remote.billingExtend('z1', '2026-10', 5, 'acordo', 'req-1');
+    assert.deepStrictEqual(lastCall(httpStub), { method: 'POST', path: '/api/v1/zaps/z1/billing/extend', body: { period: '2026-10', days: 5, reason: 'acordo', requestId: 'req-1' } });
 
     const providers = await remote.loadProviders();
     assert.deepStrictEqual(providers, [{ id: 'p1' }]);
 
     await remote.saveProviders([]);
     assert.deepStrictEqual(lastCall(httpStub).body, { providers: [] });
+
+    await remote.saveProvider('p1', { name: 'Provedor', models: [{ id: 'm1' }] });
+    assert.deepStrictEqual(lastCall(httpStub), {
+      method: 'PUT', path: '/api/v1/providers/p1',
+      body: { provider: { name: 'Provedor', models: [{ id: 'm1' }] } }
+    });
+    await remote.discoverProviderModels({ name: 'Provedor', baseUrl: 'https://api.exemplo.com/v1' });
+    assert.strictEqual(lastCall(httpStub).path, '/api/v1/providers/discover');
+    await remote.testProviderModel({ providerId: 'p1', modelId: 'm1' });
+    assert.strictEqual(lastCall(httpStub).path, '/api/v1/providers/test');
+    await remote.deleteProvider('p1');
+    assert.deepStrictEqual(lastCall(httpStub), { method: 'DELETE', path: '/api/v1/providers/p1', body: undefined });
 
     const trainings = await remote.loadTrainings();
     assert.deepStrictEqual(trainings, { z1: [] });

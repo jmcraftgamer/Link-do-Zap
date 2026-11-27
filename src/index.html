@@ -131,6 +131,14 @@
             </svg>
             <span>Contatos</span>
           </a>
+          <a href="#" class="menu-item" data-page="assinaturas">
+            <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="5" width="20" height="14" rx="2"/>
+              <line x1="2" y1="10" x2="22" y2="10"/>
+              <line x1="6" y1="15" x2="10" y2="15"/>
+            </svg>
+            <span>Gerenciar Assinaturas</span>
+          </a>
           <a href="#" class="menu-item" data-page="conversas">
             <svg class="menu-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
@@ -366,6 +374,46 @@
                 <span class="panel-enabled-label" id="panelInstantReplyLabel">Responder instantaneamente</span>
               </label>
               <div class="model-config-hint panel-instant-hint">Ignora o sorteio de tempo (15s, 25s ou 35s) e comeca a responder na hora.</div>
+            </div>
+
+            <!-- Assinatura -->
+            <div class="panel-section">
+              <div class="panel-section-title">Assinatura</div>
+              <label class="panel-enabled-toggle">
+                <input type="checkbox" id="panelSubscriptionEnabled">
+                <span class="toggle-slider"></span>
+                <span class="panel-enabled-label" id="panelSubscriptionLabel">Cobranca de assinatura desativada</span>
+              </label>
+              <div class="panel-subscription-config" id="panelSubscriptionConfig" style="display:none">
+                <div class="panel-subscription-fields">
+                  <div class="model-config-row">
+                    <div>
+                      <div class="model-config-label">Dia do vencimento</div>
+                      <div class="model-config-hint">De 1 a 31</div>
+                    </div>
+                    <input type="number" min="1" max="31" class="panel-area-input panel-billing-number" id="panelBillingDueDay" value="1">
+                  </div>
+                  <div class="model-config-row">
+                    <div>
+                      <div class="model-config-label">Carencia</div>
+                      <div class="model-config-hint">Dias apos o vencimento</div>
+                    </div>
+                    <input type="number" min="0" max="365" class="panel-area-input panel-billing-number" id="panelBillingGraceDays" value="3">
+                  </div>
+                  <div class="model-config-row">
+                    <div>
+                      <div class="model-config-label">Valor mensal</div>
+                      <div class="model-config-hint">Em reais</div>
+                    </div>
+                    <input type="number" min="0" step="0.01" class="panel-area-input panel-billing-number" id="panelBillingAmount" value="349.00">
+                  </div>
+                </div>
+                <div class="panel-subscription-actions">
+                  <span class="panel-subscription-status" id="panelSubscriptionStatus"></span>
+                  <button type="button" class="btn btn-outline btn-sm" id="panelManageSubscription">Gerenciar assinatura</button>
+                </div>
+              </div>
+              <div class="model-config-hint panel-subscription-hint">Ao ativar, o Zap entra na lista de assinaturas. Faturas atrasadas bloqueiam mensagens apos a carencia.</div>
             </div>
 
             <!-- Horario de atendimento -->
@@ -657,6 +705,13 @@
           <div class="contacts-zaps-list" id="contactsZapsList"></div>
         </div>
 
+        <!-- Page: Assinaturas -->
+        <div class="page" id="page-assinaturas">
+          <h1 class="page-title">Assinaturas</h1>
+          <p class="page-subtitle">Acompanhe vencimentos, pagamentos e carencia de cada Zap</p>
+          <div class="billing-list" id="billingList"></div>
+        </div>
+
         <!-- Page: Conversas -->
         <div class="page" id="page-conversas">
           <div class="conversations-page-header">
@@ -788,13 +843,12 @@
                 <p class="page-subtitle">Gerencie seus provedores de inteligncia artificial</p>
               </div>
               <div class="page-actions" style="margin:0">
-                <button class="btn btn-primary disabled-btn" id="addProviderBtn" disabled title="Em breve">
+                <button class="btn btn-primary" id="addProviderBtn">
                   <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="12" y1="5" x2="12" y2="19"/>
                     <line x1="5" y1="12" x2="19" y2="12"/>
                   </svg>
                   Adicionar Provedor
-                  <span class="coming-soon-badge">Em Breve</span>
                 </button>
               </div>
             </div>
@@ -1053,49 +1107,128 @@
 
   <!-- Provider Config Modal -->
   <div class="modal-overlay" id="providerModal">
-    <div class="modal modal-lg">
+    <div class="modal modal-lg provider-setup-modal">
       <div class="modal-header">
         <h2 id="providerModalTitle">Adicionar Provedor</h2>
         <button class="modal-close" id="closeProviderModal">&times;</button>
       </div>
       <div class="modal-body">
-        <div id="providerFormStep">
-          <div class="form-group">
-            <label for="providerName">Nome do Provedor</label>
-            <input type="text" id="providerName" placeholder="Ex: Meu OpenAI">
-          </div>
-          <div class="form-group">
-            <label for="apiKey">Chave API</label>
-            <input type="password" id="apiKey" placeholder="Cole sua chave API aqui">
-          </div>
-          <div class="form-actions">
-            <button class="btn btn-outline" id="cancelProviderConfig">Cancelar</button>
-            <button class="btn btn-primary" id="saveProviderConfig">Salvar e Buscar Modelos</button>
-          </div>
+        <div class="form-group">
+          <label for="providerName">Nome do Provedor</label>
+          <input type="text" id="providerName" placeholder="Ex: Minha Empresa - OpenAI" maxlength="120" autocomplete="off">
         </div>
-        <div id="providerModelsStep" style="display:none">
-          <div class="loading-models" id="loadingModels">
-            <p>Buscando modelos disponveis...</p>
-          </div>
-          <div id="modelsResult" style="display:none">
-            <div class="form-group">
-              <label>Modelos Encontrados</label>
-              <p class="form-hint">Desmarque os modelos que no deseja usar</p>
-              <div class="models-list" id="modelsList"></div>
-            </div>
-            <div class="form-actions">
-              <button class="btn btn-outline" id="cancelProviderConfig2">Cancelar</button>
-              <button class="btn btn-primary" id="confirmSaveProvider">Confirmar e Salvar</button>
-            </div>
-          </div>
-          <div id="modelsError" style="display:none">
-            <p class="error-text">Erro ao buscar modelos. Verifique sua chave API.</p>
-            <div class="form-actions">
-              <button class="btn btn-outline" id="retryProviderConfig">Tentar Novamente</button>
-              <button class="btn btn-outline" id="cancelProviderConfig3">Cancelar</button>
-            </div>
-          </div>
+        <div class="form-group">
+          <label for="apiKey">Chave API</label>
+          <input type="password" id="apiKey" placeholder="Cole sua chave API aqui" maxlength="8192" autocomplete="off" spellcheck="false">
+          <p class="form-hint">Pode ficar em branco apenas para provedores locais que no exigem autenticacao.</p>
         </div>
+        <div class="form-group">
+          <label for="providerUrl">URL do Provedor</label>
+          <input type="url" id="providerUrl" placeholder="https://api.openai.com/v1" maxlength="2048" autocomplete="off" spellcheck="false">
+          <p class="form-hint">Use a URL base compativel com OpenAI. O sistema adiciona /models e /chat/completions.</p>
+        </div>
+
+        <section class="provider-model-editor-section">
+          <div class="provider-model-editor-header">
+            <div>
+              <h3>Modelos</h3>
+              <p class="form-hint">Adicione manualmente ou busque os modelos disponiveis na API.</p>
+            </div>
+            <div class="provider-model-editor-actions">
+              <button type="button" class="btn btn-outline btn-sm" id="discoverProviderModelsBtn">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
+                </svg>
+                Buscar Modelos
+              </button>
+              <button type="button" class="btn btn-outline btn-sm" id="addProviderModelBtn">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                Adicionar Modelo
+              </button>
+            </div>
+          </div>
+          <div class="provider-model-status" id="providerModelsStatus" role="status"></div>
+          <div class="models-list provider-modal-models-list" id="modelsList"></div>
+          <div class="provider-model-form" id="providerModelForm" style="display:none">
+            <input type="text" id="providerModelName" placeholder="Nome do modelo" maxlength="200" autocomplete="off">
+            <input type="text" id="providerModelId" placeholder="ID do modelo" maxlength="500" autocomplete="off" spellcheck="false">
+            <button type="button" class="btn btn-primary btn-sm" id="saveProviderModelBtn">Salvar Modelo</button>
+            <button type="button" class="btn btn-outline btn-sm" id="cancelProviderModelBtn">Cancelar</button>
+          </div>
+        </section>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline" id="cancelProviderConfig">Cancelar</button>
+        <button type="button" class="btn btn-primary" id="saveProviderConfig">Salvar Provedor</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Assinatura de pagamento -->
+  <div class="modal-overlay" id="billingPaymentModal">
+    <div class="modal modal-lg billing-payment-modal">
+      <div class="modal-header">
+        <div>
+          <h2 id="billingPaymentTitle">Confirmar pagamento</h2>
+          <p class="billing-modal-subtitle" id="billingPaymentSubtitle"></p>
+        </div>
+        <button type="button" class="modal-close" id="closeBillingPaymentModal" aria-label="Fechar">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="billing-payment-info">
+          <div><span>Fatura</span><strong id="billingPaymentPeriod"></strong></div>
+          <div><span>Vencimento</span><strong id="billingPaymentDue"></strong></div>
+          <div><span>Valor</span><strong id="billingPaymentAmount"></strong></div>
+        </div>
+        <div class="billing-signature-header">
+          <label for="billingSignatureCanvas">Assinatura do pagador</label>
+          <button type="button" class="btn btn-outline btn-sm" id="clearBillingSignature">Limpar</button>
+        </div>
+        <div class="billing-signature-pad">
+          <canvas id="billingSignatureCanvas" width="720" height="260" aria-label="Area para desenhar a assinatura"></canvas>
+          <span class="billing-signature-placeholder" id="billingSignaturePlaceholder">Desenhe sua assinatura aqui</span>
+        </div>
+        <label class="billing-irreversible-check">
+          <input type="checkbox" id="billingPaymentConfirm">
+          <span>Confirmo que este pagamento e real e sera registrado de forma irreversivel.</span>
+        </label>
+        <p class="billing-modal-status" id="billingPaymentStatus" role="status"></p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline" id="cancelBillingPayment">Cancelar</button>
+        <button type="button" class="btn btn-primary" id="confirmBillingPayment" disabled>Confirmar pagamento</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Prorrogacao de carencia -->
+  <div class="modal-overlay" id="billingExtensionModal">
+    <div class="modal modal-md">
+      <div class="modal-header">
+        <div>
+          <h2>Prorrogar carencia</h2>
+          <p class="billing-modal-subtitle" id="billingExtensionSubtitle"></p>
+        </div>
+        <button type="button" class="modal-close" id="closeBillingExtensionModal" aria-label="Fechar">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="billingExtensionDays">Dias adicionais</label>
+          <input type="number" id="billingExtensionDays" min="1" max="365" value="5">
+        </div>
+        <div class="form-group">
+          <label for="billingExtensionReason">Motivo (opcional)</label>
+          <input type="text" id="billingExtensionReason" maxlength="500" placeholder="Ex: acordo com o cliente">
+        </div>
+        <div class="billing-extension-preview" id="billingExtensionPreview"></div>
+        <p class="billing-modal-status" id="billingExtensionStatus" role="status"></p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline" id="cancelBillingExtension">Cancelar</button>
+        <button type="button" class="btn btn-primary" id="confirmBillingExtension">Salvar prorrogacao</button>
       </div>
     </div>
   </div>

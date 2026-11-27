@@ -1,6 +1,7 @@
 // Testes do download/descriptografia manual de audio do WhatsApp
 const assert = require('assert');
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 
 const { decryptWhatsAppMedia } = require(path.join(__dirname, '..', 'src', 'js', 'media-crypto'));
@@ -393,9 +394,17 @@ test('audio erro: classifica auth, expirada, transitoria e permanente', () => {
   assert.strictEqual(classifyAudioError(new Error('HTTP 503')).kind, 'transient');
   assert.strictEqual(classifyAudioError(new Error('socket hang up')).retryable, true);
   assert.strictEqual(classifyAudioError(new Error('mensagem nao encontrada')).kind, 'permanent');
+  const bug = classifyAudioError(new ReferenceError('getWhatsapp is not defined'));
+  assert.strictEqual(bug.kind, 'permanent');
+  assert.strictEqual(bug.retryable, false);
   const timeout = classifyAudioError(Object.assign(new Error('aborted'), { name: 'AbortError' }));
   assert.strictEqual(timeout.kind, 'timeout');
   assert.strictEqual(timeout.retryable, true);
+});
+
+test('audio main: nao chama helper getWhatsapp inexistente', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.ok(!/\bgetWhatsapp\s*\(\s*\)/.test(source), 'main.js deve usar whatsappManager diretamente');
 });
 
 test('audio validador: aceita ogg real e recusa html/json/curto/grande', () => {

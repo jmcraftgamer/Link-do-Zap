@@ -18,6 +18,7 @@ const PATTERNS = [
   { kind: 'transient', retryable: true, re: /ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|fetch failed|HTTP\s*5\d\d|HTTP\s*429|resposta vazia|empty|vazi[ao]/i },
   { kind: 'corrupt', retryable: true, re: /assinatura da midia nao confere|decrypt|descriptograf|corromp|Unexpected mimetype|formato|mime|header|bytes/i },
   { kind: 'limit', retryable: false, re: /grande demais|maior que o limite|muito grande|too large|size limit|pequeno demais|too small/i },
+  { kind: 'permanent', retryable: false, re: /ReferenceError|SyntaxError|is not defined|is not a function/i },
   { kind: 'permanent', retryable: false, re: /nao encontrada|mensagem nao encontrada|not found|fetch indisponivel|nenhuma URL|sem midia|sem permissao|permission denied/i }
 ];
 

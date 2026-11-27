@@ -129,8 +129,16 @@ const localDataApi = {
   saveZaps: (data, opts) => ipcRenderer.invoke('save-zaps', data, opts),
   billingSave: (zapId, data) => ipcRenderer.invoke('billing-save', zapId, data),
   billingCheck: (zapId) => ipcRenderer.invoke('billing-check', zapId),
+  billingDetail: (zapId) => ipcRenderer.invoke('billing-detail', zapId),
+  billingOverview: () => ipcRenderer.invoke('billing-overview'),
+  billingPay: (zapId, period, signature) => ipcRenderer.invoke('billing-pay', zapId, period, signature),
+  billingExtend: (zapId, period, days, reason, requestId) => ipcRenderer.invoke('billing-extend', zapId, period, days, reason, requestId),
   loadProviders: () => ipcRenderer.invoke('load-providers'),
   saveProviders: (data) => ipcRenderer.invoke('save-providers', data),
+  saveProvider: (id, data) => ipcRenderer.invoke('save-provider', id, data),
+  deleteProvider: (id) => ipcRenderer.invoke('delete-provider', id),
+  discoverProviderModels: (data) => ipcRenderer.invoke('discover-provider-models', data),
+  testProviderModel: (data) => ipcRenderer.invoke('test-provider-model', data),
 
   // Trainings
   loadTrainings: () => ipcRenderer.invoke('load-trainings'),

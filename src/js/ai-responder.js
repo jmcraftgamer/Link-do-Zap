@@ -1,5 +1,6 @@
 const { verifyMessage, buildCorrectionPrompt } = require('./message-guard');
 const { ConnectQueue } = require('../core/connect-queue');
+const { DEFAULT_BASE_URLS, buildProviderEndpoint, buildGoogleGenerateUrl, providerHeaders } = require('../core/providers');
 
 class AIResponder {
   constructor() {
@@ -513,9 +514,11 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
 
     // Specific model selected like "OpenRouter|qwen/qwen3.8-27b:free"
     if (zap.model && zap.model !== 'auto' && zap.model.includes('|')) {
-      const [provName, modelId] = zap.model.split('|');
+      const sep = zap.model.indexOf('|');
+      const providerRef = zap.model.slice(0, sep);
+      const modelId = zap.model.slice(sep + 1);
       for (const p of providersData) {
-        if (p.name !== provName) continue;
+        if (p.id !== providerRef && p.name !== providerRef) continue;
         const m = (p.models || []).find(x => x.id === modelId);
         if (m) {
           const key = resolveKey(p);
@@ -525,7 +528,7 @@ REGRAS ANTI-ERRO (OBRIGATORIO):
               const k = resolveKey(pp);
               if (!k) continue;
               for (const mm of (pp.models || [])) {
-                if (pp.name === provName && mm.id === modelId) continue;
+                if (pp.id === p.id && mm.id === modelId) continue;
                 list.push({ provider: { ...pp, apiKey: k }, model: mm });
               }
             }
@@ -903,26 +906,27 @@ NOME DO CLIENTE: ${contactName}
   }
 
   async callAIWithKey(provider, model, apiKey, messages) {
-    const providerName = provider.name.toLowerCase();
+    const providerName = String(provider.name || '').toLowerCase();
+    const type = provider.type || (
+      providerName.includes('openrouter') ? 'openrouter'
+        : providerName.includes('google') || providerName.includes('gemini') ? 'google'
+          : 'openai'
+    );
 
-    if (providerName.includes('openrouter')) {
-      return this.callOpenRouter(model.id, apiKey, messages);
+    if (type === 'openrouter') {
+      return this.callOpenRouter(provider, model.id, apiKey, messages);
+    }
+    if (type === 'google') {
+      return this.callGoogleAI(provider, model.id, apiKey, messages);
+    }
+    if (provider.baseUrl || type === 'openai') {
+      return this.callOpenAICompatible(provider, model.id, apiKey, messages);
     }
 
-    if (providerName.includes('google')) {
-      return this.callGoogleAI(model.id, apiKey, messages);
+    if (model.id && model.id.includes('/') && !provider.baseUrl) {
+      return this.callOpenRouter(provider, model.id, apiKey, messages);
     }
-
-    if (providerName.includes('openai') || providerName.includes('groq') || providerName.includes('deepseek') || providerName.includes('mistral')) {
-      return this.callOpenAICompatible(providerName, model.id, apiKey, messages);
-    }
-
-    // Fallback: try OpenAI-compatible for any other provider (anthropic via openrouter, etc.)
-    // If model id looks like provider/model (openrouter style), use OpenRouter
-    if (model.id && model.id.includes('/')) {
-      return this.callOpenRouter(model.id, apiKey, messages);
-    }
-    return this.callOpenAICompatible(providerName, model.id, apiKey, messages);
+    return this.callOpenAICompatible(provider, model.id, apiKey, messages);
   }
 
   // Resposta cortada no meio (finish_reason=length / MAX_TOKENS): corta na
@@ -1041,15 +1045,12 @@ NOME DO CLIENTE: ${contactName}
     return head.concat(tail);
   }
 
-  async callOpenRouter(modelId, apiKey, messages) {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+  async callOpenRouter(providerOrName, modelId, apiKey, messages) {
+    const provider = typeof providerOrName === 'string' ? { name: providerOrName, type: 'openrouter' } : providerOrName;
+    const baseUrl = provider.baseUrl || DEFAULT_BASE_URLS.openrouter;
+    const response = await fetch(buildProviderEndpoint(baseUrl, 'chat/completions'), {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://link-no-whatsapp.app',
-        'X-Title': 'Link no WhatsApp'
-      },
+      headers: providerHeaders(provider, apiKey),
       body: JSON.stringify({
         model: modelId,
         messages,
@@ -1075,7 +1076,8 @@ NOME DO CLIENTE: ${contactName}
     return content;
   }
 
-  async callGoogleAI(modelId, apiKey, messages) {
+  async callGoogleAI(providerOrName, modelId, apiKey, messages) {
+    const provider = typeof providerOrName === 'string' ? { name: providerOrName, type: 'google' } : providerOrName;
     // Usa o id EXATO vindo do painel do Zap. NUNCA remapear para modelos
     // antigos: 2.5/2.0/1.5 retornam 404 "no longer available to new users"
     // nas contas novas do AI Studio, e o remapeamento derrubava modelos que
@@ -1106,7 +1108,7 @@ NOME DO CLIENTE: ${contactName}
       };
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${effectiveModel}:generateContent?key=${apiKey}`;
+    const url = buildGoogleGenerateUrl(provider.baseUrl || DEFAULT_BASE_URLS.google, effectiveModel, apiKey);
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1156,18 +1158,19 @@ NOME DO CLIENTE: ${contactName}
     return text;
   }
 
-  async callOpenAICompatible(providerName, modelId, apiKey, messages) {
-    const baseUrl = providerName.includes('groq') ? 'https://api.groq.com/openai' :
-                    providerName.includes('deepseek') ? 'https://api.deepseek.com' :
-                    providerName.includes('mistral') ? 'https://api.mistral.ai' :
-                    'https://api.openai.com';
+  async callOpenAICompatible(providerOrName, modelId, apiKey, messages) {
+    const provider = typeof providerOrName === 'string' ? { name: providerOrName, type: 'openai' } : providerOrName;
+    const name = String(provider.name || '').toLowerCase();
+    const baseUrl = provider.baseUrl || (
+      name.includes('groq') ? DEFAULT_BASE_URLS.groq
+        : name.includes('deepseek') ? DEFAULT_BASE_URLS.deepseek
+          : name.includes('mistral') ? DEFAULT_BASE_URLS.mistral
+            : DEFAULT_BASE_URLS.openai
+    );
 
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const response = await fetch(buildProviderEndpoint(baseUrl, 'chat/completions'), {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
+      headers: providerHeaders(provider, apiKey),
       body: JSON.stringify({
         model: modelId,
         messages,

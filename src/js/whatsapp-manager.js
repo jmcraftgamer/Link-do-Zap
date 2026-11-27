@@ -23,6 +23,8 @@ class WhatsAppManager {
     this.clients = new Map();
     this.conversations = new Map();
     this.onMessageCallback = null;
+    this.accessGate = null;
+    this._blockedAccess = new Map();
     // Recuperacao de audio (fila persistente + retry). Injetado pelo main.js.
     this.audioPipeline = null;
     // Objetos Message originais enquanto a tarefa de audio esta em andamento.
@@ -67,6 +69,46 @@ class WhatsAppManager {
     this.contactsFilePath = path.join(baseDir, 'contacts.json');
     this._baseDir = baseDir;
     this.loadPersistedContacts();
+  }
+
+  setAccessGate(gate) {
+    this.accessGate = typeof gate === 'function' ? gate : null;
+  }
+
+  _accessState(zapId) {
+    if (!this.accessGate) return { active: true, reason: 'allowed' };
+    try {
+      const state = this.accessGate(String(zapId));
+      return state && typeof state === 'object' ? state : { active: false, reason: 'access_unavailable' };
+    } catch (error) {
+      console.error(`[ACESSO] nao foi possivel validar o zap ${zapId}:`, error.message);
+      return { active: false, reason: 'access_unavailable', error: error.message };
+    }
+  }
+
+  async _enforceAccess(zapId) {
+    const id = String(zapId);
+    const state = this._accessState(id);
+    if (state.active) {
+      this._blockedAccess.delete(id);
+      return state;
+    }
+    const marker = `${state.reason || 'blocked'}:${state.oldestUnpaidPeriod || ''}`;
+    if (this._blockedAccess.get(id) !== marker) {
+      this._blockedAccess.set(id, marker);
+      const detail = state.reason === 'atrasado'
+        ? `Zap suspenso por pagamento atrasado${state.oldestUnpaidPeriod ? ` (${state.oldestUnpaidPeriod})` : ''}.`
+        : `Zap sem acesso (${state.reason || 'bloqueado'}).`;
+      this.logToApp(id, 'warning', detail);
+    }
+    if (this.clients.has(id)) await this.disconnectZap(id, state.reason === 'atrasado' ? 'assinatura atrasada' : 'acesso bloqueado');
+    this.sendToRenderer('whatsapp-status', {
+      zapId: id,
+      status: state.reason === 'atrasado' ? 'billing_suspended' : 'disabled',
+      reason: state.reason,
+      billing: state
+    });
+    return state;
   }
 
   loadPersistedContacts() {
@@ -421,6 +463,8 @@ class WhatsAppManager {
   }
 
   async connectZap(zapId, phoneNumber, method = 'pairing') {
+    const access = await this._enforceAccess(zapId);
+    if (!access.active) return { status: access.reason === 'atrasado' ? 'billing_suspended' : 'blocked', error: access.reason, billing: access };
     // Save checkpoint before connection attempt
     if (this.clients.has(zapId)) {
       await this.saveCheckpointBeforeOperation(zapId, 'connectZap');
@@ -850,6 +894,7 @@ class WhatsAppManager {
     client.on('message', async (msg) => {
       const data = this.clients.get(zapId);
       if (!data || data.client !== client) return;
+      if (!(await this._enforceAccess(zapId)).active) return;
 
       // GRUPOS/TRANSMISSAO/CANAIS: corte aqui, antes de qualquer coisa.
       // Nao vai para a UI, nao baixa midia e nunca passa pela IA.
@@ -895,6 +940,7 @@ class WhatsAppManager {
         if (!msg.fromMe) return; // mensagens recebidas vêm pelo evento 'message'
         const data = this.clients.get(zapId);
         if (!data || data.client !== client) return;
+        if (!(await this._enforceAccess(zapId)).active) return;
         if (!this._claimMessageKey(data, msg, 'processedCreateKeys')) return;
 
         // Chat da mensagem: para mensagens enviadas por mim, o chat e msg.to
@@ -1055,6 +1101,7 @@ class WhatsAppManager {
   }
 
   async handleMessage(zapId, msg, opts) {
+    if (!(await this._enforceAccess(zapId)).active) return;
     const fromBacklog = !!(opts && opts.fromBacklog);
     const messageClient = this.clients.get(String(zapId));
     try {
@@ -2436,6 +2483,7 @@ class WhatsAppManager {
 
   // Reconexao forcada preservando a sessao (LocalAuth no disco)
   async _forceReconnect(zapId) {
+    if (!this._accessState(zapId).active) return false;
     if (this._reconnecting.has(zapId)) return this._waitReady(zapId, 120000);
     const cd = this.clients.get(zapId);
     if (!cd) return false;
@@ -2490,6 +2538,8 @@ class WhatsAppManager {
     const sendStart = Date.now();
     
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const access = await this._enforceAccess(zapId);
+      if (!access.active) throw new Error(`Zap ${zapId} sem acesso (${access.reason || 'bloqueado'}) - envio interrompido`);
       const cd = this.clients.get(zapId);
       if (!cd || cd.status !== 'ready') {
         const errorMsg = `Zap ${zapId} ${cd ? 'esta ' + cd.status : 'foi desconectado'} - envio interrompido`;

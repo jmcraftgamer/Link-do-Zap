@@ -2,7 +2,6 @@
 // usa (runtime.invoke), mantendo uma unica implementacao da regra de negocio.
 const path = require('path');
 const fs = require('fs');
-const billingCore = require('../../../src/core/billing');
 const { resourcesSnapshot } = require('../../../src/core/resources');
 
 function asArray(value, fallback = []) {
@@ -257,7 +256,8 @@ function createRoutes({ runtime, config }) {
         const list = await loadZaps();
         const zap = list.find((z) => String(z.id) === String(ctx.params.id));
         if (!zap) throw Object.assign(new Error('zap nao encontrado'), { status: 404 });
-        Object.assign(zap, patch, { id: zap.id });
+        const { billingPlan, ...safePatch } = patch;
+        Object.assign(zap, safePatch, { id: zap.id });
         await saveZaps(list);
         return zap;
       }
@@ -451,7 +451,7 @@ function createRoutes({ runtime, config }) {
       handler: async (ctx) => {
         const zap = await getZap(ctx.params.id);
         if (!zap) throw Object.assign(new Error('zap nao encontrado'), { status: 404 });
-        return { ok: true, ...billingCore.describeBilling(zap) };
+        return invoke('billing-detail', String(ctx.params.id));
       }
     },
     {
@@ -460,38 +460,15 @@ function createRoutes({ runtime, config }) {
     },
     {
       method: 'POST', path: '/zaps/:id/billing/pay',
-      handler: async (ctx) => {
-        const month = ctx.body && ctx.body.month;
-        if (!month) throw Object.assign(new Error('informe month (ex: 2026-11)'), { status: 400 });
-        const list = await loadZaps();
-        const zap = list.find((z) => String(z.id) === String(ctx.params.id));
-        if (!zap) throw Object.assign(new Error('zap nao encontrado'), { status: 404 });
-        zap.billingPlan = billingCore.markMonthPaid(zap.billingPlan || {}, month, true);
-        await saveZaps(list);
-        return { ok: true, billing: billingCore.describeBilling(zap) };
-      }
+      handler: (ctx) => invoke('billing-pay', String(ctx.params.id), ctx.body && (ctx.body.period || ctx.body.month), ctx.body && ctx.body.signature)
+    },
+    {
+      method: 'POST', path: '/zaps/:id/billing/extend',
+      handler: (ctx) => invoke('billing-extend', String(ctx.params.id), ctx.body && ctx.body.period, ctx.body && ctx.body.days, ctx.body && ctx.body.reason, ctx.body && ctx.body.requestId)
     },
     {
       method: 'GET', path: '/billing/overview',
-      handler: async () => {
-        const list = await loadZaps();
-        const items = list.map((z) => ({
-          zapId: String(z.id),
-          name: z.name || '',
-          enabled: z.enabled !== false,
-          ...billingCore.describeBilling(z)
-        }));
-        return {
-          ok: true,
-          total: items.length,
-          overdue: items.filter((i) => i.status === 'overdue').length,
-          pending: items.filter((i) => i.status === 'pending').length,
-          grace: items.filter((i) => i.status === 'grace').length,
-          // compat: cliente antigo lia "suspended"
-          suspended: items.filter((i) => i.status === 'overdue').length,
-          items
-        };
-      }
+      handler: () => invoke('billing-overview')
     },
 
     // ------------------------------------------------------------ providers/trainings
@@ -508,6 +485,31 @@ function createRoutes({ runtime, config }) {
         if (ok !== true) throw Object.assign(new Error('falha ao salvar provedores'), { status: 409 });
         return { ok: true };
       }
+    },
+    {
+      method: 'PUT', path: '/providers/:id',
+      handler: async (ctx) => {
+        const body = ctx.body || {};
+        const result = await invoke('save-provider', ctx.params.id, body.provider || body);
+        if (!result) throw Object.assign(new Error('nao foi possivel salvar o provedor'), { status: 409 });
+        return result;
+      }
+    },
+    {
+      method: 'DELETE', path: '/providers/:id',
+      handler: async (ctx) => {
+        const ok = await invoke('delete-provider', ctx.params.id);
+        if (!ok) throw Object.assign(new Error('provedor nao encontrado'), { status: 404 });
+        return { ok: true };
+      }
+    },
+    {
+      method: 'POST', path: '/providers/discover',
+      handler: (ctx) => invoke('discover-provider-models', ctx.body || {})
+    },
+    {
+      method: 'POST', path: '/providers/test',
+      handler: (ctx) => invoke('test-provider-model', ctx.body || {})
     },
     {
       method: 'GET', path: '/trainings',

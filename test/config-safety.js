@@ -43,6 +43,7 @@ function testAsync(name, fn) { pending.push({ name, fn }); }
   const zapsPath = path.join(dataDir, 'zaps.json');
   const bakPath = zapsPath + '.bak';
   const markerPath = path.join(dataDir, 'zaps.empty-ok.json');
+  const signature = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=';
 
   fs.writeFileSync(zapsPath, JSON.stringify([
     { id: 'z1', name: 'Zap 1', enabled: true },
@@ -123,6 +124,52 @@ function testAsync(name, fn) { pending.push({ name, fn }); }
     assert.strictEqual(JSON.parse(fs.readFileSync(zapsPath, 'utf8')).length, 1);
     assert.ok(fs.existsSync(bakPath), 'backup .bak nao foi criado');
     assert.strictEqual(JSON.parse(fs.readFileSync(bakPath, 'utf8')).length, 2, 'backup deveria ter a versao anterior');
+  });
+
+  test('config: save-zaps preserva billingPlan e nao aceita plano por escrita generica', () => {
+    const billingSave = handlers.get('billing-save');
+    const now = new Date();
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const previous = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const previousMonth = `${previous.getFullYear()}-${String(previous.getMonth() + 1).padStart(2, '0')}`;
+    const saved = billingSave({}, 'z1', { enabled: true, dueDay: 1, graceDays: 15, monthlyAmount: 99, startMonth: previousMonth });
+    assert.strictEqual(saved.ok, true, saved.error);
+    assert.strictEqual(saveZaps({}, [{ id: 'z1', name: 'Zap editado', billingPlan: { enabled: false, monthlyAmount: 999 } }]), true);
+    const onDisk = JSON.parse(fs.readFileSync(zapsPath, 'utf8'));
+    assert.strictEqual(onDisk[0].billingPlan.enabled, true);
+    assert.strictEqual(onDisk[0].billingPlan.monthlyAmount, 99);
+    assert.strictEqual(onDisk[0].billingPlan.dueDay, 1);
+    assert.strictEqual(saveZaps({}, [
+      { id: 'z1', name: 'Zap editado' },
+      { id: 'z3', name: 'Zap novo', billingPlan: { enabled: true, monthlyAmount: 500 } }
+    ]), true);
+    const withNewZap = JSON.parse(fs.readFileSync(zapsPath, 'utf8'));
+    const newPlan = withNewZap.find((zap) => zap.id === 'z3').billingPlan;
+    assert.strictEqual(newPlan.enabled, true);
+    assert.strictEqual(newPlan.monthlyAmount, 349);
+    assert.strictEqual(newPlan.graceDays, 3);
+    assert.notStrictEqual(newPlan.monthlyAmount, 500);
+    assert.strictEqual(saveZaps({}, [{ id: 'z1', name: 'Zap editado' }]), true);
+
+    const pay = handlers.get('billing-pay')({}, 'z1', previousMonth, signature);
+    assert.strictEqual(pay.ok, true, pay.error);
+    assert.strictEqual(pay.payment.period, previousMonth);
+    const overview = handlers.get('billing-overview')();
+    assert.strictEqual(overview.ok, true, overview.error);
+    assert.strictEqual(overview.subscriptions.length, 1);
+    assert.strictEqual(overview.subscriptions[0].billing.payments.length, 1);
+
+    const extension = handlers.get('billing-extend')({}, 'z1', currentMonth, 5, 'teste');
+    assert.strictEqual(extension.ok, true, extension.error);
+    assert.strictEqual(extension.extension.days, 5);
+
+    const disabled = billingSave({}, 'z1', { enabled: false });
+    assert.strictEqual(disabled.ok, true, disabled.error);
+    assert.strictEqual(handlers.get('billing-overview')().subscriptions.length, 0);
+    assert.strictEqual(handlers.get('billing-check')({}, 'z1').active, true);
+    const enabled = billingSave({}, 'z1', { enabled: true });
+    assert.strictEqual(enabled.ok, true, enabled.error);
+    assert.strictEqual(handlers.get('billing-overview')().subscriptions[0].billing.payments.length, 1);
   });
 
   test('config: lista vazia confirmada grava marcador explicito', () => {
