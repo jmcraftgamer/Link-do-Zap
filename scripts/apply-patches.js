@@ -116,6 +116,8 @@ for (const file of fs.readdirSync(patchesDir).filter((f) => f.endsWith('.patch')
       const alvo = path.join(pkgDir, f.path);
       const atual = fs.readFileSync(alvo, 'utf8');
       const linhas = atual.split('\n');
+      const reverso = applyFile(linhas, f.hunks, true);
+      if (reverso) continue;
       const direto = applyFile(linhas, f.hunks, false);
       if (direto) {
         fs.writeFileSync(alvo, direto.join('\n'));
@@ -123,8 +125,6 @@ for (const file of fs.readdirSync(patchesDir).filter((f) => f.endsWith('.patch')
         aplicados++;
         continue;
       }
-      const reverso = applyFile(linhas, f.hunks, true);
-      if (reverso) continue; // ja aplicado
       throw new Error(`contexto nao bateu em ${f.path}`);
     }
     console.log(
