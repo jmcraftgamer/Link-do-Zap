@@ -74,7 +74,7 @@ function applyFile(lines, hunks, reverse) {
           res.push(x);
         }
       }
-      return { res, end: s };
+      return { res, start, end: s };
     };
     let r = tryAt(expect);
     if (!r) {
@@ -84,8 +84,8 @@ function applyFile(lines, hunks, reverse) {
       }
     }
     if (!r) return false;
-    out.splice(expect, r.end - expect, ...r.res);
-    offset += r.res.length - (r.end - expect);
+    out.splice(r.start, r.end - r.start, ...r.res);
+    offset += (r.start - expect) + r.res.length - (r.end - r.start);
   }
   return out;
 }
