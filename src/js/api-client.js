@@ -25,7 +25,11 @@ function createHttpClient(options) {
   function request(method, path, body, requestOptions) {
     const base = trimSlash(options.getBaseUrl());
     if (!base) return Promise.reject(new Error('servidor nao configurado'));
-    const url = new URL(path, base.endsWith('/') ? base : `${base}/`);
+    const url = new URL(base);
+    const [pathname, search = ''] = String(path).split('?', 2);
+    const basePath = url.pathname.replace(/\/+$/, '');
+    url.pathname = `${basePath}${pathname.startsWith('/') ? pathname : `/${pathname}`}`;
+    url.search = search;
     const payload = body === undefined ? null : JSON.stringify(body);
     const headers = { Accept: 'application/json' };
     const token = getToken();
