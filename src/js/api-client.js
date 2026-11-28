@@ -25,7 +25,7 @@ function createHttpClient(options) {
   function request(method, path, body, requestOptions) {
     const base = trimSlash(options.getBaseUrl());
     if (!base) return Promise.reject(new Error('servidor nao configurado'));
-    const url = new URL(base + path);
+    const url = new URL(path, base.endsWith('/') ? base : `${base}/`);
     const payload = body === undefined ? null : JSON.stringify(body);
     const headers = { Accept: 'application/json' };
     const token = getToken();
